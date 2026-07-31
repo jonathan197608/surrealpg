@@ -1,0 +1,5 @@
+[env]
+# Fix: Homebrew LLVM clang config hardcodes -isysroot to CLT SDK which has
+# empty usr/include/. Override with the Xcode SDK path so bindgen (used by
+# rquickjs-sys and similar crates) can find stdio.h and other C headers.
+BINDGEN_EXTRA_CLANG_ARGS = "-isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"

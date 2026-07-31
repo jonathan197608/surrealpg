@@ -1,0 +1,4 @@
+/target
+
+# Agent temp directory
+.temp/

@@ -1,0 +1,53 @@
+[package]
+name = "surreal-pg"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "SurrealDB server with PostgreSQL storage backend — delegates to surrealdb-server::init()"
+
+[[bin]]
+name = "surreal-pg"
+path = "src/main.rs"
+
+[lib]
+name = "surreal_pg"
+path = "src/lib.rs"
+
+[dependencies]
+# SurrealDB server engine — provides init(), CLI, HTTP/WS/GraphQL, full SurrealQL
+surrealdb-server = { version = "3.2.3" }
+# SurrealDB core — provides CommunityComposer, kvs traits, Transactable, etc.
+surrealdb-core = { version = "3.2.3" }
+
+# PostgreSQL driver
+sqlx = { version = "0.8", default-features = false, features = [
+    "postgres",
+    "runtime-tokio",
+    "tls-rustls",
+    "macros",
+] }
+
+# Async utilities
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# HTTP framework (needed for RouterFactory return type)
+axum = "0.8"
+
+# Logging
+tracing = "0.1"
+
+# async trait macro (needed by ConfigCheck trait)
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "macros"] }
+chrono = "0.4"
+futures = "0.3"
+
+[lints.rust]
+linker_messages = "allow"
