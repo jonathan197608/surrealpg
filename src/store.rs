@@ -2,10 +2,10 @@
 //! and spawns [`PgTransaction`] instances.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use sqlx::Executor;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::config::{PersistentStatements, PgConfig};
@@ -27,6 +27,10 @@ pub struct PgStore {
     tune: PgTuneConfig,
     /// Resolved persistent-statements flag (concrete `bool` after startup probe).
     persistent: bool,
+    /// Cancellation token — checked before starting new transactions.
+    /// When the server shuts down, this token is cancelled and all in-flight
+    /// `begin()` calls return `TxCancelled` instead of acquiring a connection.
+    canceller: CancellationToken,
 }
 
 impl PgStore {
@@ -38,7 +42,7 @@ impl PgStore {
     /// Tuning parameters are loaded from `PG_TUNED_*` environment variables;
     /// URL query params (`max_connections`, `min_connections`, etc.) override
     /// the pool-level tuning defaults.
-    pub async fn new(url: &str) -> Result<Arc<Self>> {
+    pub async fn new(url: &str, canceller: CancellationToken) -> Result<Arc<Self>> {
         // ── Load configs ──
         let mut config = PgConfig::default();
         config.merge_url_params(url);
@@ -47,21 +51,9 @@ impl PgStore {
         let tune = PgTuneConfig::from_env();
 
         // URL params override tuning env vars for pool sizing (URL is more specific)
-        let pool_max = if config.max_connections != 20 {
-            config.max_connections
-        } else {
-            tune.pool_max
-        };
-        let pool_min = if config.min_connections != 5 {
-            config.min_connections
-        } else {
-            tune.pool_min
-        };
-        let acquire_timeout = if config.connect_timeout != Duration::from_secs(10) {
-            config.connect_timeout
-        } else {
-            tune.pool_acquire_timeout
-        };
+        let pool_max = config.max_connections.unwrap_or(tune.pool_max);
+        let pool_min = config.min_connections.unwrap_or(tune.pool_min);
+        let acquire_timeout = config.connect_timeout.unwrap_or(tune.pool_acquire_timeout);
         let idle_timeout = config.idle_timeout.or(Some(tune.pool_idle_timeout));
         let max_lifetime = config.max_lifetime.or(Some(tune.pool_max_lifetime));
 
@@ -156,6 +148,7 @@ impl PgStore {
             config,
             tune,
             persistent,
+            canceller,
         }))
     }
 
@@ -165,11 +158,33 @@ impl PgStore {
     /// isolation level. If `write` is false, starts a read-only transaction
     /// (or a regular transaction if `read_only_optimization` is disabled).
     pub async fn begin(&self, write: bool) -> Result<PgTransaction> {
+        // Check cancellation before acquiring a connection from the pool.
+        // This prevents new transactions from starting during shutdown.
+        if self.canceller.is_cancelled() {
+            return Err(PgStoreError::TxCancelled);
+        }
+
         let mut conn = self
             .pool
             .acquire()
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
+
+        // Safety net: if the connection was previously leaked from an
+        // unclosed transaction, ROLLBACK any residual state before starting
+        // a new transaction. This prevents "BEGIN inside BEGIN" errors.
+        // (sqlx does NOT auto-ROLLBACK when returning connections to the pool.)
+        let rollback_result = Executor::execute(
+            &mut *conn,
+            sqlx::raw_sql("ROLLBACK"),
+        )
+        .await;
+        match rollback_result {
+            Ok(_) => {} // no active tx — harmless ROLLBACK
+            Err(_) => {
+                // Some DBs error on ROLLBACK without tx; that's also fine.
+            }
+        }
 
         // Begin transaction — session-level params (statement_timeout, lock_timeout,
         // idle_in_transaction_timeout, etc.) are already set via after_connect.
@@ -179,7 +194,10 @@ impl PgStore {
                 self.config.isolation_level.as_sql()
             )
         } else if self.config.read_only_optimization {
-            "BEGIN READ ONLY".to_string()
+            format!(
+                "BEGIN ISOLATION LEVEL {} READ ONLY",
+                self.config.isolation_level.as_sql()
+            )
         } else {
             "BEGIN".to_string()
         };
@@ -319,6 +337,9 @@ impl PgStore {
         match r2 {
             Ok(_) => {
                 info!("persistent probe: no conflict, direct PG or session mode");
+                // Clean up probe statements before returning connections to pool
+                let _ = Executor::execute(&mut *conn1, sqlx::raw_sql("DEALLOCATE ALL")).await;
+                let _ = Executor::execute(&mut *conn2, sqlx::raw_sql("DEALLOCATE ALL")).await;
                 true
             }
             Err(e) => {
@@ -334,6 +355,9 @@ impl PgStore {
                 } else {
                     warn!("persistent probe: phase 2 (conn2) failed (disabling persistent): {e}");
                 }
+                // Clean up probe statements before returning connections to pool
+                let _ = Executor::execute(&mut *conn1, sqlx::raw_sql("DEALLOCATE ALL")).await;
+                let _ = Executor::execute(&mut *conn2, sqlx::raw_sql("DEALLOCATE ALL")).await;
                 false
             }
         }

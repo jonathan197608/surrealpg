@@ -5,18 +5,16 @@ use std::time::Duration;
 /// PostgreSQL storage engine configuration
 #[derive(Clone, Debug)]
 pub struct PgConfig {
-    /// Maximum connection pool size
-    pub max_connections: u32,
-    /// Minimum idle connections
-    pub min_connections: u32,
-    /// Connection acquisition timeout
-    pub connect_timeout: Duration,
-    /// Idle connection timeout (None = no timeout)
+    /// Maximum connection pool size (None = defer to PgTuneConfig)
+    pub max_connections: Option<u32>,
+    /// Minimum idle connections (None = defer to PgTuneConfig)
+    pub min_connections: Option<u32>,
+    /// Connection acquisition timeout (None = defer to PgTuneConfig)
+    pub connect_timeout: Option<Duration>,
+    /// Idle connection timeout (None = defer to PgTuneConfig)
     pub idle_timeout: Option<Duration>,
-    /// Maximum connection lifetime (None = no limit)
+    /// Maximum connection lifetime (None = defer to PgTuneConfig)
     pub max_lifetime: Option<Duration>,
-    /// SQL statement timeout (None = no limit; superseded by PgTuneConfig when tuning is active)
-    pub statement_timeout: Option<Duration>,
     /// Automatically create the table on startup
     pub auto_create_table: bool,
     /// Table name (default `kv`; use `kv_test` for tests)
@@ -109,12 +107,11 @@ impl PgIsolation {
 impl Default for PgConfig {
     fn default() -> Self {
         Self {
-            max_connections: 20,
-            min_connections: 5,
-            connect_timeout: Duration::from_secs(10),
-            idle_timeout: Some(Duration::from_secs(600)),
-            max_lifetime: Some(Duration::from_secs(1800)),
-            statement_timeout: Some(Duration::from_secs(30)),
+            max_connections: None,
+            min_connections: None,
+            connect_timeout: None,
+            idle_timeout: None,
+            max_lifetime: None,
             auto_create_table: true,
             table_name: "kv".to_string(),
             isolation_level: PgIsolation::default(),
@@ -125,6 +122,24 @@ impl Default for PgConfig {
 }
 
 impl PgConfig {
+    /// Validate that a SQL identifier (table name) contains only safe characters.
+    ///
+    /// Prevents SQL injection through the `table_name` URL parameter.
+    /// Only alphanumeric characters and underscores are allowed.
+    fn validate_identifier(name: &str) -> Result<(), String> {
+        if !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "invalid table name '{name}': must be non-empty and contain only [a-zA-Z0-9_]"
+            ))
+        }
+    }
+
     /// Apply configuration from environment variables.
     ///
     /// This is called **after** [`merge_url_params`](Self::merge_url_params),
@@ -155,9 +170,10 @@ impl PgConfig {
     /// Parse configuration overrides from query parameters in a PG URL.
     ///
     /// Supported params: `max_connections`, `min_connections`,
-    /// `statement_timeout` (seconds), `auto_create_table` (bool),
-    /// `isolation_level` (read_committed|repeatable_read|serializable),
-    /// `persistent_statements` (auto|true|false).
+    /// `connect_timeout` (seconds), `idle_timeout` (seconds),
+    /// `max_lifetime` (seconds), `auto_create_table` (bool),
+    /// `table_name` (identifier), `isolation_level`,
+    /// `read_only_optimization` (bool), `persistent_statements`.
     pub fn merge_url_params(&mut self, url: &str) {
         // Parse the query string manually to avoid adding a URL-parsing dep.
         if let Some(query) = url.split('?').nth(1) {
@@ -165,18 +181,25 @@ impl PgConfig {
                 if let Some((key, value)) = pair.split_once('=') {
                     match key {
                         "max_connections" => {
-                            if let Ok(v) = value.parse() {
-                                self.max_connections = v;
+                            if let Ok(v) = value.parse::<u32>() {
+                                if v == 0 {
+                                    tracing::warn!("max_connections=0 is invalid, ignoring");
+                                } else {
+                                    self.max_connections = Some(v);
+                                }
                             }
                         }
                         "min_connections" => {
-                            if let Ok(v) = value.parse() {
-                                self.min_connections = v;
-                            }
-                        }
-                        "statement_timeout" => {
-                            if let Ok(secs) = value.parse() {
-                                self.statement_timeout = Some(Duration::from_secs(secs));
+                            if let Ok(v) = value.parse::<u32>() {
+                                if let Some(max) = self.max_connections
+                                    && v > max
+                                {
+                                    tracing::warn!(
+                                        "min_connections={v} > max_connections={max}, ignoring"
+                                    );
+                                    continue;
+                                }
+                                self.min_connections = Some(v);
                             }
                         }
                         "max_lifetime" => {
@@ -190,6 +213,10 @@ impl PgConfig {
                             }
                         }
                         "table_name" => {
+                            if let Err(e) = Self::validate_identifier(value) {
+                                tracing::error!("{e}");
+                                panic!("{e}");
+                            }
                             self.table_name = value.to_string();
                         }
                         "isolation_level" => {
@@ -202,6 +229,21 @@ impl PgConfig {
                         "persistent_statements" => {
                             if let Some(v) = PersistentStatements::parse(value) {
                                 self.persistent_statements = v;
+                            }
+                        }
+                        "connect_timeout" => {
+                            if let Ok(secs) = value.parse() {
+                                self.connect_timeout = Some(Duration::from_secs(secs));
+                            }
+                        }
+                        "idle_timeout" => {
+                            if let Ok(secs) = value.parse() {
+                                self.idle_timeout = Some(Duration::from_secs(secs));
+                            }
+                        }
+                        "read_only_optimization" => {
+                            if let Ok(v) = value.parse::<bool>() {
+                                self.read_only_optimization = v;
                             }
                         }
                         _ => {}

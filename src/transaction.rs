@@ -6,7 +6,7 @@
 use std::ops::{DerefMut, Range};
 
 use sqlx::{Executor, Row};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::config::PgIsolation;
 use crate::error::{PgStoreError, Result};
@@ -368,6 +368,13 @@ impl PgTransaction {
         skip: u32,
         direction: &str,
     ) -> Result<Vec<sqlx::postgres::PgRow>> {
+        if skip > 1000 {
+            warn!(
+                skip,
+                limit,
+                "large OFFSET in range scan — consider cursor-based pagination"
+            );
+        }
         let sql = format!(
             "SELECT {select} FROM {} WHERE key >= $1 AND key < $2 \
              ORDER BY key {direction} LIMIT $3 OFFSET $4",

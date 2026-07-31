@@ -14,6 +14,8 @@
 
 use std::sync::Arc;
 
+use tokio_util::sync::CancellationToken;
+
 use surreal_pg::store::PgStore;
 
 /// Type alias for test case functions to avoid clippy type_complexity warning.
@@ -102,7 +104,7 @@ async fn del_key(store: &Arc<PgStore>, key: &[u8]) -> Result<(), String> {
 
 async fn clean_all(store: &Arc<PgStore>) {
     let mut tx = store.begin(true).await.unwrap();
-    tx.delr(vec![]..vec![0xFF]).await.ok();
+    tx.delr(vec![]..vec![0xFF; 16]).await.ok();
     tx.commit().await.ok();
 }
 
@@ -503,7 +505,7 @@ async fn integration_test_suite() {
     match std::env::var("PG_TEST_URL") {
         Ok(raw_url) => {
             let url = ensure_test_table(&raw_url);
-            let store = PgStore::new(&url).await.unwrap();
+            let store = PgStore::new(&url, CancellationToken::new()).await.unwrap();
 
             // Verify persistent-statements auto-detection produced a sane result.
             // The test runs against Supabase Pooler (pgbouncer transaction mode

@@ -51,10 +51,7 @@ impl PostgresComposer {
 
     /// Check whether a path should be handled by the PostgreSQL backend.
     fn is_pg_path(path: &str) -> bool {
-        path.starts_with("postgres://")
-            || path.starts_with("postgresql://")
-            || path.starts_with("postgres:")
-            || path.starts_with("postgresql:")
+        path.starts_with("postgres:") || path.starts_with("postgresql:")
     }
 }
 
@@ -96,7 +93,7 @@ impl TransactionBuilderFactory for PostgresComposer {
         if Self::is_pg_path(path) {
             info!("Starting PostgreSQL kvs store at {path}");
 
-            let store = PgStore::new(path).await?;
+            let store = PgStore::new(path, canceller.clone()).await?;
 
             info!("Started PostgreSQL kvs store");
 

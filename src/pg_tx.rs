@@ -102,9 +102,7 @@ impl Transactable for PgTx {
             if self.done.swap(true, Ordering::AcqRel) {
                 return Err(kvs::Error::TransactionFinished);
             }
-            if !self.write {
-                return Err(kvs::Error::TransactionReadonly);
-            }
+            // PG natively supports COMMIT on read-only transactions.
             let mut guard = self.inner.lock().await;
             if let Some(tx) = guard.as_mut() {
                 tx.commit().await.map_err(kvs::Error::from)?;
@@ -119,7 +117,7 @@ impl Transactable for PgTx {
         Box::pin(async move {
             Self::check_version(version)?;
             let mut guard = self.lock().await?;
-            let tx = guard.as_mut().expect("guarded txn");
+            let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
             tx.exists(key).await.map_err(kvs::Error::from)
         })
     }
@@ -128,7 +126,7 @@ impl Transactable for PgTx {
         Box::pin(async move {
             Self::check_version(version)?;
             let mut guard = self.lock().await?;
-            let tx = guard.as_mut().expect("guarded txn");
+            let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
             tx.get(key).await.map_err(kvs::Error::from)
         })
     }
@@ -142,7 +140,7 @@ impl Transactable for PgTx {
                 return Err(kvs::Error::TransactionReadonly);
             }
             let mut guard = self.lock().await?;
-            let tx = guard.as_mut().expect("guarded txn");
+            let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
             tx.set(key, val).await.map_err(kvs::Error::from)
         })
     }
@@ -156,7 +154,7 @@ impl Transactable for PgTx {
                 return Err(kvs::Error::TransactionReadonly);
             }
             let mut guard = self.lock().await?;
-            let tx = guard.as_mut().expect("guarded txn");
+            let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
             tx.put(key, val).await.map_err(kvs::Error::from)
         })
     }
@@ -170,7 +168,7 @@ impl Transactable for PgTx {
                 return Err(kvs::Error::TransactionReadonly);
             }
             let mut guard = self.lock().await?;
-            let tx = guard.as_mut().expect("guarded txn");
+            let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
             tx.putc(key, val, chk).await.map_err(kvs::Error::from)
         })
     }
@@ -184,7 +182,7 @@ impl Transactable for PgTx {
                 return Err(kvs::Error::TransactionReadonly);
             }
             let mut guard = self.lock().await?;
-            let tx = guard.as_mut().expect("guarded txn");
+            let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
             tx.del(key).await.map_err(kvs::Error::from)
         })
     }
@@ -198,7 +196,7 @@ impl Transactable for PgTx {
                 return Err(kvs::Error::TransactionReadonly);
             }
             let mut guard = self.lock().await?;
-            let tx = guard.as_mut().expect("guarded txn");
+            let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
             tx.delc(key, chk).await.map_err(kvs::Error::from)
         })
     }
@@ -213,7 +211,7 @@ impl Transactable for PgTx {
         Box::pin(async move {
             Self::check_version(version)?;
             let mut guard = self.lock().await?;
-            let tx = guard.as_mut().expect("guarded txn");
+            let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
             let keys = tx.keys(rng, limit, skip).await.map_err(kvs::Error::from)?;
             let key_bytes = keys.iter().map(|k| k.len() as u64).sum();
             Ok(KeysResult { keys, key_bytes })
@@ -230,7 +228,7 @@ impl Transactable for PgTx {
         Box::pin(async move {
             Self::check_version(version)?;
             let mut guard = self.lock().await?;
-            let tx = guard.as_mut().expect("guarded txn");
+            let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
             let keys = tx.keysr(rng, limit, skip).await.map_err(kvs::Error::from)?;
             let key_bytes = keys.iter().map(|k| k.len() as u64).sum();
             Ok(KeysResult { keys, key_bytes })
@@ -247,7 +245,7 @@ impl Transactable for PgTx {
         Box::pin(async move {
             Self::check_version(version)?;
             let mut guard = self.lock().await?;
-            let tx = guard.as_mut().expect("guarded txn");
+            let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
             let values = tx.scan(rng, limit, skip).await.map_err(kvs::Error::from)?;
             let key_bytes = values.iter().map(|(k, _)| k.len() as u64).sum();
             let value_bytes = values.iter().map(|(_, v)| v.len() as u64).sum();
@@ -269,7 +267,7 @@ impl Transactable for PgTx {
         Box::pin(async move {
             Self::check_version(version)?;
             let mut guard = self.lock().await?;
-            let tx = guard.as_mut().expect("guarded txn");
+            let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
             let values = tx.scanr(rng, limit, skip).await.map_err(kvs::Error::from)?;
             let key_bytes = values.iter().map(|(k, _)| k.len() as u64).sum();
             let value_bytes = values.iter().map(|(_, v)| v.len() as u64).sum();
@@ -284,7 +282,7 @@ impl Transactable for PgTx {
     fn new_save_point(&self) -> BoxFut<'_, kvs::Result<()>> {
         Box::pin(async move {
             let mut guard = self.lock().await?;
-            let tx = guard.as_mut().expect("guarded txn");
+            let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
             tx.new_save_point().await.map_err(kvs::Error::from)?;
             Ok(())
         })
@@ -293,7 +291,7 @@ impl Transactable for PgTx {
     fn release_last_save_point(&self) -> BoxFut<'_, kvs::Result<()>> {
         Box::pin(async move {
             let mut guard = self.lock().await?;
-            let tx = guard.as_mut().expect("guarded txn");
+            let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
             tx.release_last_save_point()
                 .await
                 .map_err(kvs::Error::from)?;
@@ -304,7 +302,7 @@ impl Transactable for PgTx {
     fn rollback_to_save_point(&self) -> BoxFut<'_, kvs::Result<()>> {
         Box::pin(async move {
             let mut guard = self.lock().await?;
-            let tx = guard.as_mut().expect("guarded txn");
+            let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
             tx.rollback_to_save_point()
                 .await
                 .map_err(kvs::Error::from)?;

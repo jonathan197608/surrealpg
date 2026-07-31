@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use tracing::info;
+use tracing::{info, warn};
 
 /// All tuning parameters for the PostgreSQL KV storage backend.
 #[derive(Clone, Debug)]
@@ -113,7 +113,11 @@ impl PgTuneConfig {
 
             // Table
             fillfactor: env_i32("PG_TUNED_TABLE_FILLFACTOR", 90),
-            toast_storage: env_str("PG_TUNED_TABLE_TOAST_STORAGE", "external"),
+            toast_storage: env_str_validated(
+                "PG_TUNED_TABLE_TOAST_STORAGE",
+                "external",
+                validate_toast_storage,
+            ),
             toast_threshold: env_i32("PG_TUNED_TABLE_TOAST_THRESHOLD", 2032),
             use_unlogged: env_bool("PG_TUNED_TABLE_UNLOGGED", false),
 
@@ -131,12 +135,32 @@ impl PgTuneConfig {
             stats_target: env_i32("PG_TUNED_QUERY_STATS_TARGET", 500),
 
             // PG server
-            server_shared_buffers: env_str("PG_TUNED_SERVER_SHARED_BUFFERS", "256MB"),
-            server_work_mem: env_str("PG_TUNED_SERVER_WORK_MEM", "64MB"),
-            server_maintenance_work_mem: env_str("PG_TUNED_SERVER_MAINTENANCE_WORK_MEM", "256MB"),
-            server_wal_buffers: env_str("PG_TUNED_SERVER_WAL_BUFFERS", "16MB"),
+            server_shared_buffers: env_str_validated(
+                "PG_TUNED_SERVER_SHARED_BUFFERS",
+                "256MB",
+                validate_pg_memory_size,
+            ),
+            server_work_mem: env_str_validated(
+                "PG_TUNED_SERVER_WORK_MEM",
+                "64MB",
+                validate_pg_memory_size,
+            ),
+            server_maintenance_work_mem: env_str_validated(
+                "PG_TUNED_SERVER_MAINTENANCE_WORK_MEM",
+                "256MB",
+                validate_pg_memory_size,
+            ),
+            server_wal_buffers: env_str_validated(
+                "PG_TUNED_SERVER_WAL_BUFFERS",
+                "16MB",
+                validate_pg_memory_size,
+            ),
             server_max_connections: env_i32("PG_TUNED_SERVER_MAX_CONNECTIONS", 100),
-            server_effective_cache_size: env_str("PG_TUNED_SERVER_EFFECTIVE_CACHE_SIZE", "1GB"),
+            server_effective_cache_size: env_str_validated(
+                "PG_TUNED_SERVER_EFFECTIVE_CACHE_SIZE",
+                "1GB",
+                validate_pg_memory_size,
+            ),
             server_random_page_cost: env_f64("PG_TUNED_SERVER_RANDOM_PAGE_COST", 1.1),
             server_checkpoint_target: env_f64("PG_TUNED_SERVER_CHECKPOINT_TARGET", 0.9),
         }
@@ -260,8 +284,47 @@ fn env_f64(key: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
-fn env_str(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+/// Like `env_str`, but validates the env value with a predicate.
+/// Falls back to the default if validation fails (with a warning).
+fn env_str_validated(key: &str, default: &str, validate: fn(&str) -> bool) -> String {
+    match std::env::var(key) {
+        Ok(ref v) if validate(v) => v.clone(),
+        Ok(ref v) => {
+            warn!(
+                env = key,
+                value = %v,
+                "invalid value, falling back to default '{default}'"
+            );
+            default.to_string()
+        }
+        Err(_) => default.to_string(),
+    }
+}
+
+/// Validate a PG memory size string (e.g. `64MB`, `1GB`, `256kB`).
+/// Must match `^[0-9]+(kB|MB|GB|TB)$` or plain integer (bytes).
+fn validate_pg_memory_size(v: &str) -> bool {
+    let v = v.trim();
+    if v.is_empty() {
+        return false;
+    }
+    // Plain integer (bytes)
+    if v.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    // Strip known suffixes and check remaining is digits
+    let suffixes = ["TB", "GB", "MB", "kB"];
+    for suffix in suffixes {
+        if let Some(prefix) = v.strip_suffix(suffix) {
+            return !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit());
+        }
+    }
+    false
+}
+
+/// Validate TOAST storage strategy: must be one of the four PG-allowed values.
+fn validate_toast_storage(v: &str) -> bool {
+    matches!(v, "external" | "extended" | "main" | "plain")
 }
 
 fn env_bool(key: &str, default: bool) -> bool {
@@ -355,5 +418,28 @@ mod tests {
         assert!(sql.contains("toast_tuple_target = 2032"));
         assert!(sql.contains("autovacuum_vacuum_scale_factor = 0.05"));
         assert!(!sql.contains("SET UNLOGGED"));
+    }
+
+    #[test]
+    fn test_validate_pg_memory_size() {
+        assert!(validate_pg_memory_size("64MB"));
+        assert!(validate_pg_memory_size("1GB"));
+        assert!(validate_pg_memory_size("256kB"));
+        assert!(validate_pg_memory_size("2TB"));
+        assert!(validate_pg_memory_size("1024"));
+        assert!(!validate_pg_memory_size(""));
+        assert!(!validate_pg_memory_size("64MB'; DROP TABLE kv; --"));
+        assert!(!validate_pg_memory_size("abc"));
+        assert!(!validate_pg_memory_size("64mb")); // lowercase not allowed by PG
+    }
+
+    #[test]
+    fn test_validate_toast_storage() {
+        assert!(validate_toast_storage("external"));
+        assert!(validate_toast_storage("extended"));
+        assert!(validate_toast_storage("main"));
+        assert!(validate_toast_storage("plain"));
+        assert!(!validate_toast_storage("evil'; DROP TABLE kv; --"));
+        assert!(!validate_toast_storage("EXTERNAL")); // case-sensitive
     }
 }

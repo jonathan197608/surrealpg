@@ -43,6 +43,10 @@ pub enum PgStoreError {
     #[error("connection pool closed")]
     PoolClosed,
 
+    /// Transaction cancelled due to server shutdown
+    #[error("transaction cancelled: server is shutting down")]
+    TxCancelled,
+
     /// A PostgreSQL / SQLx error that doesn't map to a specific variant
     #[error("postgres error: {0}")]
     Postgres(String),
@@ -118,6 +122,7 @@ impl From<PgStoreError> for surrealdb_core::kvs::Error {
             PgStoreError::PoolClosed => {
                 Self::ConnectionFailed("connection pool closed".to_string())
             }
+            PgStoreError::TxCancelled => Self::TransactionFinished,
             PgStoreError::Postgres(msg) => Self::Transaction(msg),
             PgStoreError::Other(msg) => Self::Transaction(msg),
         }
