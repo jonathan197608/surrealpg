@@ -112,8 +112,11 @@ impl Transactable for PgTx {
                 *guard = None;
                 return Err(kvs::Error::from(e));
             }
+            let had_tx = guard.is_some();
             *guard = None; // Drop the transaction, returning the connection to the pool
-            info!("PostgreSQL transaction cancelled");
+            if had_tx {
+                info!("PostgreSQL transaction cancelled");
+            }
             Ok(())
         })
     }

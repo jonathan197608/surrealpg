@@ -229,19 +229,25 @@ impl PgStore {
 
         // Attempt BEGIN directly. On the normal path (no leaked transaction),
         // this saves a network round-trip compared to always doing ROLLBACK first.
-        // If BEGIN fails with a "already in a transaction" error (25P01 or 25P02),
-        // we ROLLBACK the leaked transaction and retry once.
+        //
+        // Recovery: if BEGIN fails with 25P02 (in_failed_sql_transaction), the
+        // connection has a leaked failed transaction — we ROLLBACK and retry.
+        //
+        // Note: 25P01 (no_active_sql_transaction) is intentionally NOT checked
+        // because BEGIN never produces it — BEGIN's purpose is to *start* a
+        // transaction. A non-failed leaked active transaction would only
+        // produce a WARNING (not an error), so it cannot be detected here;
+        // that is a known limitation of the optimistic approach.
         let result = Executor::execute(&mut *conn, sqlx::raw_sql(begin_sql)).await;
         match result {
             Ok(_) => {}
             Err(e) => {
                 // Use SQLSTATE codes instead of string matching for
                 // cross-version reliability.
-                // 25P01 = no_active_sql_transaction
                 // 25P02 = in_failed_sql_transaction
-                let is_tx_active = matches!(&e, sqlx::Error::Database(db)
-                    if matches!(db.code().as_deref(), Some("25P01") | Some("25P02")));
-                if is_tx_active {
+                let is_failed_tx = matches!(&e, sqlx::Error::Database(db)
+                    if matches!(db.code().as_deref(), Some("25P02")));
+                if is_failed_tx {
                     // Leaked transaction detected — clean up and retry.
                     let _ = Executor::execute(&mut *conn, sqlx::raw_sql("ROLLBACK"))
                         .await

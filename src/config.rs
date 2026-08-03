@@ -264,7 +264,7 @@ impl PgConfig {
                         }
                         "isolation_level" => {
                             self.isolation_level = match value.to_ascii_lowercase().as_str() {
-                                "repeatable_read" => PgIsolation::RepeatableRead,
+                                "repeatable_read" | "repeatable read" => PgIsolation::RepeatableRead,
                                 "serializable" => PgIsolation::Serializable,
                                 "read_committed" | "read committed" => PgIsolation::ReadCommitted,
                                 _ => {

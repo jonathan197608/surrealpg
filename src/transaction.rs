@@ -322,7 +322,6 @@ impl PgTransaction {
         self.close(); // Always close — release connection even on error
         result?;
         debug!("transaction rolled back");
-        self.close();
         Ok(())
     }
 
