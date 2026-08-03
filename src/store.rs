@@ -45,8 +45,22 @@ impl PgStore {
     pub async fn new(url: &str, canceller: CancellationToken) -> Result<Arc<Self>> {
         // ── Load configs ──
         let mut config = PgConfig::default();
-        config.merge_url_params(url);
+        config
+            .merge_url_params(url)
+            .map_err(PgStoreError::Other)?;
         config.merge_env();
+
+        // Post-merge cross-validation: min_connections must not exceed max_connections.
+        // This catches the case where URL params appear in an order that defeats
+        // the per-field check (e.g. ?min_connections=20&max_connections=10).
+        if let (Some(min), Some(max)) = (config.min_connections, config.max_connections)
+            && min > max
+        {
+            tracing::warn!(
+                "min_connections={min} > max_connections={max}, capping min to max"
+            );
+            config.min_connections = Some(max);
+        }
 
         let tune = PgTuneConfig::from_env();
 

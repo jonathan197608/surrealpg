@@ -174,7 +174,10 @@ impl PgConfig {
     /// `max_lifetime` (seconds), `auto_create_table` (bool),
     /// `table_name` (identifier), `isolation_level`,
     /// `read_only_optimization` (bool), `persistent_statements`.
-    pub fn merge_url_params(&mut self, url: &str) {
+    ///
+    /// Returns `Err` if the `table_name` parameter contains invalid characters,
+    /// allowing the caller to fail gracefully instead of panicking.
+    pub fn merge_url_params(&mut self, url: &str) -> Result<(), String> {
         // Parse the query string manually to avoid adding a URL-parsing dep.
         if let Some(query) = url.split('?').nth(1) {
             for pair in query.split('&') {
@@ -213,10 +216,7 @@ impl PgConfig {
                             }
                         }
                         "table_name" => {
-                            if let Err(e) = Self::validate_identifier(value) {
-                                tracing::error!("{e}");
-                                panic!("{e}");
-                            }
+                            Self::validate_identifier(value)?;
                             self.table_name = value.to_string();
                         }
                         "isolation_level" => {
@@ -251,5 +251,6 @@ impl PgConfig {
                 }
             }
         }
+        Ok(())
     }
 }
