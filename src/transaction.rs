@@ -540,6 +540,22 @@ impl PgTransaction {
             .map_err(|e| PgStoreError::from_sqlx(None, &e))
     }
 
+    /// Internal: dispatch between cursor-based (keyset) and OFFSET-based
+    /// range scan depending on whether a cursor is provided.
+    async fn range_query_cursor(
+        &mut self,
+        after_variant: RangeSql,
+        offset_variant: RangeSql,
+        rng: Range<Key>,
+        limit: u32,
+        cursor: Option<&[u8]>,
+    ) -> Result<Vec<sqlx::postgres::PgRow>> {
+        match cursor {
+            Some(c) => self.range_query_after(after_variant, rng, limit, c).await,
+            None => self.range_query_offset(offset_variant, rng, limit, 0).await,
+        }
+    }
+
     /// Internal: extract keys from rows.
     fn rows_to_keys(rows: Vec<sqlx::postgres::PgRow>) -> Vec<Key> {
         rows.into_iter()
@@ -607,16 +623,9 @@ impl PgTransaction {
         limit: u32,
         cursor: Option<Key>,
     ) -> Result<Vec<Key>> {
-        let rows = match cursor {
-            Some(c) => {
-                self.range_query_after(RangeSql::AfterKeysAsc, rng, limit, &c)
-                    .await?
-            }
-            None => {
-                self.range_query_offset(RangeSql::KeysAsc, rng, limit, 0)
-                    .await?
-            }
-        };
+        let rows = self
+            .range_query_cursor(RangeSql::AfterKeysAsc, RangeSql::KeysAsc, rng, limit, cursor.as_deref())
+            .await?;
         Ok(Self::rows_to_keys(rows))
     }
 
@@ -630,16 +639,9 @@ impl PgTransaction {
         limit: u32,
         cursor: Option<Key>,
     ) -> Result<Vec<(Key, Val)>> {
-        let rows = match cursor {
-            Some(c) => {
-                self.range_query_after(RangeSql::AfterKvAsc, rng, limit, &c)
-                    .await?
-            }
-            None => {
-                self.range_query_offset(RangeSql::KvAsc, rng, limit, 0)
-                    .await?
-            }
-        };
+        let rows = self
+            .range_query_cursor(RangeSql::AfterKvAsc, RangeSql::KvAsc, rng, limit, cursor.as_deref())
+            .await?;
         if let Some(last) = rows.last() {
             self.last_scan_key_asc = Some(last.get::<Vec<u8>, _>("key"));
         }
