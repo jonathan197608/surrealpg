@@ -523,7 +523,7 @@ fn test_count_approx(store: &Arc<PgStore>) -> futures::future::BoxFuture<'_, Res
                 .begin(true)
                 .await
                 .map_err(|e| e.to_string())?;
-            tx.delr(b"test:approx:".to_vec()..b"test:approx:".to_vec())
+            tx.delr(b"test:approx:".to_vec()..b"test:approx;".to_vec())
                 .await
                 .map_err(|e| e.to_string())?;
             tx.commit().await.map_err(|e| e.to_string())?;
