@@ -184,10 +184,15 @@ impl PgTuneConfig {
         )
     }
 
-    /// Generate table tuning DDL: fillfactor, TOAST storage, autovacuum, UNLOGGED.
+    /// Generate table tuning DDL: fillfactor, TOAST storage, autovacuum.
     ///
     /// This should be executed **once** after `create_table_sql`. Failure is
     /// non-fatal (logged as warning) — the table still works without tuning.
+    ///
+    /// Note: `UNLOGGED` is handled by `create_table_sql` via
+    /// `CREATE UNLOGGED TABLE`, so no ALTER SET UNLOGGED is needed here
+    /// (the redundant ALTER was removed — it was a no-op since the table
+    /// is already UNLOGGED from creation).
     ///
     /// # Panics
     ///
@@ -196,11 +201,6 @@ impl PgTuneConfig {
     pub fn tune_table_sql(&self, table: &str) -> String {
         crate::config::PgConfig::validate_identifier(table)
             .expect("table name must be a valid SQL identifier");
-        let unlogged_alter = if self.use_unlogged {
-            format!("ALTER TABLE {table} SET UNLOGGED;")
-        } else {
-            String::new()
-        };
         format!(
             r#"
 -- Table storage tuning
@@ -214,8 +214,7 @@ ALTER TABLE {table} SET (
     autovacuum_analyze_scale_factor = {ascale},
     autovacuum_vacuum_cost_limit = {vclimit},
     autovacuum_vacuum_cost_delay = {vcdelay}
-);
-{unlogged_alter}"#,
+);"#,
             fillfactor = self.fillfactor,
             toast = self.toast_storage,
             toast_threshold = self.toast_threshold,

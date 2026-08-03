@@ -134,8 +134,11 @@ impl Transactable for PgTx {
                 *guard = None;
                 return Err(kvs::Error::from(e));
             }
+            let had_tx = guard.is_some();
             *guard = None;
-            info!("PostgreSQL transaction committed");
+            if had_tx {
+                info!("PostgreSQL transaction committed");
+            }
             Ok(())
         })
     }

@@ -39,24 +39,32 @@ async fn surreal_kv_basic_crud() {
     let sess = Session::owner().with_ns("crud_test").with_db("crud_test");
 
     // Ensure namespace, database, and table exist
-    ds.execute("DEFINE NAMESPACE crud_test", &sess, None)
+    if let Err(e) = ds.execute("DEFINE NAMESPACE crud_test", &sess, None).await {
+        eprintln!("[WARN] DEFINE NAMESPACE failed (may already exist): {e}");
+    }
+    if let Err(e) = ds.execute("DEFINE DATABASE crud_test", &sess, None).await {
+        eprintln!("[WARN] DEFINE DATABASE failed (may already exist): {e}");
+    }
+    if let Err(e) = ds.execute("DEFINE TABLE person SCHEMAFULL", &sess, None).await {
+        eprintln!("[WARN] DEFINE TABLE failed (may already exist): {e}");
+    }
+    if let Err(e) = ds
+        .execute("DEFINE FIELD name ON person TYPE string", &sess, None)
         .await
-        .ok();
-    ds.execute("DEFINE DATABASE crud_test", &sess, None)
+    {
+        eprintln!("[WARN] DEFINE FIELD name failed: {e}");
+    }
+    if let Err(e) = ds
+        .execute("DEFINE FIELD age ON person TYPE int", &sess, None)
         .await
-        .ok();
-    ds.execute("DEFINE TABLE person SCHEMAFULL", &sess, None)
-        .await
-        .ok();
-    ds.execute("DEFINE FIELD name ON person TYPE string", &sess, None)
-        .await
-        .ok();
-    ds.execute("DEFINE FIELD age ON person TYPE int", &sess, None)
-        .await
-        .ok();
+    {
+        eprintln!("[WARN] DEFINE FIELD age failed: {e}");
+    }
 
     // Clean up any stale data from previous runs
-    ds.execute("DELETE FROM person", &sess, None).await.ok();
+    if let Err(e) = ds.execute("DELETE FROM person", &sess, None).await {
+        eprintln!("[WARN] DELETE FROM person failed: {e}");
+    }
 
     // CREATE
     let result = ds
@@ -104,7 +112,9 @@ async fn surreal_kv_basic_crud() {
     let records = response.remove(0).result.expect("query result");
     assert!(records.is_empty(), "Alice should be gone");
 
-    ds.shutdown().await.ok();
+    if let Err(e) = ds.shutdown().await {
+        eprintln!("[WARN] shutdown failed: {e}");
+    }
 }
 
 #[tokio::test]
@@ -120,21 +130,35 @@ async fn surreal_kv_transaction_rollback() {
         .with_db("rollback_test");
 
     // Ensure namespace, database, and table exist
-    ds.execute("DEFINE NAMESPACE rollback_test", &sess, None)
+    if let Err(e) = ds
+        .execute("DEFINE NAMESPACE rollback_test", &sess, None)
         .await
-        .ok();
-    ds.execute("DEFINE DATABASE rollback_test", &sess, None)
+    {
+        eprintln!("[WARN] DEFINE NAMESPACE failed (may already exist): {e}");
+    }
+    if let Err(e) = ds
+        .execute("DEFINE DATABASE rollback_test", &sess, None)
         .await
-        .ok();
-    ds.execute("DEFINE TABLE tx_test SCHEMAFULL", &sess, None)
+    {
+        eprintln!("[WARN] DEFINE DATABASE failed (may already exist): {e}");
+    }
+    if let Err(e) = ds
+        .execute("DEFINE TABLE tx_test SCHEMAFULL", &sess, None)
         .await
-        .ok();
-    ds.execute("DEFINE FIELD val ON tx_test TYPE int", &sess, None)
+    {
+        eprintln!("[WARN] DEFINE TABLE failed (may already exist): {e}");
+    }
+    if let Err(e) = ds
+        .execute("DEFINE FIELD val ON tx_test TYPE int", &sess, None)
         .await
-        .ok();
+    {
+        eprintln!("[WARN] DEFINE FIELD val failed: {e}");
+    }
 
     // Clean up any existing data
-    ds.execute("DELETE FROM tx_test", &sess, None).await.ok();
+    if let Err(e) = ds.execute("DELETE FROM tx_test", &sess, None).await {
+        eprintln!("[WARN] DELETE FROM tx_test failed: {e}");
+    }
 
     // Begin transaction, create data, then rollback
     let query = "BEGIN; CREATE tx_test SET val = 1; CANCEL;";
@@ -153,5 +177,7 @@ async fn surreal_kv_transaction_rollback() {
     let records = response.remove(0).result.expect("query result");
     assert!(records.is_empty(), "tx_test should be empty after rollback");
 
-    ds.shutdown().await.ok();
+    if let Err(e) = ds.shutdown().await {
+        eprintln!("[WARN] shutdown failed: {e}");
+    }
 }

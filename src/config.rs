@@ -122,22 +122,52 @@ impl Default for PgConfig {
 }
 
 impl PgConfig {
-    /// Validate that a SQL identifier (table name) contains only safe characters.
+    /// Validate that a SQL identifier (table name) contains only safe characters
+    /// and is not a SQL reserved word.
     ///
     /// Prevents SQL injection through the `table_name` URL parameter.
     /// Only alphanumeric characters and underscores are allowed.
+    /// Common SQL reserved words (e.g. `SELECT`, `TABLE`) are rejected
+    /// because they would cause syntax errors when interpolated into DDL/DML.
     pub(crate) fn validate_identifier(name: &str) -> Result<(), String> {
-        if !name.is_empty()
-            && name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
-            Ok(())
-        } else {
-            Err(format!(
-                "invalid table name '{name}': must be non-empty and contain only [a-zA-Z0-9_]"
-            ))
+        if name.is_empty() {
+            return Err("invalid table name '': must be non-empty and contain only [a-zA-Z0-9_]".to_string());
         }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err(format!(
+                "invalid table name '{name}': must contain only [a-zA-Z0-9_]"
+            ));
+        }
+        // Reject common SQL reserved words that would cause syntax errors.
+        // This is not exhaustive (PG has ~500 reserved words) but covers the
+        // most likely accidental misconfigurations.
+        if Self::is_sql_reserved(name) {
+            return Err(format!(
+                "invalid table name '{name}': SQL reserved word"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check if a name is a common SQL reserved word (case-insensitive).
+    fn is_sql_reserved(name: &str) -> bool {
+        // Curated list of reserved words most likely to appear as accidental
+        // table names. PG has ~500 reserved words; we check the most common
+        // DDL/DML keywords that would cause immediate syntax errors.
+        const RESERVED: &[&str] = &[
+            "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER",
+            "TABLE", "INDEX", "VIEW", "FROM", "WHERE", "SET", "VALUES", "INTO",
+            "ORDER", "GROUP", "HAVING", "LIMIT", "OFFSET", "AS", "ON", "AND",
+            "OR", "NOT", "NULL", "DEFAULT", "PRIMARY", "KEY", "FOREIGN",
+            "REFERENCES", "UNIQUE", "CHECK", "CONSTRAINT", "BEGIN", "COMMIT",
+            "ROLLBACK", "SAVEPOINT", "GRANT", "REVOKE", "EXPLAIN", "VACUUM",
+            "TRUNCATE", "RETURNING", "WITH", "UNION", "INTERSECT", "EXCEPT",
+        ];
+        let upper = name.to_ascii_uppercase();
+        RESERVED.contains(&upper.as_str())
     }
 
     /// Apply configuration from environment variables.

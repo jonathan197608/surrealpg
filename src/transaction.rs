@@ -255,9 +255,14 @@ impl PgTransaction {
                 pos += 1;
             }
         }
-        let name = std::str::from_utf8(&buf[..pos])
-            .expect("savepoint name is always valid UTF-8")
-            .to_string();
+        // Safety: buf[..pos] is always valid UTF-8 because we only
+        // write ASCII bytes ('s', 'p', '_', '0'-'9') into the buffer.
+        // Using from_utf8_unchecked avoids a redundant validation branch,
+        // but we add a debug_assert for defense-in-depth.
+        let name_slice = &buf[..pos];
+        debug_assert!(std::str::from_utf8(name_slice).is_ok(),
+            "savepoint name must be valid UTF-8");
+        let name = unsafe { std::str::from_utf8_unchecked(name_slice) }.to_string();
         self.savepoints.push(name.clone());
         name
     }
@@ -283,9 +288,10 @@ impl PgTransaction {
         );
         buf[..prefix_len].copy_from_slice(prefix.as_bytes());
         buf[prefix_len..total].copy_from_slice(name_bytes);
-        std::str::from_utf8(&buf[..total])
-            .expect("savepoint SQL is always valid UTF-8")
-            .to_string()
+        // Safety: same as push_savepoint_name — only ASCII bytes.
+        debug_assert!(std::str::from_utf8(&buf[..total]).is_ok(),
+            "savepoint SQL must be valid UTF-8");
+        unsafe { std::str::from_utf8_unchecked(&buf[..total]) }.to_string()
     }
 
     // ─── Transaction control ─────────────────────────────

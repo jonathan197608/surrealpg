@@ -15,9 +15,9 @@ path = "src/lib.rs"
 
 [dependencies]
 # SurrealDB server engine — provides init(), CLI, HTTP/WS/GraphQL, full SurrealQL
-surrealdb-server = { version = "3.2.3" }
+surrealdb-server = { version = "^3.2" }
 # SurrealDB core — provides CommunityComposer, kvs traits, Transactable, etc.
-surrealdb-core = { version = "3.2.3" }
+surrealdb-core = { version = "^3.2" }
 
 # PostgreSQL driver
 sqlx = { version = "0.8", default-features = false, features = [

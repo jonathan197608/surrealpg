@@ -22,13 +22,13 @@ CREATE TABLE IF NOT EXISTS kv (
 -- -- Store large values out-of-line (reduces TOAST table scan overhead):
 -- ALTER TABLE kv ALTER COLUMN val SET STORAGE external;
 --
--- -- Autovacuum tuning for high-churn KV workloads:
+-- -- Autovacuum tuning for high-churn KV workloads (matches PgTuneConfig defaults):
 -- ALTER TABLE kv SET (
 --     autovacuum_enabled = true,
---     autovacuum_vacuum_scale_factor = 0.1,
---     autovacuum_vacuum_threshold = 1000,
---     autovacuum_analyze_scale_factor = 0.05,
---     autovacuum_analyze_threshold = 500
+--     autovacuum_vacuum_scale_factor = 0.05,
+--     autovacuum_vacuum_threshold = 50,
+--     autovacuum_analyze_scale_factor = 0.02,
+--     autovacuum_analyze_threshold = 50
 -- );
 --
 -- See `PgTuneConfig` and the `PG_TUNED_*` environment variables for the full

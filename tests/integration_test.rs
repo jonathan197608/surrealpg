@@ -42,6 +42,11 @@ pub async fn run(store: &Arc<PgStore>) -> (u32, u32) {
         ("health check", test_health_check),
         ("pool size reporting", test_pool_size),
         ("batch setm", test_setm),
+        ("vacuum", test_vacuum),
+        ("try_resize_pool", test_try_resize_pool),
+        ("empty range scan", test_empty_range),
+        ("nested savepoint", test_nested_savepoint),
+        ("setm + delc combination", test_setm_delc_combo),
     ];
 
     let mut passed = 0u32;
@@ -638,6 +643,202 @@ fn test_setm(store: &Arc<PgStore>) -> futures::future::BoxFuture<'_, Result<(), 
         {
             let mut tx = store.begin(true).await.map_err(|e| e.to_string())?;
             tx.delr(b"test:setm:".to_vec()..b"test:setm;".to_vec())
+                .await
+                .map_err(|e| e.to_string())?;
+            tx.commit().await.map_err(|e| e.to_string())?;
+        }
+
+        Ok(())
+    })
+}
+
+fn test_vacuum(store: &Arc<PgStore>) -> futures::future::BoxFuture<'_, Result<(), String>> {
+    Box::pin(async {
+        // VACUUM ANALYZE should succeed without error.
+        store
+            .vacuum()
+            .await
+            .map_err(|e| format!("vacuum failed: {e}"))?;
+        Ok(())
+    })
+}
+
+fn test_try_resize_pool(
+    store: &Arc<PgStore>,
+) -> futures::future::BoxFuture<'_, Result<(), String>> {
+    Box::pin(async {
+        // try_resize_pool is a placeholder (sqlx 0.8 limitation).
+        // Validate arg checking: max < min should fail.
+        let res = store.try_resize_pool(5, 10);
+        assert!(res.is_err(), "max < min should be rejected");
+
+        // Valid args should succeed (even if no-op).
+        store
+            .try_resize_pool(20, 5)
+            .map_err(|e| format!("try_resize_pool(20,5) failed: {e}"))?;
+        Ok(())
+    })
+}
+
+fn test_empty_range(store: &Arc<PgStore>) -> futures::future::BoxFuture<'_, Result<(), String>> {
+    Box::pin(async {
+        // Empty range (start >= end) should return 0 keys / 0 count without error.
+        let mut tx = store.begin(false).await.map_err(|e| e.to_string())?;
+
+        let keys = tx
+            .keys(b"test:z".to_vec()..b"test:a".to_vec(), 10, 0)
+            .await
+            .map_err(|e| e.to_string())?;
+        assert!(keys.is_empty(), "empty range should return no keys");
+
+        let cnt = tx
+            .count(b"test:z".to_vec()..b"test:a".to_vec())
+            .await
+            .map_err(|e| e.to_string())?;
+        assert_eq!(cnt, 0, "empty range count should be 0");
+
+        let pairs = tx
+            .scan(b"test:z".to_vec()..b"test:a".to_vec(), 10, 0)
+            .await
+            .map_err(|e| e.to_string())?;
+        assert!(pairs.is_empty(), "empty range scan should return no pairs");
+
+        tx.cancel().await.map_err(|e| e.to_string())?;
+
+        // Also test delr with empty range (should be no-op).
+        let mut tx = store.begin(true).await.map_err(|e| e.to_string())?;
+        tx.delr(b"test:z".to_vec()..b"test:a".to_vec())
+            .await
+            .map_err(|e| e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
+fn test_nested_savepoint(
+    store: &Arc<PgStore>,
+) -> futures::future::BoxFuture<'_, Result<(), String>> {
+    Box::pin(async {
+        clean_all(store).await;
+
+        let mut tx = store.begin(true).await.map_err(|e| e.to_string())?;
+        tx.set(b"test:ns".to_vec(), b"v0".to_vec())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Savepoint 1
+        tx.new_save_point().await.map_err(|e| e.to_string())?;
+        tx.set(b"test:ns".to_vec(), b"v1".to_vec())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Savepoint 2 (nested)
+        tx.new_save_point().await.map_err(|e| e.to_string())?;
+        tx.set(b"test:ns".to_vec(), b"v2".to_vec())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Rollback to savepoint 2 — should restore v1
+        tx.rollback_to_save_point()
+            .await
+            .map_err(|e| e.to_string())?;
+        let val = tx
+            .get(b"test:ns".to_vec())
+            .await
+            .map_err(|e| e.to_string())?;
+        assert_eq!(
+            val,
+            Some(b"v1".to_vec()),
+            "nested rollback should restore v1"
+        );
+
+        // Rollback to savepoint 1 — should restore v0
+        tx.rollback_to_save_point()
+            .await
+            .map_err(|e| e.to_string())?;
+        let val = tx
+            .get(b"test:ns".to_vec())
+            .await
+            .map_err(|e| e.to_string())?;
+        assert_eq!(
+            val,
+            Some(b"v0".to_vec()),
+            "outer rollback should restore v0"
+        );
+
+        tx.commit().await.map_err(|e| e.to_string())?;
+        del_key(store, b"test:ns").await?;
+        Ok(())
+    })
+}
+
+fn test_setm_delc_combo(
+    store: &Arc<PgStore>,
+) -> futures::future::BoxFuture<'_, Result<(), String>> {
+    Box::pin(async {
+        clean_all(store).await;
+
+        // Insert 3 keys via setm, then delc one of them.
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..3u32)
+            .map(|i| {
+                (
+                    format!("test:combo:{i}").into_bytes(),
+                    format!("val_{i}").into_bytes(),
+                )
+            })
+            .collect();
+
+        {
+            let mut tx = store.begin(true).await.map_err(|e| e.to_string())?;
+            tx.setm(pairs).await.map_err(|e| e.to_string())?;
+            tx.commit().await.map_err(|e| e.to_string())?;
+        }
+
+        // delc with wrong check — key should survive
+        {
+            let mut tx = store.begin(true).await.map_err(|e| e.to_string())?;
+            let res = tx
+                .delc(b"test:combo:1".to_vec(), Some(b"wrong".to_vec()))
+                .await;
+            assert!(res.is_err(), "delc with wrong check should fail");
+
+            // delc with correct check
+            tx.delc(b"test:combo:1".to_vec(), Some(b"val_1".to_vec()))
+                .await
+                .map_err(|e| e.to_string())?;
+
+            tx.commit().await.map_err(|e| e.to_string())?;
+        }
+
+        // Verify: key 1 gone, keys 0 and 2 still present
+        {
+            let mut tx = store.begin(false).await.map_err(|e| e.to_string())?;
+            assert_eq!(
+                tx.get(b"test:combo:0".to_vec())
+                    .await
+                    .map_err(|e| e.to_string())?,
+                Some(b"val_0".to_vec())
+            );
+            assert_eq!(
+                tx.get(b"test:combo:1".to_vec())
+                    .await
+                    .map_err(|e| e.to_string())?,
+                None,
+                "delc'd key should be gone"
+            );
+            assert_eq!(
+                tx.get(b"test:combo:2".to_vec())
+                    .await
+                    .map_err(|e| e.to_string())?,
+                Some(b"val_2".to_vec())
+            );
+            tx.cancel().await.map_err(|e| e.to_string())?;
+        }
+
+        // Clean up
+        {
+            let mut tx = store.begin(true).await.map_err(|e| e.to_string())?;
+            tx.delr(b"test:combo:".to_vec()..b"test:combo;".to_vec())
                 .await
                 .map_err(|e| e.to_string())?;
             tx.commit().await.map_err(|e| e.to_string())?;
