@@ -59,7 +59,7 @@ impl PgStore {
         if let (Some(min), Some(max)) = (config.min_connections, config.max_connections)
             && min > max
         {
-            tracing::warn!(
+            warn!(
                 "min_connections={min} > max_connections={max}, capping min to max"
             );
             config.min_connections = Some(max);
@@ -90,7 +90,7 @@ impl PgStore {
             .after_connect(move |conn, _meta| {
                 let sql = session_sql.clone(); // Arc clone — atomic refcount, no heap alloc
                 Box::pin(async move {
-                    sqlx::Executor::execute(conn, sqlx::raw_sql(&sql)).await?;
+                    Executor::execute(conn, sqlx::raw_sql(&sql)).await?;
                     Ok(())
                 })
             })
@@ -319,7 +319,7 @@ impl PgStore {
                 "max_connections ({max}) must be >= min_connections ({min})"
             )));
         }
-        tracing::info!(
+        info!(
             "pool resize requested: max={max}, min={min} (not yet supported by sqlx 0.8)"
         );
         Ok(())

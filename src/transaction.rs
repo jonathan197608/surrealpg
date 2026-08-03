@@ -16,30 +16,6 @@ use crate::error::{PgStoreError, Result};
 pub type Key = Vec<u8>;
 pub type Val = Vec<u8>;
 
-// ─── ScanMode ────────────────────────────────────────────
-
-/// Pagination mode for range scans.
-///
-/// `Offset` is the traditional `OFFSET $4` mode (compatible with the
-/// existing `Transactable` trait). `After` uses keyset pagination
-/// (`WHERE key > $cursor`) which avoids the linear-scan cost of deep
-/// OFFSET on large tables.
-#[derive(Clone)]
-pub enum ScanMode {
-    /// Traditional OFFSET-based pagination (default, backward-compatible).
-    Offset(u32),
-    /// Keyset (cursor) pagination: return rows after the given cursor key.
-    /// The cursor is typically the last key returned by a previous scan,
-    /// enabling O(limit) deep-page performance instead of O(skip+limit).
-    After(Key),
-}
-
-impl Default for ScanMode {
-    fn default() -> Self {
-        Self::Offset(0)
-    }
-}
-
 // ─── Pre-built SQL ───────────────────────────────────────
 
 /// Pre-built SQL strings for all KV operations.
@@ -47,6 +23,26 @@ impl Default for ScanMode {
 /// Constructed once when a `PgTransaction` is created. Stored separately from
 /// the connection so that SQL references (`&sql.x`) don't conflict with
 /// `&mut self` borrows on the connection.
+/// Identifies which of the 6 pre-built range-scan SQL strings to use.
+///
+/// By pre-building all 6 combinations at construction time, we eliminate
+/// per-call `String::replace()` heap allocations entirely.
+#[derive(Clone, Copy)]
+enum RangeSql {
+    /// Offset mode, SELECT key, ASC
+    KeysAsc,
+    /// Offset mode, SELECT key, DESC
+    KeysDesc,
+    /// Offset mode, SELECT key, val, ASC
+    KvAsc,
+    /// Offset mode, SELECT key, val, DESC
+    KvDesc,
+    /// After-cursor mode, SELECT key, ASC
+    AfterKeysAsc,
+    /// After-cursor mode, SELECT key, val, ASC
+    AfterKvAsc,
+}
+
 struct Sql {
     exists: String,
     get: String,
@@ -58,11 +54,16 @@ struct Sql {
     delc: String,
     delr: String,
     count: String,
-    /// Range scan prefix with `{select}` and `{direction}` placeholders.
-    range_prefix: String,
-    /// Range scan prefix for keyset pagination with `{select}` placeholder.
-    range_after_prefix: String,
-    /// Original table name (for `count_approx` / `pg_class` queries).
+    // ── Pre-built range-scan SQL (6 fixed combinations) ──
+    // Offset mode: keys/keysr/scan/scanr (4 variants)
+    range_keys_asc: String,
+    range_keys_desc: String,
+    range_kv_asc: String,
+    range_kv_desc: String,
+    // After-cursor mode: keys_after/scan_after (2 variants, ASC only)
+    range_after_keys_asc: String,
+    range_after_kv_asc: String,
+    // Original table name (for `count_approx` / `pg_class` queries).
     table_name: String,
 }
 
@@ -85,13 +86,31 @@ impl Sql {
             delc: format!("DELETE FROM {table} WHERE key = $1 AND val = $2"),
             delr: format!("DELETE FROM {table} WHERE key >= $1 AND key < $2"),
             count: format!("SELECT count(*) AS cnt FROM {table} WHERE key >= $1 AND key < $2"),
-            range_prefix: format!(
-                "SELECT {{select}} FROM {table} WHERE key >= $1 AND key < $2 \
-                 ORDER BY key {{direction}} LIMIT $3 OFFSET $4"
+            // Offset mode — SELECT … ORDER BY key {dir} LIMIT $3 OFFSET $4
+            range_keys_asc: format!(
+                "SELECT key FROM {table} WHERE key >= $1 AND key < $2 \
+                 ORDER BY key ASC LIMIT $3 OFFSET $4"
             ),
-            range_after_prefix: format!(
-                "SELECT {{select}} FROM {table} WHERE key >= $1 AND key < $2 AND key > $3 \
-                 ORDER BY key {{direction}} LIMIT $4"
+            range_keys_desc: format!(
+                "SELECT key FROM {table} WHERE key >= $1 AND key < $2 \
+                 ORDER BY key DESC LIMIT $3 OFFSET $4"
+            ),
+            range_kv_asc: format!(
+                "SELECT key, val FROM {table} WHERE key >= $1 AND key < $2 \
+                 ORDER BY key ASC LIMIT $3 OFFSET $4"
+            ),
+            range_kv_desc: format!(
+                "SELECT key, val FROM {table} WHERE key >= $1 AND key < $2 \
+                 ORDER BY key DESC LIMIT $3 OFFSET $4"
+            ),
+            // After-cursor mode — SELECT … AND key > $3 ORDER BY key ASC LIMIT $4
+            range_after_keys_asc: format!(
+                "SELECT key FROM {table} WHERE key >= $1 AND key < $2 AND key > $3 \
+                 ORDER BY key ASC LIMIT $4"
+            ),
+            range_after_kv_asc: format!(
+                "SELECT key, val FROM {table} WHERE key >= $1 AND key < $2 AND key > $3 \
+                 ORDER BY key ASC LIMIT $4"
             ),
             table_name: table.to_string(),
         }
@@ -196,10 +215,10 @@ impl PgTransaction {
 
     /// Build a parameterised query with the configured `.persistent()` flag.
     #[inline]
-    fn build_query<'a>(
+    fn build_query(
         persistent: bool,
-        sql: &'a str,
-    ) -> sqlx::query::Query<'a, sqlx::Postgres, sqlx::postgres::PgArguments> {
+        sql: &str,
+    ) -> sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments> {
         sqlx::query(sql).persistent(persistent)
     }
 
@@ -459,61 +478,66 @@ impl PgTransaction {
 
     // ─── Range scans ─────────────────────────────────────
 
-    /// Internal: execute a range scan query, returning raw rows.
-    ///
-    /// Supports two pagination modes via `ScanMode`:
-    /// - `Offset(skip)`: traditional `OFFSET` pagination (backward-compatible)
-    /// - `After(cursor)`: keyset pagination using `WHERE key > $cursor`,
-    ///   which avoids the O(skip) cost of deep OFFSET
-    async fn range_query(
+    /// Resolve the pre-built SQL string for the given range-scan variant.
+    #[inline]
+    fn range_sql(sql: &Sql, variant: RangeSql) -> &str {
+        match variant {
+            RangeSql::KeysAsc => &sql.range_keys_asc,
+            RangeSql::KeysDesc => &sql.range_keys_desc,
+            RangeSql::KvAsc => &sql.range_kv_asc,
+            RangeSql::KvDesc => &sql.range_kv_desc,
+            RangeSql::AfterKeysAsc => &sql.range_after_keys_asc,
+            RangeSql::AfterKvAsc => &sql.range_after_kv_asc,
+        }
+    }
+
+    /// Internal: execute an OFFSET-based range scan, returning raw rows.
+    async fn range_query_offset(
         &mut self,
-        select: &str,
+        variant: RangeSql,
         rng: Range<Key>,
         limit: u32,
-        mode: ScanMode,
-        direction: &str,
+        skip: u32,
     ) -> Result<Vec<sqlx::postgres::PgRow>> {
-        let persistent = self.persistent;
-        let sql = self.sql.clone();
-        match mode {
-            ScanMode::Offset(skip) => {
-                if skip > 1000 {
-                    warn!(
-                        skip,
-                        limit,
-                        "large OFFSET in range scan — consider cursor-based pagination"
-                    );
-                }
-                let sql = sql
-                    .range_prefix
-                    .replace("{select}", select)
-                    .replace("{direction}", direction);
-                let conn = self.conn_mut()?;
-                Self::build_query(persistent, &sql)
-                    .bind(rng.start.as_slice())
-                    .bind(rng.end.as_slice())
-                    .bind(limit as i64)
-                    .bind(skip as i64)
-                    .fetch_all(conn)
-                    .await
-                    .map_err(|e| PgStoreError::from_sqlx(None, &e))
-            }
-            ScanMode::After(cursor) => {
-                let sql = sql
-                    .range_after_prefix
-                    .replace("{select}", select)
-                    .replace("{direction}", direction);
-                let conn = self.conn_mut()?;
-                Self::build_query(persistent, &sql)
-                    .bind(rng.start.as_slice())
-                    .bind(rng.end.as_slice())
-                    .bind(cursor.as_slice())
-                    .bind(limit as i64)
-                    .fetch_all(conn)
-                    .await
-                    .map_err(|e| PgStoreError::from_sqlx(None, &e))
-            }
+        if skip > 1000 {
+            warn!(
+                skip,
+                limit,
+                "large OFFSET in range scan — consider cursor-based pagination"
+            );
         }
+        let sql = self.sql.clone();
+        let persistent = self.persistent;
+        let sql_str = Self::range_sql(&sql, variant);
+        Self::build_query(persistent, sql_str)
+            .bind(rng.start.as_slice())
+            .bind(rng.end.as_slice())
+            .bind(limit as i64)
+            .bind(skip as i64)
+            .fetch_all(self.conn_mut()?)
+            .await
+            .map_err(|e| PgStoreError::from_sqlx(None, &e))
+    }
+
+    /// Internal: execute a cursor-based (keyset) range scan, returning raw rows.
+    async fn range_query_after(
+        &mut self,
+        variant: RangeSql,
+        rng: Range<Key>,
+        limit: u32,
+        cursor: &[u8],
+    ) -> Result<Vec<sqlx::postgres::PgRow>> {
+        let sql = self.sql.clone();
+        let persistent = self.persistent;
+        let sql_str = Self::range_sql(&sql, variant);
+        Self::build_query(persistent, sql_str)
+            .bind(rng.start.as_slice())
+            .bind(rng.end.as_slice())
+            .bind(cursor)
+            .bind(limit as i64)
+            .fetch_all(self.conn_mut()?)
+            .await
+            .map_err(|e| PgStoreError::from_sqlx(None, &e))
     }
 
     /// Internal: extract keys from rows.
@@ -532,13 +556,17 @@ impl PgTransaction {
 
     /// Scan keys in a range (ascending).
     pub async fn keys(&mut self, rng: Range<Key>, limit: u32, skip: u32) -> Result<Vec<Key>> {
-        let rows = self.range_query("key", rng, limit, ScanMode::Offset(skip), "ASC").await?;
+        let rows = self
+            .range_query_offset(RangeSql::KeysAsc, rng, limit, skip)
+            .await?;
         Ok(Self::rows_to_keys(rows))
     }
 
     /// Scan keys in a range (descending).
     pub async fn keysr(&mut self, rng: Range<Key>, limit: u32, skip: u32) -> Result<Vec<Key>> {
-        let rows = self.range_query("key", rng, limit, ScanMode::Offset(skip), "DESC").await?;
+        let rows = self
+            .range_query_offset(RangeSql::KeysDesc, rng, limit, skip)
+            .await?;
         Ok(Self::rows_to_keys(rows))
     }
 
@@ -550,7 +578,7 @@ impl PgTransaction {
         skip: u32,
     ) -> Result<Vec<(Key, Val)>> {
         let rows = self
-            .range_query("key, val", rng, limit, ScanMode::Offset(skip), "ASC")
+            .range_query_offset(RangeSql::KvAsc, rng, limit, skip)
             .await?;
         Ok(Self::rows_to_pairs(rows))
     }
@@ -563,7 +591,7 @@ impl PgTransaction {
         skip: u32,
     ) -> Result<Vec<(Key, Val)>> {
         let rows = self
-            .range_query("key, val", rng, limit, ScanMode::Offset(skip), "DESC")
+            .range_query_offset(RangeSql::KvDesc, rng, limit, skip)
             .await?;
         Ok(Self::rows_to_pairs(rows))
     }
@@ -579,11 +607,16 @@ impl PgTransaction {
         limit: u32,
         cursor: Option<Key>,
     ) -> Result<Vec<Key>> {
-        let mode = match cursor {
-            Some(c) => ScanMode::After(c),
-            None => ScanMode::Offset(0),
+        let rows = match cursor {
+            Some(c) => {
+                self.range_query_after(RangeSql::AfterKeysAsc, rng, limit, &c)
+                    .await?
+            }
+            None => {
+                self.range_query_offset(RangeSql::KeysAsc, rng, limit, 0)
+                    .await?
+            }
         };
-        let rows = self.range_query("key", rng, limit, mode, "ASC").await?;
         Ok(Self::rows_to_keys(rows))
     }
 
@@ -597,13 +630,16 @@ impl PgTransaction {
         limit: u32,
         cursor: Option<Key>,
     ) -> Result<Vec<(Key, Val)>> {
-        let mode = match cursor {
-            Some(c) => ScanMode::After(c),
-            None => ScanMode::Offset(0),
+        let rows = match cursor {
+            Some(c) => {
+                self.range_query_after(RangeSql::AfterKvAsc, rng, limit, &c)
+                    .await?
+            }
+            None => {
+                self.range_query_offset(RangeSql::KvAsc, rng, limit, 0)
+                    .await?
+            }
         };
-        let rows = self
-            .range_query("key, val", rng, limit, mode, "ASC")
-            .await?;
         if let Some(last) = rows.last() {
             self.last_scan_key_asc = Some(last.get::<Vec<u8>, _>("key"));
         }
@@ -695,7 +731,7 @@ impl PgTransaction {
 impl Drop for PgTransaction {
     fn drop(&mut self) {
         if !self.closed {
-            tracing::warn!(
+            warn!(
                 "PgTransaction dropped without explicit commit/cancel; PG will auto-rollback"
             );
         }
