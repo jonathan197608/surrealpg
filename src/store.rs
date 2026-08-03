@@ -243,7 +243,9 @@ impl PgStore {
                     if matches!(db.code().as_deref(), Some("25P01") | Some("25P02")));
                 if is_tx_active {
                     // Leaked transaction detected — clean up and retry.
-                    let _ = Executor::execute(&mut *conn, sqlx::raw_sql("ROLLBACK")).await;
+                    let _ = Executor::execute(&mut *conn, sqlx::raw_sql("ROLLBACK"))
+                        .await
+                        .inspect_err(|e| warn!("ROLLBACK of leaked transaction failed: {e}"));
                     Executor::execute(&mut *conn, sqlx::raw_sql(begin_sql))
                         .await
                         .map_err(|e2| PgStoreError::from_sqlx(None, &e2))?;

@@ -169,8 +169,14 @@ impl PgTuneConfig {
     /// Generate the `CREATE TABLE` DDL.
     ///
     /// This should be executed **once** after pool creation. Failure is fatal.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `table` is not a valid SQL identifier (only `[a-zA-Z0-9_]`).
     #[must_use]
     pub fn create_table_sql(&self, table: &str) -> String {
+        crate::config::PgConfig::validate_identifier(table)
+            .expect("table name must be a valid SQL identifier");
         let kw = if self.use_unlogged { "UNLOGGED " } else { "" };
         format!(
             "CREATE {kw}TABLE IF NOT EXISTS {table} \
@@ -182,8 +188,14 @@ impl PgTuneConfig {
     ///
     /// This should be executed **once** after `create_table_sql`. Failure is
     /// non-fatal (logged as warning) — the table still works without tuning.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `table` is not a valid SQL identifier (only `[a-zA-Z0-9_]`).
     #[must_use]
     pub fn tune_table_sql(&self, table: &str) -> String {
+        crate::config::PgConfig::validate_identifier(table)
+            .expect("table name must be a valid SQL identifier");
         let unlogged_alter = if self.use_unlogged {
             format!("ALTER TABLE {table} SET UNLOGGED;")
         } else {
@@ -224,8 +236,33 @@ ALTER TABLE {table} SET (
     /// `SET` may not persist across transactions. For guaranteed effect behind
     /// a pooler, set these at the database or role level
     /// (`ALTER DATABASE … SET …`).
+    ///
+    /// # Safety
+    ///
+    /// Memory size strings (`work_mem`, etc.) are validated by
+    /// `validate_pg_memory_size` during `from_env()`. Direct construction of
+    /// `PgTuneConfig` with unvalidated strings could inject SQL into the
+    /// `SET` statements. For defense-in-depth, we assert here too.
     #[must_use]
     pub fn session_sql(&self) -> String {
+        // Defense-in-depth: validate all memory size strings before
+        // embedding them in SQL. If someone constructed PgTuneConfig
+        // directly with malicious values, we catch it here.
+        debug_assert!(
+            validate_pg_memory_size(&self.server_work_mem),
+            "server_work_mem failed validation: {}",
+            self.server_work_mem
+        );
+        debug_assert!(
+            validate_pg_memory_size(&self.server_maintenance_work_mem),
+            "server_maintenance_work_mem failed validation: {}",
+            self.server_maintenance_work_mem
+        );
+        debug_assert!(
+            validate_pg_memory_size(&self.server_effective_cache_size),
+            "server_effective_cache_size failed validation: {}",
+            self.server_effective_cache_size
+        );
         format!(
             r#"SET statement_timeout = '{st}s';
 SET idle_in_transaction_session_timeout = '{it}s';
@@ -349,9 +386,15 @@ fn parse_duration(v: &str) -> Option<Duration> {
     } else if let Some(n) = v.strip_suffix('s') {
         n.parse().ok().map(Duration::from_secs)
     } else if let Some(n) = v.strip_suffix('m') {
-        n.parse::<u64>().ok().map(|n| Duration::from_secs(n * 60))
+        n.parse::<u64>()
+            .ok()
+            .and_then(|n| n.checked_mul(60))
+            .map(Duration::from_secs)
     } else if let Some(n) = v.strip_suffix('h') {
-        n.parse::<u64>().ok().map(|n| Duration::from_secs(n * 3600))
+        n.parse::<u64>()
+            .ok()
+            .and_then(|n| n.checked_mul(3600))
+            .map(Duration::from_secs)
     } else {
         v.parse().ok().map(Duration::from_secs)
     }

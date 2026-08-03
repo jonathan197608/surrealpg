@@ -104,8 +104,13 @@ impl Transactable for PgTx {
                 return Err(kvs::Error::TransactionFinished);
             }
             let mut guard = self.inner.lock().await;
-            if let Some(tx) = guard.as_mut() {
-                tx.cancel().await.map_err(kvs::Error::from)?;
+            if let Some(tx) = guard.as_mut()
+                && let Err(e) = tx.cancel().await
+            {
+                // Release the connection even on error — PG will auto-rollback
+                // when the PoolConnection is dropped and returned to the pool.
+                *guard = None;
+                return Err(kvs::Error::from(e));
             }
             *guard = None; // Drop the transaction, returning the connection to the pool
             info!("PostgreSQL transaction cancelled");
@@ -120,8 +125,14 @@ impl Transactable for PgTx {
             }
             // PG natively supports COMMIT on read-only transactions.
             let mut guard = self.inner.lock().await;
-            if let Some(tx) = guard.as_mut() {
-                tx.commit().await.map_err(kvs::Error::from)?;
+            if let Some(tx) = guard.as_mut()
+                && let Err(e) = tx.commit().await
+            {
+                // Release the connection even on error (e.g. serialization
+                // conflict). PG will auto-rollback when the PoolConnection
+                // is returned to the pool.
+                *guard = None;
+                return Err(kvs::Error::from(e));
             }
             *guard = None;
             info!("PostgreSQL transaction committed");

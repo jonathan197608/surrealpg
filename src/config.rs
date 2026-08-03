@@ -126,7 +126,7 @@ impl PgConfig {
     ///
     /// Prevents SQL injection through the `table_name` URL parameter.
     /// Only alphanumeric characters and underscores are allowed.
-    fn validate_identifier(name: &str) -> Result<(), String> {
+    pub(crate) fn validate_identifier(name: &str) -> Result<(), String> {
         if !name.is_empty()
             && name
                 .chars()

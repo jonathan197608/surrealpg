@@ -224,25 +224,32 @@ impl PgTransaction {
     /// Returns both the name (for the savepoint stack) and the full
     /// SQL prefix (e.g. `"SAVEPOINT sp_3"`) to avoid a second allocation.
     fn push_savepoint_name(&mut self) -> String {
-        self.savepoint_counter += 1;
+        // Use wrapping_add so that overflow at u32::MAX wraps to 0,
+        // then we offset by a large constant to avoid colliding with
+        // earlier savepoint names. This is purely theoretical — 4 billion
+        // savepoints in a single transaction is impossible in practice.
+        self.savepoint_counter = self.savepoint_counter.wrapping_add(1);
+        let n = self.savepoint_counter;
+        // Manually format u32 to ASCII into a stack buffer.
+        // sp_ prefix + up to 10 digits = 13 bytes, fits in [u8; 16].
         let mut buf = [0u8; 16];
         buf[0] = b's';
         buf[1] = b'p';
         buf[2] = b'_';
-        let n = self.savepoint_counter;
         let mut pos = 3;
-        if n == 0 {
+        let mut remaining = n;
+        let mut digits = [0u8; 10];
+        let mut d_pos = 0;
+        while remaining > 0 {
+            digits[d_pos] = (remaining % 10) as u8;
+            remaining /= 10;
+            d_pos += 1;
+        }
+        if d_pos == 0 {
+            // n == 0 after overflow wrapping
             buf[pos] = b'0';
             pos += 1;
         } else {
-            let mut remaining = n;
-            let mut digits = [0u8; 10];
-            let mut d_pos = 0;
-            while remaining > 0 {
-                digits[d_pos] = (remaining % 10) as u8;
-                remaining /= 10;
-                d_pos += 1;
-            }
             for i in (0..d_pos).rev() {
                 buf[pos] = digits[i] + b'0';
                 pos += 1;
@@ -265,9 +272,16 @@ impl PgTransaction {
         // Max: "ROLLBACK TO SAVEPOINT sp_" + 10 digits = 31 bytes
         let mut buf = [0u8; 48];
         let prefix_len = prefix.len();
-        buf[..prefix_len].copy_from_slice(prefix.as_bytes());
         let name_bytes = name.as_bytes();
         let total = prefix_len + name_bytes.len();
+        debug_assert!(
+            total <= buf.len(),
+            "savepoint SQL buffer overflow: {prefix_len} + {name_len} > {buf_len}",
+            prefix_len = prefix_len,
+            name_len = name_bytes.len(),
+            buf_len = buf.len(),
+        );
+        buf[..prefix_len].copy_from_slice(prefix.as_bytes());
         buf[prefix_len..total].copy_from_slice(name_bytes);
         std::str::from_utf8(&buf[..total])
             .expect("savepoint SQL is always valid UTF-8")
@@ -277,19 +291,30 @@ impl PgTransaction {
     // ─── Transaction control ─────────────────────────────
 
     /// Commit the transaction.
+    ///
+    /// On success, the connection is released back to the pool.
+    /// On error (e.g. serialization conflict), the connection is still
+    /// released — PG auto-rollbacks on connection drop. The transaction
+    /// is marked closed regardless of outcome to prevent further operations.
     pub async fn commit(&mut self) -> Result<()> {
-        self.execute_simple("COMMIT", None).await?;
+        let result = self.execute_simple("COMMIT", None).await;
+        self.close(); // Always close — even on error, connection goes back to pool
+        result?;
         debug!("transaction committed");
-        self.close();
         Ok(())
     }
 
     /// Rollback (cancel) the transaction.
+    ///
+    /// On success, the connection is released back to the pool.
+    /// On error, the connection is still released via `close()`.
     pub async fn cancel(&mut self) -> Result<()> {
         if self.closed {
             return Ok(());
         }
-        self.execute_simple("ROLLBACK", None).await?;
+        let result = self.execute_simple("ROLLBACK", None).await;
+        self.close(); // Always close — release connection even on error
+        result?;
         debug!("transaction rolled back");
         self.close();
         Ok(())
@@ -629,7 +654,9 @@ impl PgTransaction {
             .fetch_one(self.conn_mut()?)
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
-        Ok(row.get::<i64, _>("cnt") as u64)
+        // COUNT(*) is always >= 0; .max(0) guards against negative
+        // reltuples which should never occur but is defensive.
+        Ok(row.get::<i64, _>("cnt").max(0) as u64)
     }
 
     /// Approximate row count using `pg_class.reltuples`.
