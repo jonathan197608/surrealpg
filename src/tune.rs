@@ -364,10 +364,24 @@ fn validate_toast_storage(v: &str) -> bool {
 }
 
 fn env_bool(key: &str, default: bool) -> bool {
-    std::env::var(key)
-        .ok()
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"))
-        .unwrap_or(default)
+    match std::env::var(key) {
+        Ok(v) => {
+            let lower = v.to_ascii_lowercase();
+            if matches!(lower.as_str(), "true" | "1" | "yes" | "on") {
+                true
+            } else if matches!(lower.as_str(), "false" | "0" | "no" | "off") {
+                false
+            } else {
+                warn!(
+                    env = key,
+                    value = %v,
+                    "unrecognized boolean value, falling back to default '{default}'"
+                );
+                default
+            }
+        }
+        Err(_) => default,
+    }
 }
 
 fn env_duration(key: &str, default_secs: u64) -> Duration {
@@ -483,5 +497,32 @@ mod tests {
         assert!(validate_toast_storage("plain"));
         assert!(!validate_toast_storage("evil'; DROP TABLE kv; --"));
         assert!(!validate_toast_storage("EXTERNAL")); // case-sensitive
+    }
+
+    #[test]
+    fn test_env_bool() {
+        // Unset → default
+        unsafe { std::env::remove_var("TEST_ENV_BOOL_UNSET") };
+        assert!(env_bool("TEST_ENV_BOOL_UNSET", true));
+        assert!(!env_bool("TEST_ENV_BOOL_UNSET", false));
+
+        // Truthy values (case-insensitive)
+        for val in &["true", "1", "yes", "on", "TRUE", "Yes", "ON"] {
+            unsafe { std::env::set_var("TEST_ENV_BOOL_UNSET", val) };
+            assert!(env_bool("TEST_ENV_BOOL_UNSET", false), "val={val}");
+        }
+
+        // Falsy values (case-insensitive)
+        for val in &["false", "0", "no", "off", "FALSE", "No", "OFF"] {
+            unsafe { std::env::set_var("TEST_ENV_BOOL_UNSET", val) };
+            assert!(!env_bool("TEST_ENV_BOOL_UNSET", true), "val={val}");
+        }
+
+        // Unrecognized → default (not silently false)
+        unsafe { std::env::set_var("TEST_ENV_BOOL_UNSET", "maybe") };
+        assert!(env_bool("TEST_ENV_BOOL_UNSET", true));
+        assert!(!env_bool("TEST_ENV_BOOL_UNSET", false));
+
+        unsafe { std::env::remove_var("TEST_ENV_BOOL_UNSET") };
     }
 }

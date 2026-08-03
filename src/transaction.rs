@@ -224,10 +224,9 @@ impl PgTransaction {
     /// Returns both the name (for the savepoint stack) and the full
     /// SQL prefix (e.g. `"SAVEPOINT sp_3"`) to avoid a second allocation.
     fn push_savepoint_name(&mut self) -> String {
-        // Use wrapping_add so that overflow at u32::MAX wraps to 0,
-        // then we offset by a large constant to avoid colliding with
-        // earlier savepoint names. This is purely theoretical — 4 billion
-        // savepoints in a single transaction is impossible in practice.
+        // Use wrapping_add so that overflow at u32::MAX wraps to 0.
+        // In practice, 4 billion savepoints in a single transaction is
+        // impossible, so collision with earlier names is not a concern.
         self.savepoint_counter = self.savepoint_counter.wrapping_add(1);
         let n = self.savepoint_counter;
         // Manually format u32 to ASCII into a stack buffer.
@@ -274,7 +273,8 @@ impl PgTransaction {
     /// directly into a stack buffer.
     #[inline]
     fn savepoint_sql(prefix: &str, name: &str) -> String {
-        // Max: "ROLLBACK TO SAVEPOINT sp_" + 10 digits = 31 bytes
+        // Max: "ROLLBACK TO SAVEPOINT sp_" + 10 digits = 36 bytes.
+        // Buffer [u8; 48] provides ample headroom.
         let mut buf = [0u8; 48];
         let prefix_len = prefix.len();
         let name_bytes = name.as_bytes();

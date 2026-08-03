@@ -24,11 +24,11 @@ CREATE TABLE IF NOT EXISTS kv (
 --
 -- -- Autovacuum tuning for high-churn KV workloads (matches PgTuneConfig defaults):
 -- ALTER TABLE kv SET (
---     autovacuum_enabled = true,
 --     autovacuum_vacuum_scale_factor = 0.05,
 --     autovacuum_vacuum_threshold = 50,
 --     autovacuum_analyze_scale_factor = 0.02,
---     autovacuum_analyze_threshold = 50
+--     autovacuum_vacuum_cost_limit = 2000,
+--     autovacuum_vacuum_cost_delay = 1
 -- );
 --
 -- See `PgTuneConfig` and the `PG_TUNED_*` environment variables for the full
