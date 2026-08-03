@@ -6,7 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use surrealdb_core::kvs::{
-    self, Metrics, Transactable, TransactionBuilder, TransactionBuilderRequirements,
+    self, Metric, Metrics, Transactable, TransactionBuilder, TransactionBuilderRequirements,
 };
 
 use crate::pg_tx::PgTx;
@@ -55,10 +55,31 @@ impl TransactionBuilder for PgStore {
     }
 
     fn register_metrics(&self) -> Option<Metrics> {
-        None
+        Some(Metrics {
+            name: "surrealdb.postgresql",
+            u64_metrics: vec![
+                Metric {
+                    name: "pg_pool_size",
+                    description: "Current number of connections in the pool",
+                },
+                Metric {
+                    name: "pg_pool_idle",
+                    description: "Number of idle connections in the pool",
+                },
+                Metric {
+                    name: "pg_pool_max",
+                    description: "Maximum number of connections allowed in the pool",
+                },
+            ],
+        })
     }
 
-    fn collect_u64_metric(&self, _metric: &str) -> Option<u64> {
-        None
+    fn collect_u64_metric(&self, metric: &str) -> Option<u64> {
+        match metric {
+            "pg_pool_size" => Some(self.pool_size().0 as u64),
+            "pg_pool_idle" => Some(self.pool_size().1 as u64),
+            "pg_pool_max" => Some(self.pool_max() as u64),
+            _ => None,
+        }
     }
 }

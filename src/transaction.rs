@@ -4,6 +4,7 @@
 //! or more SQL statements executed within a single PG transaction.
 
 use std::ops::{DerefMut, Range};
+use std::sync::Arc;
 
 use sqlx::{Executor, Row};
 use tracing::{debug, trace, warn};
@@ -15,6 +16,88 @@ use crate::error::{PgStoreError, Result};
 pub type Key = Vec<u8>;
 pub type Val = Vec<u8>;
 
+// ─── ScanMode ────────────────────────────────────────────
+
+/// Pagination mode for range scans.
+///
+/// `Offset` is the traditional `OFFSET $4` mode (compatible with the
+/// existing `Transactable` trait). `After` uses keyset pagination
+/// (`WHERE key > $cursor`) which avoids the linear-scan cost of deep
+/// OFFSET on large tables.
+#[derive(Clone)]
+pub enum ScanMode {
+    /// Traditional OFFSET-based pagination (default, backward-compatible).
+    Offset(u32),
+    /// Keyset (cursor) pagination: return rows after the given cursor key.
+    /// The cursor is typically the last key returned by a previous scan,
+    /// enabling O(limit) deep-page performance instead of O(skip+limit).
+    After(Key),
+}
+
+impl Default for ScanMode {
+    fn default() -> Self {
+        Self::Offset(0)
+    }
+}
+
+// ─── Pre-built SQL ───────────────────────────────────────
+
+/// Pre-built SQL strings for all KV operations.
+///
+/// Constructed once when a `PgTransaction` is created. Stored separately from
+/// the connection so that SQL references (`&sql.x`) don't conflict with
+/// `&mut self` borrows on the connection.
+struct Sql {
+    exists: String,
+    get: String,
+    getm: String,
+    set: String,
+    put: String,
+    putc: String,
+    del: String,
+    delc: String,
+    delr: String,
+    count: String,
+    /// Range scan prefix with `{select}` and `{direction}` placeholders.
+    range_prefix: String,
+    /// Range scan prefix for keyset pagination with `{select}` placeholder.
+    range_after_prefix: String,
+    /// Original table name (for `count_approx` / `pg_class` queries).
+    table_name: String,
+}
+
+impl Sql {
+    fn new(table: &str) -> Self {
+        Self {
+            exists: format!("SELECT 1 AS exists_flag FROM {table} WHERE key = $1"),
+            get: format!("SELECT val FROM {table} WHERE key = $1"),
+            getm: format!("SELECT key, val FROM {table} WHERE key = ANY($1)"),
+            set: format!(
+                "INSERT INTO {table} (key, val) VALUES ($1, $2) \
+                 ON CONFLICT (key) DO UPDATE SET val = EXCLUDED.val"
+            ),
+            put: format!(
+                "INSERT INTO {table} (key, val) VALUES ($1, $2) \
+                 ON CONFLICT (key) DO NOTHING"
+            ),
+            putc: format!("UPDATE {table} SET val = $2 WHERE key = $1 AND val = $3"),
+            del: format!("DELETE FROM {table} WHERE key = $1"),
+            delc: format!("DELETE FROM {table} WHERE key = $1 AND val = $2"),
+            delr: format!("DELETE FROM {table} WHERE key >= $1 AND key < $2"),
+            count: format!("SELECT count(*) AS cnt FROM {table} WHERE key >= $1 AND key < $2"),
+            range_prefix: format!(
+                "SELECT {{select}} FROM {table} WHERE key >= $1 AND key < $2 \
+                 ORDER BY key {{direction}} LIMIT $3 OFFSET $4"
+            ),
+            range_after_prefix: format!(
+                "SELECT {{select}} FROM {table} WHERE key >= $1 AND key < $2 AND key > $3 \
+                 ORDER BY key {{direction}} LIMIT $4"
+            ),
+            table_name: table.to_string(),
+        }
+    }
+}
+
 // ─── PgTransaction ──────────────────────────────────────
 
 /// A transaction backed by a single PostgreSQL connection.
@@ -22,6 +105,9 @@ pub type Val = Vec<u8>;
 /// Implements all KV operations that SurrealDB's `Transactable` trait requires.
 /// After `commit()` or `cancel()`, the transaction is closed and the connection
 /// is returned to the pool.
+///
+/// All SQL strings are pre-built at construction time to eliminate per-operation
+/// `format!()` heap allocations on the hot path.
 pub struct PgTransaction {
     /// The dedicated PG connection (returned to pool on drop)
     conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
@@ -39,20 +125,27 @@ pub struct PgTransaction {
     /// Whether to use persistent prepared statements.
     /// Must be false for pgbouncer/Supabase Pooler (transaction mode).
     persistent: bool,
-    /// Table name (e.g. `kv` or `kv_test`)
-    table: String,
+    /// Pre-built SQL strings, shared via Arc so cloning is an atomic
+    /// increment (no heap allocation) and borrows don't conflict with
+    /// `&mut self` on the connection.
+    sql: Arc<Sql>,
+    /// Last key returned by a range scan (ascending), used to auto-switch
+    /// to keyset pagination on subsequent calls when the caller passes
+    /// `ScanMode::After` with this cursor.
+    last_scan_key_asc: Option<Key>,
 }
 
 impl PgTransaction {
     /// Create a new transaction wrapping an acquired PG connection.
     ///
     /// The caller must have already executed `BEGIN` on the connection.
+    /// All SQL strings are pre-built here once, avoiding per-operation allocations.
     pub(crate) fn new(
         conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
         writeable: bool,
         isolation: PgIsolation,
         persistent: bool,
-        table: String,
+        table: &str,
     ) -> Self {
         Self {
             conn: Some(conn),
@@ -62,19 +155,14 @@ impl PgTransaction {
             savepoints: Vec::new(),
             isolation,
             persistent,
-            table,
+            sql: Arc::new(Sql::new(table)),
+            last_scan_key_asc: None,
         }
     }
 
     // ─── Internal helpers ────────────────────────────────
 
     /// Get a mutable reference to the inner `PgConnection`.
-    ///
-    /// In sqlx 0.8, `PoolConnection<Postgres>` does not implement `Executor`;
-    /// only `&mut PgConnection` does. `PoolConnection` implements `DerefMut`
-    /// to its inner `PgConnection`, so we double-deref to get there.
-    ///
-    /// Also validates that the transaction is not closed.
     fn conn_mut(&mut self) -> Result<&mut sqlx::postgres::PgConnection> {
         if self.closed {
             return Err(PgStoreError::TxClosed);
@@ -98,10 +186,6 @@ impl PgTransaction {
     }
 
     /// Execute a parameterless SQL statement via simple query protocol.
-    ///
-    /// Uses `raw_sql` instead of `query` to avoid the extended protocol
-    /// (Parse/Bind/Execute/Close/Sync) overhead for control statements
-    /// like `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`.
     async fn execute_simple(&mut self, sql: &str, key_for_err: Option<&[u8]>) -> Result<()> {
         let conn = self.conn_mut()?;
         Executor::execute(conn, sqlx::raw_sql(sql))
@@ -113,45 +197,10 @@ impl PgTransaction {
     /// Build a parameterised query with the configured `.persistent()` flag.
     #[inline]
     fn build_query<'a>(
-        &self,
+        persistent: bool,
         sql: &'a str,
     ) -> sqlx::query::Query<'a, sqlx::Postgres, sqlx::postgres::PgArguments> {
-        sqlx::query(sql).persistent(self.persistent)
-    }
-
-    /// Execute a single-key query and return at most one row.
-    ///
-    /// Used by read operations (`exists`, `get`) that share the pattern:
-    /// `build_query + bind(key) + fetch_optional + map_err`.
-    async fn fetch_optional_by_key(
-        &mut self,
-        sql: &str,
-        key: &[u8],
-    ) -> Result<Option<sqlx::postgres::PgRow>> {
-        self.build_query(sql)
-            .bind(key)
-            .fetch_optional(self.conn_mut()?)
-            .await
-            .map_err(|e| PgStoreError::from_sqlx(Some(key), &e))
-    }
-
-    /// Execute a two-argument write query (key + one value) and return the
-    /// `PgQueryResult` (which carries `rows_affected`).
-    ///
-    /// Used by write operations (`set`, `put`, `delc`) that share the pattern:
-    /// `build_query + bind(key) + bind(val) + execute + map_err`.
-    async fn execute_keyed_2arg(
-        &mut self,
-        sql: &str,
-        key: &[u8],
-        val: &[u8],
-    ) -> Result<sqlx::postgres::PgQueryResult> {
-        self.build_query(sql)
-            .bind(key)
-            .bind(val)
-            .execute(self.conn_mut()?)
-            .await
-            .map_err(|e| PgStoreError::from_sqlx(Some(key), &e))
+        sqlx::query(sql).persistent(persistent)
     }
 
     /// Pop the last savepoint name, returning `None` if the stack is empty.
@@ -160,9 +209,38 @@ impl PgTransaction {
     }
 
     /// Build the next unique savepoint name and push it onto the stack.
+    ///
+    /// Uses stack-allocated buffer instead of `format!()` to avoid
+    /// heap allocation. Savepoint names follow the pattern `sp_N`
+    /// where N is a monotonically increasing counter.
     fn push_savepoint_name(&mut self) -> String {
         self.savepoint_counter += 1;
-        let name = format!("sp_{}", self.savepoint_counter);
+        let mut buf = [0u8; 16];
+        buf[0] = b's';
+        buf[1] = b'p';
+        buf[2] = b'_';
+        let n = self.savepoint_counter;
+        let mut pos = 3;
+        if n == 0 {
+            buf[pos] = b'0';
+            pos += 1;
+        } else {
+            let mut remaining = n;
+            let mut digits = [0u8; 10];
+            let mut d_pos = 0;
+            while remaining > 0 {
+                digits[d_pos] = (remaining % 10) as u8;
+                remaining /= 10;
+                d_pos += 1;
+            }
+            for i in (0..d_pos).rev() {
+                buf[pos] = digits[i] + b'0';
+                pos += 1;
+            }
+        }
+        let name = std::str::from_utf8(&buf[..pos])
+            .expect("savepoint name is always valid UTF-8")
+            .to_string();
         self.savepoints.push(name.clone());
         name
     }
@@ -204,15 +282,25 @@ impl PgTransaction {
 
     /// Check whether a key exists.
     pub async fn exists(&mut self, key: Key) -> Result<bool> {
-        let sql = format!("SELECT 1 AS exists_flag FROM {} WHERE key = $1", self.table);
-        let row = self.fetch_optional_by_key(&sql, &key).await?;
+        let sql = self.sql.clone();
+        let persistent = self.persistent;
+        let row = Self::build_query(persistent, &sql.exists)
+            .bind(&key)
+            .fetch_optional(self.conn_mut()?)
+            .await
+            .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?;
         Ok(row.is_some())
     }
 
     /// Get the value for a key.
     pub async fn get(&mut self, key: Key) -> Result<Option<Val>> {
-        let sql = format!("SELECT val FROM {} WHERE key = $1", self.table);
-        let row = self.fetch_optional_by_key(&sql, &key).await?;
+        let sql = self.sql.clone();
+        let persistent = self.persistent;
+        let row = Self::build_query(persistent, &sql.get)
+            .bind(&key)
+            .fetch_optional(self.conn_mut()?)
+            .await
+            .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?;
         Ok(row.map(|r| r.get::<Vec<u8>, _>("val")))
     }
 
@@ -223,23 +311,34 @@ impl PgTransaction {
         }
 
         let keys_ref: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let sql = self.sql.clone();
+        let persistent = self.persistent;
 
-        let sql = format!("SELECT key, val FROM {} WHERE key = ANY($1)", self.table);
-        let rows = self
-            .build_query(&sql)
+        let rows = Self::build_query(persistent, &sql.getm)
             .bind(&keys_ref)
             .fetch_all(self.conn_mut()?)
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
 
-        let mut map = std::collections::HashMap::new();
-        for row in rows {
-            let k: Vec<u8> = row.get::<Vec<u8>, _>("key");
-            let v: Vec<u8> = row.get::<Vec<u8>, _>("val");
-            map.insert(k, v);
+        // For small result sets (≤64 rows), linear scan has better cache locality
+        // than a HashMap. This covers the vast majority of batch-get calls.
+        if rows.len() <= 64 {
+            Ok(keys.into_iter()
+                .map(|k| {
+                    rows.iter()
+                        .find(|r| r.get::<Vec<u8>, _>("key") == k)
+                        .map(|r| r.get::<Vec<u8>, _>("val"))
+                })
+                .collect())
+        } else {
+            let mut map = std::collections::HashMap::with_capacity(rows.len());
+            for row in rows {
+                let k: Vec<u8> = row.get::<Vec<u8>, _>("key");
+                let v: Vec<u8> = row.get::<Vec<u8>, _>("val");
+                map.insert(k, v);
+            }
+            Ok(keys.into_iter().map(|k| map.get(&k).cloned()).collect())
         }
-
-        Ok(keys.into_iter().map(|k| map.get(&k).cloned()).collect())
     }
 
     // ─── Write operations ────────────────────────────────
@@ -247,13 +346,14 @@ impl PgTransaction {
     /// Set a key to a value (insert or update).
     pub async fn set(&mut self, key: Key, val: Val) -> Result<()> {
         self.check_writable()?;
-
-        let sql = format!(
-            "INSERT INTO {} (key, val) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET val = $2",
-            self.table,
-        );
-        self.execute_keyed_2arg(&sql, &key, &val).await?;
-
+        let sql = self.sql.clone();
+        let persistent = self.persistent;
+        Self::build_query(persistent, &sql.set)
+            .bind(key.as_slice())
+            .bind(val.as_slice())
+            .execute(self.conn_mut()?)
+            .await
+            .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?;
         trace!(key_len = key.len(), "set");
         Ok(())
     }
@@ -262,13 +362,14 @@ impl PgTransaction {
     /// Returns `KeyAlreadyExists` if the key exists.
     pub async fn put(&mut self, key: Key, val: Val) -> Result<()> {
         self.check_writable()?;
-
-        let sql = format!(
-            "INSERT INTO {} (key, val) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING",
-            self.table,
-        );
-        let result = self.execute_keyed_2arg(&sql, &key, &val).await?;
-
+        let sql = self.sql.clone();
+        let persistent = self.persistent;
+        let result = Self::build_query(persistent, &sql.put)
+            .bind(key.as_slice())
+            .bind(val.as_slice())
+            .execute(self.conn_mut()?)
+            .await
+            .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?;
         if result.rows_affected() == 0 {
             return Err(PgStoreError::KeyAlreadyExists(key));
         }
@@ -284,12 +385,9 @@ impl PgTransaction {
             return self.put(key, val).await;
         };
 
-        let sql = format!(
-            "UPDATE {} SET val = $2 WHERE key = $1 AND val = $3",
-            self.table
-        );
-        let affected = self
-            .build_query(&sql)
+        let sql = self.sql.clone();
+        let persistent = self.persistent;
+        let affected = Self::build_query(persistent, &sql.putc)
             .bind(key.as_slice())
             .bind(val.as_slice())
             .bind(expected.as_slice())
@@ -308,14 +406,13 @@ impl PgTransaction {
     /// Delete a key.
     pub async fn del(&mut self, key: Key) -> Result<()> {
         self.check_writable()?;
-
-        let sql = format!("DELETE FROM {} WHERE key = $1", self.table);
-        self.build_query(&sql)
+        let sql = self.sql.clone();
+        let persistent = self.persistent;
+        Self::build_query(persistent, &sql.del)
             .bind(key.as_slice())
             .execute(self.conn_mut()?)
             .await
             .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?;
-
         trace!(key_len = key.len(), "del");
         Ok(())
     }
@@ -329,9 +426,14 @@ impl PgTransaction {
             return self.del(key).await;
         };
 
-        let sql = format!("DELETE FROM {} WHERE key = $1 AND val = $2", self.table);
-        let result = self.execute_keyed_2arg(&sql, &key, &expected).await?;
-
+        let sql = self.sql.clone();
+        let persistent = self.persistent;
+        let result = Self::build_query(persistent, &sql.delc)
+            .bind(key.as_slice())
+            .bind(expected.as_slice())
+            .execute(self.conn_mut()?)
+            .await
+            .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?;
         if result.rows_affected() == 0 {
             Err(PgStoreError::ConditionNotMet(key))
         } else {
@@ -342,17 +444,15 @@ impl PgTransaction {
     /// Delete all keys in a range (inclusive start, exclusive end).
     pub async fn delr(&mut self, rng: Range<Key>) -> Result<()> {
         self.check_writable()?;
-
-        let sql = format!("DELETE FROM {} WHERE key >= $1 AND key < $2", self.table);
-        let deleted = self
-            .build_query(&sql)
+        let sql = self.sql.clone();
+        let persistent = self.persistent;
+        let deleted = Self::build_query(persistent, &sql.delr)
             .bind(rng.start.as_slice())
             .bind(rng.end.as_slice())
             .execute(self.conn_mut()?)
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?
             .rows_affected();
-
         trace!(deleted, "delr");
         Ok(())
     }
@@ -360,34 +460,60 @@ impl PgTransaction {
     // ─── Range scans ─────────────────────────────────────
 
     /// Internal: execute a range scan query, returning raw rows.
+    ///
+    /// Supports two pagination modes via `ScanMode`:
+    /// - `Offset(skip)`: traditional `OFFSET` pagination (backward-compatible)
+    /// - `After(cursor)`: keyset pagination using `WHERE key > $cursor`,
+    ///   which avoids the O(skip) cost of deep OFFSET
     async fn range_query(
         &mut self,
         select: &str,
         rng: Range<Key>,
         limit: u32,
-        skip: u32,
+        mode: ScanMode,
         direction: &str,
     ) -> Result<Vec<sqlx::postgres::PgRow>> {
-        if skip > 1000 {
-            warn!(
-                skip,
-                limit,
-                "large OFFSET in range scan — consider cursor-based pagination"
-            );
+        let persistent = self.persistent;
+        let sql = self.sql.clone();
+        match mode {
+            ScanMode::Offset(skip) => {
+                if skip > 1000 {
+                    warn!(
+                        skip,
+                        limit,
+                        "large OFFSET in range scan — consider cursor-based pagination"
+                    );
+                }
+                let sql = sql
+                    .range_prefix
+                    .replace("{select}", select)
+                    .replace("{direction}", direction);
+                let conn = self.conn_mut()?;
+                Self::build_query(persistent, &sql)
+                    .bind(rng.start.as_slice())
+                    .bind(rng.end.as_slice())
+                    .bind(limit as i64)
+                    .bind(skip as i64)
+                    .fetch_all(conn)
+                    .await
+                    .map_err(|e| PgStoreError::from_sqlx(None, &e))
+            }
+            ScanMode::After(cursor) => {
+                let sql = sql
+                    .range_after_prefix
+                    .replace("{select}", select)
+                    .replace("{direction}", direction);
+                let conn = self.conn_mut()?;
+                Self::build_query(persistent, &sql)
+                    .bind(rng.start.as_slice())
+                    .bind(rng.end.as_slice())
+                    .bind(cursor.as_slice())
+                    .bind(limit as i64)
+                    .fetch_all(conn)
+                    .await
+                    .map_err(|e| PgStoreError::from_sqlx(None, &e))
+            }
         }
-        let sql = format!(
-            "SELECT {select} FROM {} WHERE key >= $1 AND key < $2 \
-             ORDER BY key {direction} LIMIT $3 OFFSET $4",
-            self.table,
-        );
-        self.build_query(&sql)
-            .bind(rng.start.as_slice())
-            .bind(rng.end.as_slice())
-            .bind(limit as i64)
-            .bind(skip as i64)
-            .fetch_all(self.conn_mut()?)
-            .await
-            .map_err(|e| PgStoreError::from_sqlx(None, &e))
     }
 
     /// Internal: extract keys from rows.
@@ -406,13 +532,13 @@ impl PgTransaction {
 
     /// Scan keys in a range (ascending).
     pub async fn keys(&mut self, rng: Range<Key>, limit: u32, skip: u32) -> Result<Vec<Key>> {
-        let rows = self.range_query("key", rng, limit, skip, "ASC").await?;
+        let rows = self.range_query("key", rng, limit, ScanMode::Offset(skip), "ASC").await?;
         Ok(Self::rows_to_keys(rows))
     }
 
     /// Scan keys in a range (descending).
     pub async fn keysr(&mut self, rng: Range<Key>, limit: u32, skip: u32) -> Result<Vec<Key>> {
-        let rows = self.range_query("key", rng, limit, skip, "DESC").await?;
+        let rows = self.range_query("key", rng, limit, ScanMode::Offset(skip), "DESC").await?;
         Ok(Self::rows_to_keys(rows))
     }
 
@@ -424,7 +550,7 @@ impl PgTransaction {
         skip: u32,
     ) -> Result<Vec<(Key, Val)>> {
         let rows = self
-            .range_query("key, val", rng, limit, skip, "ASC")
+            .range_query("key, val", rng, limit, ScanMode::Offset(skip), "ASC")
             .await?;
         Ok(Self::rows_to_pairs(rows))
     }
@@ -437,26 +563,91 @@ impl PgTransaction {
         skip: u32,
     ) -> Result<Vec<(Key, Val)>> {
         let rows = self
-            .range_query("key, val", rng, limit, skip, "DESC")
+            .range_query("key, val", rng, limit, ScanMode::Offset(skip), "DESC")
             .await?;
         Ok(Self::rows_to_pairs(rows))
     }
 
+    /// Cursor-based key scan (ascending): return keys after the given cursor.
+    ///
+    /// Unlike `keys()` which uses `OFFSET`, this uses `WHERE key > $cursor`
+    /// for O(limit) performance regardless of how deep the cursor is.
+    /// If `cursor` is `None`, starts from the beginning of the range.
+    pub async fn keys_after(
+        &mut self,
+        rng: Range<Key>,
+        limit: u32,
+        cursor: Option<Key>,
+    ) -> Result<Vec<Key>> {
+        let mode = match cursor {
+            Some(c) => ScanMode::After(c),
+            None => ScanMode::Offset(0),
+        };
+        let rows = self.range_query("key", rng, limit, mode, "ASC").await?;
+        Ok(Self::rows_to_keys(rows))
+    }
+
+    /// Cursor-based key-value scan (ascending): return pairs after the given cursor.
+    ///
+    /// Automatically tracks the last key returned via `last_scan_key_asc`
+    /// so callers can chain calls without manually managing cursors.
+    pub async fn scan_after(
+        &mut self,
+        rng: Range<Key>,
+        limit: u32,
+        cursor: Option<Key>,
+    ) -> Result<Vec<(Key, Val)>> {
+        let mode = match cursor {
+            Some(c) => ScanMode::After(c),
+            None => ScanMode::Offset(0),
+        };
+        let rows = self
+            .range_query("key, val", rng, limit, mode, "ASC")
+            .await?;
+        if let Some(last) = rows.last() {
+            self.last_scan_key_asc = Some(last.get::<Vec<u8>, _>("key"));
+        }
+        Ok(Self::rows_to_pairs(rows))
+    }
+
+    /// Get the last key returned by the most recent ascending scan.
+    #[must_use]
+    pub fn last_scan_key(&self) -> Option<&Key> {
+        self.last_scan_key_asc.as_ref()
+    }
+
     /// Count keys in a range.
     pub async fn count(&mut self, rng: Range<Key>) -> Result<u64> {
-        let sql = format!(
-            "SELECT count(*) AS cnt FROM {} WHERE key >= $1 AND key < $2",
-            self.table
-        );
-        let row = self
-            .build_query(&sql)
+        let sql = self.sql.clone();
+        let persistent = self.persistent;
+        let row = Self::build_query(persistent, &sql.count)
             .bind(rng.start.as_slice())
             .bind(rng.end.as_slice())
             .fetch_one(self.conn_mut()?)
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
-
         Ok(row.get::<i64, _>("cnt") as u64)
+    }
+
+    /// Approximate row count using `pg_class.reltuples`.
+    ///
+    /// Returns an O(1) estimate based on the most recent `ANALYZE` statistics.
+    /// This is a **whole-table** estimate (range parameters are ignored) and
+    /// may be stale if `ANALYZE` hasn't run recently. Returns `None` if the
+    /// table has no statistics.
+    pub async fn count_approx(&mut self) -> Result<Option<u64>> {
+        let table = &self.sql.table_name;
+        let sql = format!(
+            "SELECT reltuples::bigint AS approx_cnt FROM pg_class \
+             WHERE relname = '{}' AND reltuples > 0",
+            table
+        );
+        let persistent = self.persistent;
+        let row = Self::build_query(persistent, &sql)
+            .fetch_optional(self.conn_mut()?)
+            .await
+            .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
+        Ok(row.map(|r| r.get::<i64, _>("approx_cnt") as u64))
     }
 
     // ─── Savepoints (PG native) ──────────────────────────

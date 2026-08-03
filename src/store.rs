@@ -31,6 +31,9 @@ pub struct PgStore {
     /// When the server shuts down, this token is cancelled and all in-flight
     /// `begin()` calls return `TxCancelled` instead of acquiring a connection.
     canceller: CancellationToken,
+    /// Maximum pool connections (from config), used by metrics reporting.
+    /// sqlx 0.8 `PgPool` doesn't expose `max_connections()`, so we store it.
+    pool_max: u32,
 }
 
 impl PgStore {
@@ -76,7 +79,7 @@ impl PgStore {
             .map_err(|e: sqlx::Error| PgStoreError::Postgres(format!("invalid URL: {e}")))?;
 
         // ── Build session SQL for after_connect ──
-        let session_sql = tune.session_sql();
+        let session_sql: Arc<str> = tune.session_sql().into();
 
         let pool = PgPoolOptions::new()
             .max_connections(pool_max)
@@ -85,7 +88,7 @@ impl PgStore {
             .idle_timeout(idle_timeout)
             .max_lifetime(max_lifetime)
             .after_connect(move |conn, _meta| {
-                let sql = session_sql.clone();
+                let sql = session_sql.clone(); // Arc clone — atomic refcount, no heap alloc
                 Box::pin(async move {
                     sqlx::Executor::execute(conn, sqlx::raw_sql(&sql)).await?;
                     Ok(())
@@ -163,6 +166,7 @@ impl PgStore {
             tune,
             persistent,
             canceller,
+            pool_max,
         }))
     }
 
@@ -184,24 +188,7 @@ impl PgStore {
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
 
-        // Safety net: if the connection was previously leaked from an
-        // unclosed transaction, ROLLBACK any residual state before starting
-        // a new transaction. This prevents "BEGIN inside BEGIN" errors.
-        // (sqlx does NOT auto-ROLLBACK when returning connections to the pool.)
-        let rollback_result = Executor::execute(
-            &mut *conn,
-            sqlx::raw_sql("ROLLBACK"),
-        )
-        .await;
-        match rollback_result {
-            Ok(_) => {} // no active tx — harmless ROLLBACK
-            Err(_) => {
-                // Some DBs error on ROLLBACK without tx; that's also fine.
-            }
-        }
-
-        // Begin transaction — session-level params (statement_timeout, lock_timeout,
-        // idle_in_transaction_timeout, etc.) are already set via after_connect.
+        // Build the BEGIN statement.
         let begin_sql = if write {
             format!(
                 "BEGIN ISOLATION LEVEL {}",
@@ -216,16 +203,37 @@ impl PgStore {
             "BEGIN".to_string()
         };
 
-        Executor::execute(&mut *conn, sqlx::raw_sql(&begin_sql))
-            .await
-            .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
+        // Attempt BEGIN directly. On the normal path (no leaked transaction),
+        // this saves a network round-trip compared to always doing ROLLBACK first.
+        // If BEGIN fails with a "already in a transaction" error (25P01 or 25P02),
+        // we ROLLBACK the leaked transaction and retry once.
+        let result = Executor::execute(&mut *conn, sqlx::raw_sql(&begin_sql)).await;
+        match result {
+            Ok(_) => {}
+            Err(e) => {
+                let err_str = e.to_string().to_ascii_lowercase();
+                let is_tx_active = err_str.contains("already a transaction")
+                    || err_str.contains("25p01")
+                    || err_str.contains("25p02");
+                if is_tx_active {
+                    // Leaked transaction detected — clean up and retry.
+                    let _ = Executor::execute(&mut *conn, sqlx::raw_sql("ROLLBACK")).await;
+                    Executor::execute(&mut *conn, sqlx::raw_sql(&begin_sql))
+                        .await
+                        .map_err(|e2| PgStoreError::from_sqlx(None, &e2))?;
+                    warn!("cleaned up leaked transaction from pool connection");
+                } else {
+                    return Err(PgStoreError::from_sqlx(None, &e));
+                }
+            }
+        }
 
         Ok(PgTransaction::new(
             conn,
             write,
             self.config.isolation_level,
             self.persistent,
-            self.config.table_name.clone(),
+            &self.config.table_name,
         ))
     }
 
@@ -262,6 +270,15 @@ impl PgStore {
         self.persistent
     }
 
+    /// Get the configured maximum pool size.
+    ///
+    /// sqlx 0.8's `PgPool` doesn't expose `max_connections()`, so we store
+    /// the value from our config at construction time.
+    #[must_use]
+    pub fn pool_max(&self) -> u32 {
+        self.pool_max
+    }
+
     /// Run VACUUM ANALYZE on the table (must be called outside a transaction).
     pub async fn vacuum(&self) -> Result<()> {
         let sql = format!("VACUUM ANALYZE {}", self.config.table_name);
@@ -272,10 +289,40 @@ impl PgStore {
         Ok(())
     }
 
+    /// Execute a lightweight health check (`SELECT 1`).
+    ///
+    /// Suitable for Kubernetes liveness/readiness probes or load-balancer
+    /// health checks. Acquires a connection from the pool, executes `SELECT 1`,
+    /// and returns it.
+    pub async fn health_check(&self) -> Result<()> {
+        Executor::execute(&self.pool, sqlx::raw_sql("SELECT 1"))
+            .await
+            .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
+        Ok(())
+    }
+
     /// Return the current pool size info.
     #[must_use]
     pub fn pool_size(&self) -> (u32, u32) {
         (self.pool.size(), self.pool.num_idle() as u32)
+    }
+
+    /// Attempt to dynamically resize the connection pool.
+    ///
+    /// **Note**: sqlx 0.8's `PgPool` does not support runtime resize.
+    /// This method logs the request and returns `Ok(())` as a future
+    /// placeholder. When sqlx adds resize support, this can be
+    /// implemented without changing the public API.
+    pub fn try_resize_pool(&self, max: u32, min: u32) -> Result<()> {
+        if max < min {
+            return Err(PgStoreError::Other(format!(
+                "max_connections ({max}) must be >= min_connections ({min})"
+            )));
+        }
+        tracing::info!(
+            "pool resize requested: max={max}, min={min} (not yet supported by sqlx 0.8)"
+        );
+        Ok(())
     }
 
     /// Probe whether the server is behind a connection pooler (pgbouncer /
@@ -296,22 +343,26 @@ impl PgStore {
     /// second `Parse` fails with `42P05` (`duplicate_prepared_statement`).
     ///
     /// This probe:
-    /// 1. Acquires **two** connections from the pool.
-    /// 2. On conn-1: creates a named prepared statement (`.persistent(true)`).
-    /// 3. On conn-2: attempts to create a named prepared statement with the
-    ///    same SQL. Because both connections start their statement-ID
-    ///    counter at 0, the IDs will collide if they hit the same backend
-    ///    session.
-    /// 4. On success → direct PG (or session-mode pooler) → `true`.
+    /// 1. Acquires a connection, creates a named prepared statement, then
+    ///    releases it back to the pool.
+    /// 2. Acquires a second connection and attempts the same. Because both
+    ///    connections start their statement-ID counter at 0, the IDs will
+    ///    collide if they hit the same backend session.
+    /// 3. On success → direct PG (or session-mode pooler) → `true`.
     ///    On `42P05` → transaction-mode pooler → `false`.
-    /// 5. Other errors → log and return `false` (safe default).
+    ///    Other errors → log and return `false` (safe default).
+    ///
+    /// Connections are acquired **sequentially** (not simultaneously) so the
+    /// peak connection requirement is 1, not 2. This avoids pool exhaustion
+    /// when `min_connections` is set very low.
     ///
     /// We also use a **non-trivial SQL** (`SELECT $1::int4`) so the
     /// statement is actually prepared server-side (not just a simple query).
     async fn probe_persistent(pool: &PgPool) -> bool {
         let probe_sql = "SELECT $1::int4";
 
-        // Acquire two connections
+        // Phase 1: acquire conn1, create a named prepared statement, then
+        // release it back to the pool before acquiring conn2.
         let mut conn1 = match pool.acquire().await {
             Ok(c) => c,
             Err(e) => {
@@ -319,15 +370,7 @@ impl PgStore {
                 return false;
             }
         };
-        let mut conn2 = match pool.acquire().await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("persistent probe: failed to acquire conn2: {e}");
-                return false;
-            }
-        };
 
-        // Phase 1: create a named prepared statement on conn1
         let r1 = sqlx::query(probe_sql)
             .persistent(true)
             .bind(1i32)
@@ -339,9 +382,21 @@ impl PgStore {
             return false;
         }
 
-        // Phase 2: create a named prepared statement on conn2 with the same SQL.
+        // Clean up and release conn1 back to the pool.
+        let _ = Executor::execute(&mut *conn1, sqlx::raw_sql("DEALLOCATE ALL")).await;
+        drop(conn1);
+
+        // Phase 2: acquire conn2 and attempt the same named prepared statement.
         // In direct PG: conn2 has its own backend session, no conflict.
         // In pooler tx mode: conn2 may share a backend session, causing 42P05.
+        let mut conn2 = match pool.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("persistent probe: failed to acquire conn2: {e}");
+                return false;
+            }
+        };
+
         let r2 = sqlx::query(probe_sql)
             .persistent(true)
             .bind(2i32)
@@ -351,8 +406,6 @@ impl PgStore {
         match r2 {
             Ok(_) => {
                 info!("persistent probe: no conflict, direct PG or session mode");
-                // Clean up probe statements before returning connections to pool
-                let _ = Executor::execute(&mut *conn1, sqlx::raw_sql("DEALLOCATE ALL")).await;
                 let _ = Executor::execute(&mut *conn2, sqlx::raw_sql("DEALLOCATE ALL")).await;
                 true
             }
@@ -369,8 +422,6 @@ impl PgStore {
                 } else {
                     warn!("persistent probe: phase 2 (conn2) failed (disabling persistent): {e}");
                 }
-                // Clean up probe statements before returning connections to pool
-                let _ = Executor::execute(&mut *conn1, sqlx::raw_sql("DEALLOCATE ALL")).await;
                 let _ = Executor::execute(&mut *conn2, sqlx::raw_sql("DEALLOCATE ALL")).await;
                 false
             }
