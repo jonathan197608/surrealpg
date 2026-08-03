@@ -255,7 +255,7 @@ impl PgTransaction {
     /// `"ROLLBACK TO SAVEPOINT "`. The savepoint name is appended
     /// directly into a stack buffer.
     #[inline]
-    fn savepoint_sql(prefix: &str, name: &str) -> std::borrow::Cow<'static, str> {
+    fn savepoint_sql(prefix: &str, name: &str) -> String {
         // Max: "ROLLBACK TO SAVEPOINT sp_" + 10 digits = 31 bytes
         let mut buf = [0u8; 48];
         let prefix_len = prefix.len();
@@ -266,7 +266,6 @@ impl PgTransaction {
         std::str::from_utf8(&buf[..total])
             .expect("savepoint SQL is always valid UTF-8")
             .to_string()
-            .into()
     }
 
     // ─── Transaction control ─────────────────────────────

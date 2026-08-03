@@ -38,6 +38,9 @@ pub async fn run(store: &Arc<PgStore>) -> (u32, u32) {
         ("delc (compare-and-delete)", test_delc),
         ("keys / keysr direction", test_keys_direction),
         ("read-only tx rejects writes", test_read_only_rejects_writes),
+        ("count_approx", test_count_approx),
+        ("health check", test_health_check),
+        ("pool size reporting", test_pool_size),
     ];
 
     let mut passed = 0u32;
@@ -483,6 +486,73 @@ fn test_read_only_rejects_writes(
         let res = tx.set(b"test:ro".to_vec(), b"v".to_vec()).await;
         assert!(res.is_err(), "write on read-only tx should fail");
         tx.cancel().await.map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
+fn test_count_approx(store: &Arc<PgStore>) -> futures::future::BoxFuture<'_, Result<(), String>> {
+    Box::pin(async {
+        clean_all(store).await;
+
+        // Insert some rows so that ANALYZE has statistics to report.
+        {
+            let mut tx = store.begin(true).await.map_err(|e| e.to_string())?;
+            for i in 0..10u32 {
+                let key = format!("test:approx:{i:03}").into_bytes();
+                tx.set(key, b"v".to_vec()).await.map_err(|e| e.to_string())?;
+            }
+            tx.commit().await.map_err(|e| e.to_string())?;
+        }
+
+        // count_approx should return Some(>= 1) after ANALYZE has run.
+        // Note: reltuples may be stale or 0 if ANALYZE hasn't run yet,
+        // so we accept None or Some(>= 1). What we're really testing is
+        // that the query executes without error.
+        let mut tx = store.begin(false).await.map_err(|e| e.to_string())?;
+        let result = tx.count_approx().await.map_err(|e| e.to_string())?;
+        println!("count_approx returned: {result:?}");
+        // If we got a value, it should be positive.
+        if let Some(cnt) = result {
+            assert!(cnt > 0, "count_approx should be > 0 when table has rows");
+        }
+        tx.cancel().await.map_err(|e| e.to_string())?;
+
+        // Clean up
+        {
+            let mut tx = store
+                .begin(true)
+                .await
+                .map_err(|e| e.to_string())?;
+            tx.delr(b"test:approx:".to_vec()..b"test:approx:".to_vec())
+                .await
+                .map_err(|e| e.to_string())?;
+            tx.commit().await.map_err(|e| e.to_string())?;
+        }
+
+        Ok(())
+    })
+}
+
+fn test_health_check(store: &Arc<PgStore>) -> futures::future::BoxFuture<'_, Result<(), String>> {
+    Box::pin(async {
+        store
+            .health_check()
+            .await
+            .map_err(|e| format!("health_check failed: {e}"))?;
+        Ok(())
+    })
+}
+
+fn test_pool_size(store: &Arc<PgStore>) -> futures::future::BoxFuture<'_, Result<(), String>> {
+    Box::pin(async {
+        let (size, idle) = store.pool_size();
+        println!("pool_size: total={size}, idle={idle}");
+        // Size should be at least 1 (min_connections in test config)
+        // or 0 if no connections have been created yet.
+        assert!(size > 0, "pool size should be > 0 after begin() calls");
+        // pool_max should be readable and > 0
+        let max = store.pool_max();
+        assert!(max > 0, "pool_max should be > 0");
         Ok(())
     })
 }

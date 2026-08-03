@@ -34,6 +34,10 @@ pub struct PgStore {
     /// Maximum pool connections (from config), used by metrics reporting.
     /// sqlx 0.8 `PgPool` doesn't expose `max_connections()`, so we store it.
     pool_max: u32,
+    /// Pre-built BEGIN SQL for write transactions (isolation level fixed at construction).
+    begin_write_sql: Arc<str>,
+    /// Pre-built BEGIN SQL for read transactions (isolation level + optional READ ONLY).
+    begin_read_sql: Arc<str>,
     /// Pre-built VACUUM SQL string. VACUUM doesn't support parameterised
     /// binding (PG limitation), but `table_name` is validated by
     /// `validate_identifier`, so this is safe.
@@ -79,6 +83,24 @@ impl PgStore {
         let max_lifetime = config.max_lifetime.or(Some(tune.pool_max_lifetime));
         // Pre-build the VACUUM SQL — table_name is validated by validate_identifier.
         let vacuum_sql: Arc<str> = format!("VACUUM ANALYZE {}", config.table_name).into();
+
+        // Pre-build BEGIN SQL — isolation_level and read_only_optimization are
+        // immutable after construction, so we build both variants once here
+        // and avoid a format!() allocation on every begin() call.
+        let begin_write_sql: Arc<str> = format!(
+            "BEGIN ISOLATION LEVEL {}",
+            config.isolation_level.as_sql()
+        )
+        .into();
+        let begin_read_sql: Arc<str> = if config.read_only_optimization {
+            format!(
+                "BEGIN ISOLATION LEVEL {} READ ONLY",
+                config.isolation_level.as_sql()
+            )
+            .into()
+        } else {
+            "BEGIN".into()
+        };
 
         let opts: PgConnectOptions = url
             .parse()
@@ -173,6 +195,8 @@ impl PgStore {
             persistent,
             canceller,
             pool_max,
+            begin_write_sql,
+            begin_read_sql,
             vacuum_sql,
         }))
     }
@@ -195,26 +219,19 @@ impl PgStore {
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
 
-        // Build the BEGIN statement.
+        // BEGIN SQL is pre-built at construction time (immutable config).
+        // Zero allocation on the hot path.
         let begin_sql = if write {
-            format!(
-                "BEGIN ISOLATION LEVEL {}",
-                self.config.isolation_level.as_sql()
-            )
-        } else if self.config.read_only_optimization {
-            format!(
-                "BEGIN ISOLATION LEVEL {} READ ONLY",
-                self.config.isolation_level.as_sql()
-            )
+            &*self.begin_write_sql
         } else {
-            "BEGIN".to_string()
+            &*self.begin_read_sql
         };
 
         // Attempt BEGIN directly. On the normal path (no leaked transaction),
         // this saves a network round-trip compared to always doing ROLLBACK first.
         // If BEGIN fails with a "already in a transaction" error (25P01 or 25P02),
         // we ROLLBACK the leaked transaction and retry once.
-        let result = Executor::execute(&mut *conn, sqlx::raw_sql(&begin_sql)).await;
+        let result = Executor::execute(&mut *conn, sqlx::raw_sql(begin_sql)).await;
         match result {
             Ok(_) => {}
             Err(e) => {
@@ -227,7 +244,7 @@ impl PgStore {
                 if is_tx_active {
                     // Leaked transaction detected — clean up and retry.
                     let _ = Executor::execute(&mut *conn, sqlx::raw_sql("ROLLBACK")).await;
-                    Executor::execute(&mut *conn, sqlx::raw_sql(&begin_sql))
+                    Executor::execute(&mut *conn, sqlx::raw_sql(begin_sql))
                         .await
                         .map_err(|e2| PgStoreError::from_sqlx(None, &e2))?;
                     warn!("cleaned up leaked transaction from pool connection");

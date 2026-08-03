@@ -184,35 +184,48 @@ impl PgConfig {
                 if let Some((key, value)) = pair.split_once('=') {
                     match key {
                         "max_connections" => {
-                            if let Ok(v) = value.parse::<u32>() {
-                                if v == 0 {
+                            match value.parse::<u32>() {
+                                Ok(0) => {
                                     tracing::warn!("max_connections=0 is invalid, ignoring");
-                                } else {
-                                    self.max_connections = Some(v);
                                 }
+                                Ok(v) => self.max_connections = Some(v),
+                                Err(_) => tracing::warn!(
+                                    "max_connections='{value}' is not a valid u32, ignoring"
+                                ),
                             }
                         }
                         "min_connections" => {
-                            if let Ok(v) = value.parse::<u32>() {
-                                if let Some(max) = self.max_connections
-                                    && v > max
-                                {
-                                    tracing::warn!(
-                                        "min_connections={v} > max_connections={max}, ignoring"
-                                    );
-                                    continue;
+                            match value.parse::<u32>() {
+                                Ok(v) => {
+                                    if let Some(max) = self.max_connections
+                                        && v > max
+                                    {
+                                        tracing::warn!(
+                                            "min_connections={v} > max_connections={max}, ignoring"
+                                        );
+                                    } else {
+                                        self.min_connections = Some(v);
+                                    }
                                 }
-                                self.min_connections = Some(v);
+                                Err(_) => tracing::warn!(
+                                    "min_connections='{value}' is not a valid u32, ignoring"
+                                ),
                             }
                         }
                         "max_lifetime" => {
-                            if let Ok(secs) = value.parse() {
-                                self.max_lifetime = Some(Duration::from_secs(secs));
+                            match value.parse::<u64>() {
+                                Ok(secs) => self.max_lifetime = Some(Duration::from_secs(secs)),
+                                Err(_) => tracing::warn!(
+                                    "max_lifetime='{value}' is not a valid number, ignoring"
+                                ),
                             }
                         }
                         "auto_create_table" => {
-                            if let Ok(v) = value.parse::<bool>() {
-                                self.auto_create_table = v;
+                            match value.parse::<bool>() {
+                                Ok(v) => self.auto_create_table = v,
+                                Err(_) => tracing::warn!(
+                                    "auto_create_table='{value}' is not a valid bool, ignoring"
+                                ),
                             }
                         }
                         "table_name" => {
@@ -220,30 +233,48 @@ impl PgConfig {
                             self.table_name = value.to_string();
                         }
                         "isolation_level" => {
-                            self.isolation_level = match value {
+                            self.isolation_level = match value.to_ascii_lowercase().as_str() {
                                 "repeatable_read" => PgIsolation::RepeatableRead,
                                 "serializable" => PgIsolation::Serializable,
-                                _ => PgIsolation::ReadCommitted,
+                                "read_committed" | "read committed" => PgIsolation::ReadCommitted,
+                                _ => {
+                                    tracing::warn!(
+                                        "isolation_level='{value}' is not recognized, defaulting to ReadCommitted"
+                                    );
+                                    PgIsolation::ReadCommitted
+                                }
                             };
                         }
                         "persistent_statements" => {
-                            if let Some(v) = PersistentStatements::parse(value) {
-                                self.persistent_statements = v;
+                            match PersistentStatements::parse(value) {
+                                Some(v) => self.persistent_statements = v,
+                                None => tracing::warn!(
+                                    "persistent_statements='{value}' is not recognized, ignoring"
+                                ),
                             }
                         }
                         "connect_timeout" => {
-                            if let Ok(secs) = value.parse() {
-                                self.connect_timeout = Some(Duration::from_secs(secs));
+                            match value.parse::<u64>() {
+                                Ok(secs) => self.connect_timeout = Some(Duration::from_secs(secs)),
+                                Err(_) => tracing::warn!(
+                                    "connect_timeout='{value}' is not a valid number, ignoring"
+                                ),
                             }
                         }
                         "idle_timeout" => {
-                            if let Ok(secs) = value.parse() {
-                                self.idle_timeout = Some(Duration::from_secs(secs));
+                            match value.parse::<u64>() {
+                                Ok(secs) => self.idle_timeout = Some(Duration::from_secs(secs)),
+                                Err(_) => tracing::warn!(
+                                    "idle_timeout='{value}' is not a valid number, ignoring"
+                                ),
                             }
                         }
                         "read_only_optimization" => {
-                            if let Ok(v) = value.parse::<bool>() {
-                                self.read_only_optimization = v;
+                            match value.parse::<bool>() {
+                                Ok(v) => self.read_only_optimization = v,
+                                Err(_) => tracing::warn!(
+                                    "read_only_optimization='{value}' is not a valid bool, ignoring"
+                                ),
                             }
                         }
                         _ => {}
