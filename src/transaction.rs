@@ -23,26 +23,17 @@ pub type Val = Vec<u8>;
 /// Constructed once when a `PgTransaction` is created. Stored separately from
 /// the connection so that SQL references (`&sql.x`) don't conflict with
 /// `&mut self` borrows on the connection.
-/// Identifies which of the 6 pre-built range-scan SQL strings to use.
 ///
-/// By pre-building all 6 combinations at construction time, we eliminate
-/// per-call `String::replace()` heap allocations entirely.
-#[derive(Clone, Copy)]
-enum RangeSql {
-    /// Offset mode, SELECT key, ASC
-    KeysAsc,
-    /// Offset mode, SELECT key, DESC
-    KeysDesc,
-    /// Offset mode, SELECT key, val, ASC
-    KvAsc,
-    /// Offset mode, SELECT key, val, DESC
-    KvDesc,
-    /// After-cursor mode, SELECT key, ASC
-    AfterKeysAsc,
-    /// After-cursor mode, SELECT key, val, ASC
-    AfterKvAsc,
-}
-
+/// # Range-scan pagination
+///
+/// SurrealDB's `Transactable` trait provides `open_keys_cursor` /
+/// `open_vals_cursor` for batched iteration. We do **not** override these —
+/// the default `DefaultKeysCursor` / `DefaultValsCursor` implementation
+/// drives pagination by calling `keys()`/`scan()` with `skip=0` on every
+/// batch after the first, advancing `range.start` to `last_key + \x00`
+/// (exclusive lower bound) between batches. This is functionally
+/// equivalent to `WHERE key > $cursor` keyset pagination, so a separate
+/// cursor-based SQL variant is unnecessary.
 struct Sql {
     exists: String,
     get: String,
@@ -54,15 +45,14 @@ struct Sql {
     delc: String,
     delr: String,
     count: String,
-    // ── Pre-built range-scan SQL (6 fixed combinations) ──
-    // Offset mode: keys/keysr/scan/scanr (4 variants)
+    // ── Pre-built range-scan SQL (4 fixed combinations) ──
+    // keys/keysr/scan/scanr — all use OFFSET-based pagination.
+    // Cursor-based pagination is handled by the Transactable trait's
+    // default cursor (see struct-level doc comment).
     range_keys_asc: String,
     range_keys_desc: String,
     range_kv_asc: String,
     range_kv_desc: String,
-    // After-cursor mode: keys_after/scan_after (2 variants, ASC only)
-    range_after_keys_asc: String,
-    range_after_kv_asc: String,
     // Original table name (for `count_approx` / `pg_class` queries).
     table_name: String,
 }
@@ -103,15 +93,6 @@ impl Sql {
                 "SELECT key, val FROM {table} WHERE key >= $1 AND key < $2 \
                  ORDER BY key DESC LIMIT $3 OFFSET $4"
             ),
-            // After-cursor mode — SELECT … AND key > $3 ORDER BY key ASC LIMIT $4
-            range_after_keys_asc: format!(
-                "SELECT key FROM {table} WHERE key >= $1 AND key < $2 AND key > $3 \
-                 ORDER BY key ASC LIMIT $4"
-            ),
-            range_after_kv_asc: format!(
-                "SELECT key, val FROM {table} WHERE key >= $1 AND key < $2 AND key > $3 \
-                 ORDER BY key ASC LIMIT $4"
-            ),
             table_name: table.to_string(),
         }
     }
@@ -148,10 +129,6 @@ pub struct PgTransaction {
     /// increment (no heap allocation) and borrows don't conflict with
     /// `&mut self` on the connection.
     sql: Arc<Sql>,
-    /// Last key returned by a range scan (ascending), used to auto-switch
-    /// to keyset pagination on subsequent calls when the caller passes
-    /// `ScanMode::After` with this cursor.
-    last_scan_key_asc: Option<Key>,
 }
 
 impl PgTransaction {
@@ -175,7 +152,6 @@ impl PgTransaction {
             isolation,
             persistent,
             sql: Arc::new(Sql::new(table)),
-            last_scan_key_asc: None,
         }
     }
 
@@ -477,24 +453,18 @@ impl PgTransaction {
     }
 
     // ─── Range scans ─────────────────────────────────────
-
-    /// Resolve the pre-built SQL string for the given range-scan variant.
-    #[inline]
-    fn range_sql(sql: &Sql, variant: RangeSql) -> &str {
-        match variant {
-            RangeSql::KeysAsc => &sql.range_keys_asc,
-            RangeSql::KeysDesc => &sql.range_keys_desc,
-            RangeSql::KvAsc => &sql.range_kv_asc,
-            RangeSql::KvDesc => &sql.range_kv_desc,
-            RangeSql::AfterKeysAsc => &sql.range_after_keys_asc,
-            RangeSql::AfterKvAsc => &sql.range_after_kv_asc,
-        }
-    }
+    //
+    // SurrealDB pagination is driven by the `Transactable` trait's default
+    // `DefaultKeysCursor` / `DefaultValsCursor`: each batch calls
+    // `keys()`/`scan()` with `skip=0` (after the first batch) and advances
+    // `range.start` to `last_key + \x00`. This is equivalent to keyset
+    // pagination (`WHERE key > $cursor`), so no separate cursor SQL is
+    // needed. See the `Sql` struct doc comment for details.
 
     /// Internal: execute an OFFSET-based range scan, returning raw rows.
     async fn range_query_offset(
         &mut self,
-        variant: RangeSql,
+        range_sql: &str,
         rng: Range<Key>,
         limit: u32,
         skip: u32,
@@ -506,10 +476,8 @@ impl PgTransaction {
                 "large OFFSET in range scan — consider cursor-based pagination"
             );
         }
-        let sql = self.sql.clone();
         let persistent = self.persistent;
-        let sql_str = Self::range_sql(&sql, variant);
-        Self::build_query(persistent, sql_str)
+        Self::build_query(persistent, range_sql)
             .bind(rng.start.as_slice())
             .bind(rng.end.as_slice())
             .bind(limit as i64)
@@ -517,43 +485,6 @@ impl PgTransaction {
             .fetch_all(self.conn_mut()?)
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))
-    }
-
-    /// Internal: execute a cursor-based (keyset) range scan, returning raw rows.
-    async fn range_query_after(
-        &mut self,
-        variant: RangeSql,
-        rng: Range<Key>,
-        limit: u32,
-        cursor: &[u8],
-    ) -> Result<Vec<sqlx::postgres::PgRow>> {
-        let sql = self.sql.clone();
-        let persistent = self.persistent;
-        let sql_str = Self::range_sql(&sql, variant);
-        Self::build_query(persistent, sql_str)
-            .bind(rng.start.as_slice())
-            .bind(rng.end.as_slice())
-            .bind(cursor)
-            .bind(limit as i64)
-            .fetch_all(self.conn_mut()?)
-            .await
-            .map_err(|e| PgStoreError::from_sqlx(None, &e))
-    }
-
-    /// Internal: dispatch between cursor-based (keyset) and OFFSET-based
-    /// range scan depending on whether a cursor is provided.
-    async fn range_query_cursor(
-        &mut self,
-        after_variant: RangeSql,
-        offset_variant: RangeSql,
-        rng: Range<Key>,
-        limit: u32,
-        cursor: Option<&[u8]>,
-    ) -> Result<Vec<sqlx::postgres::PgRow>> {
-        match cursor {
-            Some(c) => self.range_query_after(after_variant, rng, limit, c).await,
-            None => self.range_query_offset(offset_variant, rng, limit, 0).await,
-        }
     }
 
     /// Internal: extract keys from rows.
@@ -572,17 +503,15 @@ impl PgTransaction {
 
     /// Scan keys in a range (ascending).
     pub async fn keys(&mut self, rng: Range<Key>, limit: u32, skip: u32) -> Result<Vec<Key>> {
-        let rows = self
-            .range_query_offset(RangeSql::KeysAsc, rng, limit, skip)
-            .await?;
+        let sql = self.sql.clone();
+        let rows = self.range_query_offset(&sql.range_keys_asc, rng, limit, skip).await?;
         Ok(Self::rows_to_keys(rows))
     }
 
     /// Scan keys in a range (descending).
     pub async fn keysr(&mut self, rng: Range<Key>, limit: u32, skip: u32) -> Result<Vec<Key>> {
-        let rows = self
-            .range_query_offset(RangeSql::KeysDesc, rng, limit, skip)
-            .await?;
+        let sql = self.sql.clone();
+        let rows = self.range_query_offset(&sql.range_keys_desc, rng, limit, skip).await?;
         Ok(Self::rows_to_keys(rows))
     }
 
@@ -593,9 +522,8 @@ impl PgTransaction {
         limit: u32,
         skip: u32,
     ) -> Result<Vec<(Key, Val)>> {
-        let rows = self
-            .range_query_offset(RangeSql::KvAsc, rng, limit, skip)
-            .await?;
+        let sql = self.sql.clone();
+        let rows = self.range_query_offset(&sql.range_kv_asc, rng, limit, skip).await?;
         Ok(Self::rows_to_pairs(rows))
     }
 
@@ -606,52 +534,9 @@ impl PgTransaction {
         limit: u32,
         skip: u32,
     ) -> Result<Vec<(Key, Val)>> {
-        let rows = self
-            .range_query_offset(RangeSql::KvDesc, rng, limit, skip)
-            .await?;
+        let sql = self.sql.clone();
+        let rows = self.range_query_offset(&sql.range_kv_desc, rng, limit, skip).await?;
         Ok(Self::rows_to_pairs(rows))
-    }
-
-    /// Cursor-based key scan (ascending): return keys after the given cursor.
-    ///
-    /// Unlike `keys()` which uses `OFFSET`, this uses `WHERE key > $cursor`
-    /// for O(limit) performance regardless of how deep the cursor is.
-    /// If `cursor` is `None`, starts from the beginning of the range.
-    pub async fn keys_after(
-        &mut self,
-        rng: Range<Key>,
-        limit: u32,
-        cursor: Option<Key>,
-    ) -> Result<Vec<Key>> {
-        let rows = self
-            .range_query_cursor(RangeSql::AfterKeysAsc, RangeSql::KeysAsc, rng, limit, cursor.as_deref())
-            .await?;
-        Ok(Self::rows_to_keys(rows))
-    }
-
-    /// Cursor-based key-value scan (ascending): return pairs after the given cursor.
-    ///
-    /// Automatically tracks the last key returned via `last_scan_key_asc`
-    /// so callers can chain calls without manually managing cursors.
-    pub async fn scan_after(
-        &mut self,
-        rng: Range<Key>,
-        limit: u32,
-        cursor: Option<Key>,
-    ) -> Result<Vec<(Key, Val)>> {
-        let rows = self
-            .range_query_cursor(RangeSql::AfterKvAsc, RangeSql::KvAsc, rng, limit, cursor.as_deref())
-            .await?;
-        if let Some(last) = rows.last() {
-            self.last_scan_key_asc = Some(last.get::<Vec<u8>, _>("key"));
-        }
-        Ok(Self::rows_to_pairs(rows))
-    }
-
-    /// Get the last key returned by the most recent ascending scan.
-    #[must_use]
-    pub fn last_scan_key(&self) -> Option<&Key> {
-        self.last_scan_key_asc.as_ref()
     }
 
     /// Count keys in a range.
