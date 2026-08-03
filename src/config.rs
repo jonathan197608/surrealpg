@@ -122,16 +122,26 @@ impl Default for PgConfig {
 }
 
 impl PgConfig {
-    /// Validate that a SQL identifier (table name) contains only safe characters
-    /// and is not a SQL reserved word.
+    /// Validate that a SQL identifier (table name) contains only safe characters,
+    /// starts with a letter or underscore, and is not a SQL reserved word.
     ///
     /// Prevents SQL injection through the `table_name` URL parameter.
-    /// Only alphanumeric characters and underscores are allowed.
+    /// Only alphanumeric characters and underscores are allowed; the first
+    /// character must be an ASCII letter or underscore (not a digit), matching
+    /// PostgreSQL's unquoted-identifier rules.
     /// Common SQL reserved words (e.g. `SELECT`, `TABLE`) are rejected
     /// because they would cause syntax errors when interpolated into DDL/DML.
     pub(crate) fn validate_identifier(name: &str) -> Result<(), String> {
         if name.is_empty() {
             return Err("invalid table name '': must be non-empty and contain only [a-zA-Z0-9_]".to_string());
+        }
+        // PostgreSQL requires unquoted identifiers to start with a letter or
+        // underscore; a leading digit (e.g. "123table") is a syntax error.
+        let first = name.chars().next().unwrap();
+        if !first.is_ascii_alphabetic() && first != '_' {
+            return Err(format!(
+                "invalid table name '{name}': first character must be a letter or underscore"
+            ));
         }
         if !name
             .chars()
@@ -313,5 +323,50 @@ impl PgConfig {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_identifier_valid() {
+        assert!(PgConfig::validate_identifier("kv").is_ok());
+        assert!(PgConfig::validate_identifier("kv_test").is_ok());
+        assert!(PgConfig::validate_identifier("_kv").is_ok());
+        assert!(PgConfig::validate_identifier("a").is_ok());
+        assert!(PgConfig::validate_identifier("Mixed_Case123").is_ok());
+    }
+
+    #[test]
+    fn test_validate_identifier_empty() {
+        assert!(PgConfig::validate_identifier("").is_err());
+    }
+
+    #[test]
+    fn test_validate_identifier_leading_digit() {
+        // PostgreSQL rejects unquoted identifiers starting with a digit.
+        assert!(PgConfig::validate_identifier("123table").is_err());
+        assert!(PgConfig::validate_identifier("1").is_err());
+        assert!(PgConfig::validate_identifier("9kv").is_err());
+    }
+
+    #[test]
+    fn test_validate_identifier_invalid_chars() {
+        assert!(PgConfig::validate_identifier("kv-table").is_err());
+        assert!(PgConfig::validate_identifier("kv.table").is_err());
+        assert!(PgConfig::validate_identifier("kv table").is_err());
+        assert!(PgConfig::validate_identifier("kv;DROP").is_err());
+        assert!(PgConfig::validate_identifier("kv'").is_err());
+    }
+
+    #[test]
+    fn test_validate_identifier_reserved() {
+        assert!(PgConfig::validate_identifier("SELECT").is_err());
+        assert!(PgConfig::validate_identifier("select").is_err());
+        assert!(PgConfig::validate_identifier("TABLE").is_err());
+        assert!(PgConfig::validate_identifier("table").is_err());
+        assert!(PgConfig::validate_identifier("DROP").is_err());
     }
 }

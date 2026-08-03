@@ -659,8 +659,9 @@ impl PgTransaction {
             .fetch_one(self.conn_mut()?)
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
-        // COUNT(*) is always >= 0; .max(0) guards against negative
-        // reltuples which should never occur but is defensive.
+        // COUNT(*) always returns ≥ 0; .max(0) is purely defensive —
+        // sqlx should never return a negative i64 for COUNT(*), but we
+        // guard against driver/encoding edge cases before casting to u64.
         Ok(row.get::<i64, _>("cnt").max(0) as u64)
     }
 
