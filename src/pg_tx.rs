@@ -61,6 +61,22 @@ impl PgTx {
         }
         Ok(guard)
     }
+
+    /// Like `lock()`, but also checks that the transaction is writable.
+    /// Used by all write methods to avoid repeating the closed/writable guards.
+    async fn lock_write(&self) -> kvs::Result<tokio::sync::MutexGuard<'_, Option<PgTransaction>>> {
+        if self.done.load(Ordering::Relaxed) {
+            return Err(kvs::Error::TransactionFinished);
+        }
+        if !self.write {
+            return Err(kvs::Error::TransactionReadonly);
+        }
+        let guard = self.inner.lock().await;
+        if guard.is_none() {
+            return Err(kvs::Error::TransactionFinished);
+        }
+        Ok(guard)
+    }
 }
 
 impl fmt::Display for PgTx {
@@ -133,13 +149,7 @@ impl Transactable for PgTx {
 
     fn set(&self, key: Key, val: Val) -> BoxFut<'_, kvs::Result<()>> {
         Box::pin(async move {
-            if self.closed() {
-                return Err(kvs::Error::TransactionFinished);
-            }
-            if !self.writeable() {
-                return Err(kvs::Error::TransactionReadonly);
-            }
-            let mut guard = self.lock().await?;
+            let mut guard = self.lock_write().await?;
             let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
             tx.set(key, val).await.map_err(kvs::Error::from)
         })
@@ -147,13 +157,7 @@ impl Transactable for PgTx {
 
     fn put(&self, key: Key, val: Val) -> BoxFut<'_, kvs::Result<()>> {
         Box::pin(async move {
-            if self.closed() {
-                return Err(kvs::Error::TransactionFinished);
-            }
-            if !self.writeable() {
-                return Err(kvs::Error::TransactionReadonly);
-            }
-            let mut guard = self.lock().await?;
+            let mut guard = self.lock_write().await?;
             let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
             tx.put(key, val).await.map_err(kvs::Error::from)
         })
@@ -161,13 +165,7 @@ impl Transactable for PgTx {
 
     fn putc(&self, key: Key, val: Val, chk: Option<Val>) -> BoxFut<'_, kvs::Result<()>> {
         Box::pin(async move {
-            if self.closed() {
-                return Err(kvs::Error::TransactionFinished);
-            }
-            if !self.writeable() {
-                return Err(kvs::Error::TransactionReadonly);
-            }
-            let mut guard = self.lock().await?;
+            let mut guard = self.lock_write().await?;
             let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
             tx.putc(key, val, chk).await.map_err(kvs::Error::from)
         })
@@ -175,13 +173,7 @@ impl Transactable for PgTx {
 
     fn del(&self, key: Key) -> BoxFut<'_, kvs::Result<()>> {
         Box::pin(async move {
-            if self.closed() {
-                return Err(kvs::Error::TransactionFinished);
-            }
-            if !self.writeable() {
-                return Err(kvs::Error::TransactionReadonly);
-            }
-            let mut guard = self.lock().await?;
+            let mut guard = self.lock_write().await?;
             let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
             tx.del(key).await.map_err(kvs::Error::from)
         })
@@ -189,13 +181,7 @@ impl Transactable for PgTx {
 
     fn delc(&self, key: Key, chk: Option<Val>) -> BoxFut<'_, kvs::Result<()>> {
         Box::pin(async move {
-            if self.closed() {
-                return Err(kvs::Error::TransactionFinished);
-            }
-            if !self.writeable() {
-                return Err(kvs::Error::TransactionReadonly);
-            }
-            let mut guard = self.lock().await?;
+            let mut guard = self.lock_write().await?;
             let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
             tx.delc(key, chk).await.map_err(kvs::Error::from)
         })

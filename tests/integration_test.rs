@@ -41,6 +41,7 @@ pub async fn run(store: &Arc<PgStore>) -> (u32, u32) {
         ("count_approx", test_count_approx),
         ("health check", test_health_check),
         ("pool size reporting", test_pool_size),
+        ("batch setm", test_setm),
     ];
 
     let mut passed = 0u32;
@@ -553,6 +554,95 @@ fn test_pool_size(store: &Arc<PgStore>) -> futures::future::BoxFuture<'_, Result
         // pool_max should be readable and > 0
         let max = store.pool_max();
         assert!(max > 0, "pool_max should be > 0");
+        Ok(())
+    })
+}
+
+fn test_setm(store: &Arc<PgStore>) -> futures::future::BoxFuture<'_, Result<(), String>> {
+    Box::pin(async {
+        clean_all(store).await;
+
+        // Batch-insert 5 key-value pairs in a single SQL statement.
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..5u32)
+            .map(|i| {
+                (
+                    format!("test:setm:{i:03}").into_bytes(),
+                    format!("val_{i}").into_bytes(),
+                )
+            })
+            .collect();
+
+        {
+            let mut tx = store.begin(true).await.map_err(|e| e.to_string())?;
+            tx.setm(pairs.clone()).await.map_err(|e| e.to_string())?;
+            tx.commit().await.map_err(|e| e.to_string())?;
+        }
+
+        // Verify all 5 keys are present with correct values.
+        {
+            let mut tx = store.begin(false).await.map_err(|e| e.to_string())?;
+            let keys: Vec<Vec<u8>> = (0..5u32)
+                .map(|i| format!("test:setm:{i:03}").into_bytes())
+                .collect();
+            let vals = tx.getm(keys).await.map_err(|e| e.to_string())?;
+            assert_eq!(vals.len(), 5);
+            for (i, v) in vals.iter().enumerate() {
+                let expected = format!("val_{i}");
+                assert_eq!(
+                    v.as_deref(),
+                    Some(expected.as_bytes()),
+                    "key {i} should have correct value"
+                );
+            }
+            tx.cancel().await.map_err(|e| e.to_string())?;
+        }
+
+        // Test upsert: update existing keys with new values via setm.
+        {
+            let mut tx = store.begin(true).await.map_err(|e| e.to_string())?;
+            let updated: Vec<(Vec<u8>, Vec<u8>)> = (0..5u32)
+                .map(|i| {
+                    (
+                        format!("test:setm:{i:03}").into_bytes(),
+                        format!("updated_{i}").into_bytes(),
+                    )
+                })
+                .collect();
+            tx.setm(updated).await.map_err(|e| e.to_string())?;
+            tx.commit().await.map_err(|e| e.to_string())?;
+        }
+
+        // Verify updated values.
+        {
+            let mut tx = store.begin(false).await.map_err(|e| e.to_string())?;
+            let val = tx
+                .get(b"test:setm:002".to_vec())
+                .await
+                .map_err(|e| e.to_string())?;
+            assert_eq!(
+                val,
+                Some(b"updated_2".to_vec()),
+                "setm upsert should update existing value"
+            );
+            tx.cancel().await.map_err(|e| e.to_string())?;
+        }
+
+        // Test empty input — should be a no-op.
+        {
+            let mut tx = store.begin(true).await.map_err(|e| e.to_string())?;
+            tx.setm(Vec::new()).await.map_err(|e| e.to_string())?;
+            tx.commit().await.map_err(|e| e.to_string())?;
+        }
+
+        // Clean up.
+        {
+            let mut tx = store.begin(true).await.map_err(|e| e.to_string())?;
+            tx.delr(b"test:setm:".to_vec()..b"test:setm;".to_vec())
+                .await
+                .map_err(|e| e.to_string())?;
+            tx.commit().await.map_err(|e| e.to_string())?;
+        }
+
         Ok(())
     })
 }

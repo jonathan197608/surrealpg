@@ -39,6 +39,7 @@ struct Sql {
     get: String,
     getm: String,
     set: String,
+    setm: String,
     put: String,
     putc: String,
     del: String,
@@ -67,6 +68,11 @@ impl Sql {
             getm: format!("SELECT key, val FROM {table} WHERE key = ANY($1)"),
             set: format!(
                 "INSERT INTO {table} (key, val) VALUES ($1, $2) \
+                 ON CONFLICT (key) DO UPDATE SET val = EXCLUDED.val"
+            ),
+            setm: format!(
+                "INSERT INTO {table} (key, val) \
+                 SELECT * FROM UNNEST($1::bytea[], $2::bytea[]) \
                  ON CONFLICT (key) DO UPDATE SET val = EXCLUDED.val"
             ),
             put: format!(
@@ -384,6 +390,37 @@ impl PgTransaction {
         Ok(())
     }
 
+    /// Batch-set multiple key-value pairs in a single SQL statement.
+    ///
+    /// Uses `UNNEST` to send all pairs as two array parameters, then a single
+    /// `INSERT ... ON CONFLICT DO UPDATE` executes atomically. This reduces
+    /// N individual `set` calls (N network round-trips) to 1 round-trip.
+    ///
+    /// If `pairs` is empty, returns immediately without hitting the DB.
+    pub async fn setm(&mut self, pairs: Vec<(Key, Val)>) -> Result<()> {
+        self.check_writable()?;
+        if pairs.is_empty() {
+            return Ok(());
+        }
+
+        let sql = self.sql.clone();
+        let persistent = self.persistent;
+
+        // Split into two Vec<Vec<u8>> for UNNEST binding.
+        let keys: Vec<&[u8]> = pairs.iter().map(|(k, _)| k.as_slice()).collect();
+        let vals: Vec<&[u8]> = pairs.iter().map(|(_, v)| v.as_slice()).collect();
+
+        Self::build_query(persistent, &sql.setm)
+            .bind(&keys)
+            .bind(&vals)
+            .execute(self.conn_mut()?)
+            .await
+            .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
+
+        trace!(count = pairs.len(), "setm");
+        Ok(())
+    }
+
     /// Set a key only if it does not already exist (insert-if-absent).
     /// Returns `KeyAlreadyExists` if the key exists.
     pub async fn put(&mut self, key: Key, val: Val) -> Result<()> {
@@ -470,6 +507,10 @@ impl PgTransaction {
     /// Delete all keys in a range (inclusive start, exclusive end).
     pub async fn delr(&mut self, rng: Range<Key>) -> Result<()> {
         self.check_writable()?;
+        // Empty range — skip DB round-trip.
+        if rng.start >= rng.end {
+            return Ok(());
+        }
         let sql = self.sql.clone();
         let persistent = self.persistent;
         let deleted = Self::build_query(persistent, &sql.delr)
@@ -500,6 +541,10 @@ impl PgTransaction {
         limit: u32,
         skip: u32,
     ) -> Result<Vec<sqlx::postgres::PgRow>> {
+        // Empty range — skip DB round-trip.
+        if rng.start >= rng.end {
+            return Ok(Vec::new());
+        }
         if skip > 1000 {
             warn!(
                 skip,
@@ -572,6 +617,10 @@ impl PgTransaction {
 
     /// Count keys in a range.
     pub async fn count(&mut self, rng: Range<Key>) -> Result<u64> {
+        // Empty range — skip DB round-trip.
+        if rng.start >= rng.end {
+            return Ok(0);
+        }
         let sql = self.sql.clone();
         let persistent = self.persistent;
         let row = Self::build_query(persistent, &sql.count)
