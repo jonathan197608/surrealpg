@@ -55,6 +55,8 @@ struct Sql {
     range_kv_desc: String,
     // Original table name (for `count_approx` / `pg_class` queries).
     table_name: String,
+    // Pre-built parameterised count_approx query (uses $1 for relname).
+    count_approx: String,
 }
 
 impl Sql {
@@ -94,6 +96,10 @@ impl Sql {
                  ORDER BY key DESC LIMIT $3 OFFSET $4"
             ),
             table_name: table.to_string(),
+            count_approx: String::from(
+                "SELECT reltuples::bigint AS approx_cnt FROM pg_class \
+                 WHERE relname = $1 AND reltuples > 0",
+            ),
         }
     }
 }
@@ -208,6 +214,9 @@ impl PgTransaction {
     /// Uses stack-allocated buffer instead of `format!()` to avoid
     /// heap allocation. Savepoint names follow the pattern `sp_N`
     /// where N is a monotonically increasing counter.
+    ///
+    /// Returns both the name (for the savepoint stack) and the full
+    /// SQL prefix (e.g. `"SAVEPOINT sp_3"`) to avoid a second allocation.
     fn push_savepoint_name(&mut self) -> String {
         self.savepoint_counter += 1;
         let mut buf = [0u8; 16];
@@ -238,6 +247,26 @@ impl PgTransaction {
             .to_string();
         self.savepoints.push(name.clone());
         name
+    }
+
+    /// Build a savepoint SQL statement on the stack without `format!()`.
+    ///
+    /// `prefix` is e.g. `"SAVEPOINT "`, `"RELEASE SAVEPOINT "`, or
+    /// `"ROLLBACK TO SAVEPOINT "`. The savepoint name is appended
+    /// directly into a stack buffer.
+    #[inline]
+    fn savepoint_sql(prefix: &str, name: &str) -> std::borrow::Cow<'static, str> {
+        // Max: "ROLLBACK TO SAVEPOINT sp_" + 10 digits = 31 bytes
+        let mut buf = [0u8; 48];
+        let prefix_len = prefix.len();
+        buf[..prefix_len].copy_from_slice(prefix.as_bytes());
+        let name_bytes = name.as_bytes();
+        let total = prefix_len + name_bytes.len();
+        buf[prefix_len..total].copy_from_slice(name_bytes);
+        std::str::from_utf8(&buf[..total])
+            .expect("savepoint SQL is always valid UTF-8")
+            .to_string()
+            .into()
     }
 
     // ─── Transaction control ─────────────────────────────
@@ -315,9 +344,12 @@ impl PgTransaction {
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
 
-        // For small result sets (≤64 rows), linear scan has better cache locality
-        // than a HashMap. This covers the vast majority of batch-get calls.
-        if rows.len() <= 64 {
+        // For small result sets, linear scan has better cache locality
+        // than a HashMap. We check the product of keys × rows to avoid
+        // O(n²) blow-up when many keys are requested but few exist.
+        // Threshold: 8192 comparisons ≈ 128 keys × 64 rows.
+        let use_linear = rows.len() <= 64 && (rows.len() as usize).saturating_mul(keys.len()) <= 8192;
+        if use_linear {
             Ok(keys.into_iter()
                 .map(|k| {
                     rows.iter()
@@ -559,14 +591,10 @@ impl PgTransaction {
     /// may be stale if `ANALYZE` hasn't run recently. Returns `None` if the
     /// table has no statistics.
     pub async fn count_approx(&mut self) -> Result<Option<u64>> {
-        let table = &self.sql.table_name;
-        let sql = format!(
-            "SELECT reltuples::bigint AS approx_cnt FROM pg_class \
-             WHERE relname = '{}' AND reltuples > 0",
-            table
-        );
+        let sql = self.sql.clone();
         let persistent = self.persistent;
-        let row = Self::build_query(persistent, &sql)
+        let row = Self::build_query(persistent, &sql.count_approx)
+            .bind(&*sql.table_name)
             .fetch_optional(self.conn_mut()?)
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
@@ -578,8 +606,8 @@ impl PgTransaction {
     /// Create a new savepoint within the current transaction.
     pub async fn new_save_point(&mut self) -> Result<()> {
         let name = self.push_savepoint_name();
-        self.execute_simple(&format!("SAVEPOINT {name}"), None)
-            .await?;
+        let sql = Self::savepoint_sql("SAVEPOINT ", &name);
+        self.execute_simple(&sql, None).await?;
         debug!(savepoint = %name, "savepoint created");
         Ok(())
     }
@@ -589,8 +617,8 @@ impl PgTransaction {
         let Some(name) = self.pop_savepoint_name() else {
             return Ok(());
         };
-        self.execute_simple(&format!("RELEASE SAVEPOINT {name}"), None)
-            .await?;
+        let sql = Self::savepoint_sql("RELEASE SAVEPOINT ", &name);
+        self.execute_simple(&sql, None).await?;
         debug!(savepoint = %name, "savepoint released");
         Ok(())
     }
@@ -600,10 +628,10 @@ impl PgTransaction {
         let Some(name) = self.pop_savepoint_name() else {
             return Ok(());
         };
-        self.execute_simple(&format!("ROLLBACK TO SAVEPOINT {name}"), None)
-            .await?;
-        self.execute_simple(&format!("RELEASE SAVEPOINT {name}"), None)
-            .await?;
+        let rollback_sql = Self::savepoint_sql("ROLLBACK TO SAVEPOINT ", &name);
+        let release_sql = Self::savepoint_sql("RELEASE SAVEPOINT ", &name);
+        self.execute_simple(&rollback_sql, None).await?;
+        self.execute_simple(&release_sql, None).await?;
         debug!(savepoint = %name, "rolled back to savepoint");
         Ok(())
     }

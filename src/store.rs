@@ -34,6 +34,10 @@ pub struct PgStore {
     /// Maximum pool connections (from config), used by metrics reporting.
     /// sqlx 0.8 `PgPool` doesn't expose `max_connections()`, so we store it.
     pool_max: u32,
+    /// Pre-built VACUUM SQL string. VACUUM doesn't support parameterised
+    /// binding (PG limitation), but `table_name` is validated by
+    /// `validate_identifier`, so this is safe.
+    vacuum_sql: Arc<str>,
 }
 
 impl PgStore {
@@ -73,6 +77,8 @@ impl PgStore {
         let acquire_timeout = config.connect_timeout.unwrap_or(tune.pool_acquire_timeout);
         let idle_timeout = config.idle_timeout.or(Some(tune.pool_idle_timeout));
         let max_lifetime = config.max_lifetime.or(Some(tune.pool_max_lifetime));
+        // Pre-build the VACUUM SQL — table_name is validated by validate_identifier.
+        let vacuum_sql: Arc<str> = format!("VACUUM ANALYZE {}", config.table_name).into();
 
         let opts: PgConnectOptions = url
             .parse()
@@ -167,6 +173,7 @@ impl PgStore {
             persistent,
             canceller,
             pool_max,
+            vacuum_sql,
         }))
     }
 
@@ -211,10 +218,12 @@ impl PgStore {
         match result {
             Ok(_) => {}
             Err(e) => {
-                let err_str = e.to_string().to_ascii_lowercase();
-                let is_tx_active = err_str.contains("already a transaction")
-                    || err_str.contains("25p01")
-                    || err_str.contains("25p02");
+                // Use SQLSTATE codes instead of string matching for
+                // cross-version reliability.
+                // 25P01 = no_active_sql_transaction
+                // 25P02 = in_failed_sql_transaction
+                let is_tx_active = matches!(&e, sqlx::Error::Database(db)
+                    if matches!(db.code().as_deref(), Some("25P01") | Some("25P02")));
                 if is_tx_active {
                     // Leaked transaction detected — clean up and retry.
                     let _ = Executor::execute(&mut *conn, sqlx::raw_sql("ROLLBACK")).await;
@@ -281,8 +290,7 @@ impl PgStore {
 
     /// Run VACUUM ANALYZE on the table (must be called outside a transaction).
     pub async fn vacuum(&self) -> Result<()> {
-        let sql = format!("VACUUM ANALYZE {}", self.config.table_name);
-        Executor::execute(self.pool(), sqlx::raw_sql(&sql))
+        Executor::execute(self.pool(), sqlx::raw_sql(&self.vacuum_sql))
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
         info!("VACUUM ANALYZE {} completed", self.config.table_name);
@@ -410,10 +418,13 @@ impl PgStore {
                 true
             }
             Err(e) => {
-                let err_str = e.to_string().to_ascii_lowercase();
-                let is_pooler = err_str.contains("already exists")
-                    || err_str.contains("duplicate_prepared_statement")
-                    || err_str.contains("prepared statement") && err_str.contains("does not exist");
+                // Use SQLSTATE codes instead of string matching.
+                // 42P05 = duplicate_prepared_statement
+                // 26000 = invalid_sql_statement_name (prepared statement not found)
+                // 08006 = connection_failure (pooler may drop)
+                let is_pooler = matches!(&e, sqlx::Error::Database(db)
+                    if matches!(db.code().as_deref(),
+                        Some("42P05") | Some("26000") | Some("08006")));
 
                 if is_pooler {
                     info!(
