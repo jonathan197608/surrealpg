@@ -2,7 +2,7 @@
 //! and spawns [`PgTransaction`] instances.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
 use sqlx::Executor;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
@@ -59,6 +59,9 @@ pub struct PgStore {
     tx_committed: Arc<AtomicU64>,
     /// Total number of transactions rolled back / cancelled.
     tx_rolled_back: Arc<AtomicU64>,
+    /// O3: One-shot flag for pool utilization warning. Prevents log spam
+    /// when the pool hovers at high utilization. Reset only on restart.
+    pool_warned: Arc<AtomicBool>,
 }
 
 impl PgStore {
@@ -250,6 +253,8 @@ impl PgStore {
             tx_started: Arc::new(AtomicU64::new(0)),
             tx_committed: Arc::new(AtomicU64::new(0)),
             tx_rolled_back: Arc::new(AtomicU64::new(0)),
+            // O3: Initialize pool utilization warning flag.
+            pool_warned: Arc::new(AtomicBool::new(false)),
         }))
     }
 
@@ -399,6 +404,31 @@ impl PgStore {
     #[must_use]
     pub fn pool_size(&self) -> (u32, u32) {
         (self.pool.size(), self.pool.num_idle() as u32)
+    }
+
+    /// O3: Check pool utilization and warn once if it exceeds 80%.
+    ///
+    /// Called from `collect_u64_metric` when pool metrics are queried.
+    /// Uses an `AtomicBool` to ensure the warning fires only once per
+    /// process lifetime, avoiding log spam during sustained high load.
+    pub(crate) fn check_pool_utilization(&self) {
+        let size = self.pool.size();
+        // Utilization = active connections / max connections.
+        // size() includes both idle and in-use connections, so this
+        // reflects total pool pressure.
+        if size as u64 * 5 > self.pool_max as u64 * 4 {
+            // > 80% utilization
+            // swap(true) returns the *previous* value; if it was already
+            // true, we've already warned — don't spam.
+            if !self.pool_warned.swap(true, AtomicOrdering::Relaxed) {
+                warn!(
+                    pool_size = size,
+                    pool_max = self.pool_max,
+                    utilization_pct = (size as f64 / self.pool_max as f64 * 100.0) as u32,
+                    "connection pool utilization exceeds 80% — consider increasing max_connections"
+                );
+            }
+        }
     }
 
     // ── F8: Transaction metric methods ──

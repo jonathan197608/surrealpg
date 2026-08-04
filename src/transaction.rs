@@ -17,6 +17,15 @@ use crate::error::{PgStoreError, Result};
 pub type Key = Vec<u8>;
 pub type Val = Vec<u8>;
 
+/// Maximum number of key-value pairs per `setm` batch.
+///
+/// PostgreSQL limits each query to 65,535 parameters. `setm` binds 2 array
+/// parameters (keys + vals), so each array can hold at most ~32,767 elements.
+/// We use 32,000 as a conservative limit to leave headroom.
+//
+// O2: setm parameter-limit protection.
+const SETM_MAX_PAIRS: usize = 32_000;
+
 // ─── Pre-built SQL ───────────────────────────────────────
 
 /// Pre-built SQL strings for all KV operations.
@@ -469,15 +478,43 @@ impl PgTransaction {
     /// N individual `set` calls (N network round-trips) to 1 round-trip.
     ///
     /// If `pairs` is empty, returns immediately without hitting the DB.
+    ///
+    /// **O2: Parameter limit protection.** PostgreSQL limits each query to
+    /// 65,535 parameters. `setm` uses 2 array parameters, but the total
+    /// element count per array must stay below 32,767 to be safe. When
+    /// `pairs` exceeds [`SETM_MAX_PAIRS`], the batch is automatically
+    /// chunked into multiple sequential executions. Each chunk is atomic
+    /// within the encompassing transaction.
     pub async fn setm(&mut self, pairs: Vec<(Key, Val)>) -> Result<()> {
-        if self.closed {
-            return Err(PgStoreError::TxClosed);
-        }
+        if self.closed { return Err(PgStoreError::TxClosed); }
         self.check_writable()?;
         if pairs.is_empty() {
             return Ok(());
         }
 
+        // O2: Chunk if the batch exceeds PG's parameter limit.
+        // Each pair becomes 2 array elements (key + val), and PG's
+        // max_parameters = 65,535. We use 32,000 as a conservative limit.
+        if pairs.len() <= SETM_MAX_PAIRS {
+            return self.setm_batch(&pairs).await;
+        }
+
+        // Process in chunks of SETM_MAX_PAIRS.
+        let total = pairs.len();
+        let mut start = 0;
+        while start < total {
+            let end = (start + SETM_MAX_PAIRS).min(total);
+            self.setm_batch(&pairs[start..end]).await?;
+            start = end;
+        }
+        trace!(count = total, chunks = total.div_ceil(SETM_MAX_PAIRS), "setm (chunked)");
+        Ok(())
+    }
+
+    /// Internal: execute a single `setm` batch (≤ `SETM_MAX_PAIRS` pairs).
+    ///
+    /// Borrows `pairs` as a slice to avoid moving the full Vec when chunking.
+    async fn setm_batch(&mut self, pairs: &[(Key, Val)]) -> Result<()> {
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
 
@@ -492,7 +529,7 @@ impl PgTransaction {
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
 
-        trace!(count = pairs.len(), "setm");
+        trace!(count = pairs.len(), "setm batch");
         Ok(())
     }
 

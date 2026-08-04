@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use surrealdb_core::kvs::{self, Key, KeysResult, ScanResult, Transactable, Val};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::debug;
 
 use crate::pg_builder::BoxFut;
 use crate::transaction::PgTransaction;
@@ -139,7 +139,7 @@ impl Transactable for PgTx {
             if had_tx {
                 // F8: Record rollback in metric counter.
                 self.tx_rolled_back.fetch_add(1, Ordering::Relaxed);
-                info!("PostgreSQL transaction cancelled");
+                debug!("PostgreSQL transaction cancelled");
             }
             Ok(())
         })
@@ -176,7 +176,7 @@ impl Transactable for PgTx {
             if had_tx {
                 // F8: Record commit in metric counter.
                 self.tx_committed.fetch_add(1, Ordering::Relaxed);
-                info!("PostgreSQL transaction committed");
+                debug!("PostgreSQL transaction committed");
             }
             Ok(())
         })

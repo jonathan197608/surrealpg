@@ -94,6 +94,8 @@ impl TransactionBuilder for PgStore {
             // redundant atomic reads on the pool internals.
             "pg_pool_size" | "pg_pool_idle" => {
                 let (size, idle) = self.pool_size();
+                // O3: Check pool utilization when metrics are queried.
+                self.check_pool_utilization();
                 if metric == "pg_pool_size" {
                     Some(size as u64)
                 } else {
