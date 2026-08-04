@@ -222,6 +222,10 @@ impl PgConfig {
     /// instead of linear scan. The list covers PostgreSQL's reserved words
     /// that would cause immediate syntax errors when used as unquoted
     /// identifiers in DDL/DML.
+    ///
+    /// P1: Avoids `to_ascii_uppercase()` allocation when `name` is already
+    /// all-ASCII-uppercase (the common case for accidental reserved-word
+    /// usage). Falls back to `to_ascii_uppercase()` only when needed.
     fn is_sql_reserved(name: &str) -> bool {
         // Sorted alphabetically for binary search. Covers the most common
         // PG reserved words that would cause syntax errors as identifiers.
@@ -249,6 +253,12 @@ impl PgConfig {
             "VALUES", "VIEW",
             "WHEN", "WHERE", "WITH",
         ];
+        // Fast path: if name is already all-ASCII-uppercase (the typical
+        // case for "SELECT", "TABLE", etc.), use it directly — zero alloc.
+        if name.bytes().all(|b| b.is_ascii_uppercase() || b == b'_') {
+            return RESERVED.binary_search(&name).is_ok();
+        }
+        // Slow path: allocate uppercase version for mixed/lowercase input.
         let upper = name.to_ascii_uppercase();
         RESERVED.binary_search(&upper.as_str()).is_ok()
     }
@@ -464,6 +474,29 @@ mod tests {
         assert!(PgConfig::validate_identifier("table").is_err());
         assert!(PgConfig::validate_identifier("DROP").is_err());
     }
+
+    // P1: Verify is_sql_reserved works with mixed case (zero-alloc path).
+    #[test]
+    fn test_is_sql_reserved_case_insensitive() {
+        // Exact match
+        assert!(PgConfig::is_sql_reserved("SELECT"));
+        // Lowercase
+        assert!(PgConfig::is_sql_reserved("select"));
+        // Mixed case
+        assert!(PgConfig::is_sql_reserved("Select"));
+        assert!(PgConfig::is_sql_reserved("TaBLe"));
+        // Non-reserved
+        assert!(!PgConfig::is_sql_reserved("kv"));
+        assert!(!PgConfig::is_sql_reserved("my_table"));
+        assert!(!PgConfig::is_sql_reserved("data"));
+        // Different length than any reserved word — fast reject
+        assert!(!PgConfig::is_sql_reserved("x"));
+        assert!(!PgConfig::is_sql_reserved("verylongname"));
+    }
+
+    // B2: Verify checkpoint_target clamping in tune config.
+    // (Placed here because config.rs has the test module, but the actual
+    // clamping logic is in tune.rs — tested in tune.rs own module.)
 
     // ── F7: percent_decode & hex_digit tests ──
 

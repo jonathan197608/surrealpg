@@ -388,13 +388,12 @@ impl PgTransaction {
 
     /// Batch-get multiple keys.
     pub async fn getm(&mut self, keys: Vec<Key>) -> Result<Vec<Option<Val>>> {
+        if self.closed { return Err(PgStoreError::TxClosed); }
         if keys.is_empty() {
             return Ok(Vec::new());
         }
 
         let keys_ref: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
-
-        if self.closed { return Err(PgStoreError::TxClosed); }
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
 
@@ -465,7 +464,6 @@ impl PgTransaction {
             return Ok(());
         }
 
-        if self.closed { return Err(PgStoreError::TxClosed); }
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
 
@@ -513,7 +511,6 @@ impl PgTransaction {
             return self.put(key, val).await;
         };
 
-        if self.closed { return Err(PgStoreError::TxClosed); }
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let affected = Self::build_query(persistent, &self.sql.putc)
@@ -557,7 +554,6 @@ impl PgTransaction {
             return self.del(key).await;
         };
 
-        if self.closed { return Err(PgStoreError::TxClosed); }
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let result = Self::build_query(persistent, &self.sql.delc)
@@ -581,7 +577,6 @@ impl PgTransaction {
         if rng.start >= rng.end {
             return Ok(());
         }
-        if self.closed { return Err(PgStoreError::TxClosed); }
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let deleted = Self::build_query(persistent, &self.sql.delr)

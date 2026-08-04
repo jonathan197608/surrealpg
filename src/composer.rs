@@ -93,6 +93,12 @@ impl TransactionBuilderFactory for PostgresComposer {
         if Self::is_pg_path(path) {
             info!("Starting PostgreSQL kvs store at {path}");
 
+            // F2: ConfigMap is not used by the PG backend — connection
+            // configuration comes from URL query params and environment
+            // variables (see PgConfig::merge_url_params / merge_env).
+            // Explicitly ignore to make the intent clear.
+            let _ = &config;
+
             let store = PgStore::new(path, canceller.clone()).await?;
 
             info!("Started PostgreSQL kvs store");

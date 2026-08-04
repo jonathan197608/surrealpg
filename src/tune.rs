@@ -162,7 +162,20 @@ impl PgTuneConfig {
                 validate_pg_memory_size,
             ),
             server_random_page_cost: env_f64("PG_TUNED_SERVER_RANDOM_PAGE_COST", 1.1),
-            server_checkpoint_target: env_f64("PG_TUNED_SERVER_CHECKPOINT_TARGET", 0.9),
+            server_checkpoint_target: {
+                let v = env_f64("PG_TUNED_SERVER_CHECKPOINT_TARGET", 0.9);
+                // B2: PG requires checkpoint_completion_target ∈ [0.0, 1.0].
+                // Clamp to valid range and warn if the user-supplied value
+                // was out of bounds.
+                if !(0.0..=1.0).contains(&v) {
+                    warn!(
+                        env = "PG_TUNED_SERVER_CHECKPOINT_TARGET",
+                        value = v,
+                        "out of range [0.0, 1.0], clamping"
+                    );
+                }
+                v.clamp(0.0, 1.0)
+            },
         }
     }
 
@@ -555,5 +568,34 @@ mod tests {
         assert!(!env_bool("TEST_ENV_BOOL_UNSET", false));
 
         unsafe { std::env::remove_var("TEST_ENV_BOOL_UNSET") };
+    }
+
+    // B2: checkpoint_target clamping to [0.0, 1.0]
+    #[test]
+    fn test_checkpoint_target_clamping() {
+        // Out-of-range values should be clamped
+        unsafe { std::env::set_var("PG_TUNED_SERVER_CHECKPOINT_TARGET", "1.5") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.server_checkpoint_target, 1.0, "should clamp 1.5 to 1.0");
+
+        unsafe { std::env::set_var("PG_TUNED_SERVER_CHECKPOINT_TARGET", "-0.5") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.server_checkpoint_target, 0.0, "should clamp -0.5 to 0.0");
+
+        // In-range value should pass through
+        unsafe { std::env::set_var("PG_TUNED_SERVER_CHECKPOINT_TARGET", "0.7") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.server_checkpoint_target, 0.7, "0.7 should pass through");
+
+        // Exact boundaries
+        unsafe { std::env::set_var("PG_TUNED_SERVER_CHECKPOINT_TARGET", "0.0") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.server_checkpoint_target, 0.0);
+
+        unsafe { std::env::set_var("PG_TUNED_SERVER_CHECKPOINT_TARGET", "1.0") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.server_checkpoint_target, 1.0);
+
+        unsafe { std::env::remove_var("PG_TUNED_SERVER_CHECKPOINT_TARGET") };
     }
 }
