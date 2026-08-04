@@ -410,16 +410,6 @@ impl PgStore {
 
     // ── F8: Transaction metric methods ──
 
-    /// Record a successful transaction commit.
-    pub fn record_commit(&self) {
-        self.tx_committed.fetch_add(1, AtomicOrdering::Relaxed);
-    }
-
-    /// Record a transaction rollback / cancel.
-    pub fn record_rollback(&self) {
-        self.tx_rolled_back.fetch_add(1, AtomicOrdering::Relaxed);
-    }
-
     /// Get transaction metric counters: (started, committed, rolled_back).
     #[must_use]
     pub fn tx_metrics(&self) -> (u64, u64, u64) {

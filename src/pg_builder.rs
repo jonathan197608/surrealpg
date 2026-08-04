@@ -94,13 +94,27 @@ impl TransactionBuilder for PgStore {
 
     fn collect_u64_metric(&self, metric: &str) -> Option<u64> {
         match metric {
-            "pg_pool_size" => Some(self.pool_size().0 as u64),
-            "pg_pool_idle" => Some(self.pool_size().1 as u64),
+            // P1: Call pool_size() once instead of twice to avoid
+            // redundant atomic reads on the pool internals.
+            "pg_pool_size" | "pg_pool_idle" => {
+                let (size, idle) = self.pool_size();
+                if metric == "pg_pool_size" {
+                    Some(size as u64)
+                } else {
+                    Some(idle as u64)
+                }
+            }
             "pg_pool_max" => Some(self.pool_max() as u64),
             // F8: Transaction metric counters.
-            "pg_tx_started" => Some(self.tx_metrics().0),
-            "pg_tx_committed" => Some(self.tx_metrics().1),
-            "pg_tx_rolled_back" => Some(self.tx_metrics().2),
+            // P1: Call tx_metrics() once for all three counters.
+            "pg_tx_started" | "pg_tx_committed" | "pg_tx_rolled_back" => {
+                let (started, committed, rolled_back) = self.tx_metrics();
+                match metric {
+                    "pg_tx_started" => Some(started),
+                    "pg_tx_committed" => Some(committed),
+                    _ => Some(rolled_back),
+                }
+            }
             _ => None,
         }
     }

@@ -110,7 +110,7 @@ impl Sql {
             table_name: table.to_string(),
             count_approx: String::from(
                 "SELECT reltuples::bigint AS approx_cnt FROM pg_class \
-                 WHERE relname = $1 AND reltuples > 0",
+                 WHERE relname = $1 AND reltuples >= 0",
             ),
         }
     }
@@ -704,11 +704,12 @@ impl PgTransaction {
 
     /// Count keys in a range.
     pub async fn count(&mut self, rng: Range<Key>) -> Result<u64> {
+        // B1: Check closed first — consistency with all other methods.
+        if self.closed { return Err(PgStoreError::TxClosed); }
         // Empty range — skip DB round-trip.
         if rng.start >= rng.end {
             return Ok(0);
         }
-        if self.closed { return Err(PgStoreError::TxClosed); }
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let row = Self::build_query(persistent, &self.sql.count)
@@ -729,7 +730,8 @@ impl PgTransaction {
     /// This is a **whole-table** estimate — the `range` parameters from the
     /// calling `Transactable` method are **not** passed to `pg_class`, so the
     /// result reflects the entire table regardless of the key range. Returns
-    /// `None` if the table has no statistics (e.g. before the first `ANALYZE`).
+    /// `None` if the table has never been analyzed (i.e. `reltuples = -1`).
+    /// Returns `Some(0)` for an analyzed empty table.
     ///
     /// **Note**: The estimate may be stale if `ANALYZE` hasn't run recently.
     pub async fn count_approx(&mut self) -> Result<Option<u64>> {
