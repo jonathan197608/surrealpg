@@ -486,7 +486,9 @@ impl PgTransaction {
     /// chunked into multiple sequential executions. Each chunk is atomic
     /// within the encompassing transaction.
     pub async fn setm(&mut self, pairs: Vec<(Key, Val)>) -> Result<()> {
-        if self.closed { return Err(PgStoreError::TxClosed); }
+        if self.closed {
+            return Err(PgStoreError::TxClosed);
+        }
         self.check_writable()?;
         if pairs.is_empty() {
             return Ok(());
@@ -507,7 +509,11 @@ impl PgTransaction {
             self.setm_batch(&pairs[start..end]).await?;
             start = end;
         }
-        trace!(count = total, chunks = total.div_ceil(SETM_MAX_PAIRS), "setm (chunked)");
+        trace!(
+            count = total,
+            chunks = total.div_ceil(SETM_MAX_PAIRS),
+            "setm (chunked)"
+        );
         Ok(())
     }
 
