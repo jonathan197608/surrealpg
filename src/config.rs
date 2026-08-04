@@ -287,11 +287,11 @@ impl PgConfig {
             "RETURNING",
             "RIGHT",
             "ROLLBACK",
+            "SAVEPOINT",
             "SELECT",
             "SET",
             "SIMILAR",
             "SOME",
-            "SAVEPOINT",
             "TABLE",
             "THEN",
             "TRUE",
@@ -305,6 +305,14 @@ impl PgConfig {
             "WHERE",
             "WITH",
         ];
+        // debug_assert: RESERVED must be sorted lexicographically for
+        // binary_search to work correctly. This catches accidental
+        // reordering during maintenance. Checked in debug builds only —
+        // zero cost in release.
+        debug_assert!(
+            RESERVED.windows(2).all(|w| w[0] < w[1]),
+            "RESERVED array must be sorted lexicographically"
+        );
         // Fast path: if name is already all-ASCII-uppercase (the typical
         // case for "SELECT", "TABLE", etc.), use it directly — zero alloc.
         if name.bytes().all(|b| b.is_ascii_uppercase() || b == b'_') {
@@ -517,6 +525,10 @@ mod tests {
         assert!(PgConfig::validate_identifier("TABLE").is_err());
         assert!(PgConfig::validate_identifier("table").is_err());
         assert!(PgConfig::validate_identifier("DROP").is_err());
+        // SAVEPOINT was previously misplaced in the RESERVED array (after
+        // SOME instead of before SELECT), causing binary_search to miss it.
+        assert!(PgConfig::validate_identifier("SAVEPOINT").is_err());
+        assert!(PgConfig::validate_identifier("savepoint").is_err());
     }
 
     // P1: Verify is_sql_reserved works with mixed case (zero-alloc path).
@@ -529,6 +541,9 @@ mod tests {
         // Mixed case
         assert!(PgConfig::is_sql_reserved("Select"));
         assert!(PgConfig::is_sql_reserved("TaBLe"));
+        // SAVEPOINT — regression: was misplaced in array, binary_search missed it
+        assert!(PgConfig::is_sql_reserved("SAVEPOINT"));
+        assert!(PgConfig::is_sql_reserved("savepoint"));
         // Non-reserved
         assert!(!PgConfig::is_sql_reserved("kv"));
         assert!(!PgConfig::is_sql_reserved("my_table"));
