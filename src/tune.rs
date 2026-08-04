@@ -262,6 +262,13 @@ ALTER TABLE {table} SET (
             "server_effective_cache_size failed validation: {}",
             self.server_effective_cache_size
         );
+        // B5: Guard against NaN/Infinity in random_page_cost — these would
+        // produce invalid SQL (`SET random_page_cost = inf` / `nan`).
+        assert!(
+            self.server_random_page_cost.is_finite(),
+            "server_random_page_cost must be finite, got {}",
+            self.server_random_page_cost
+        );
         format!(
             r#"SET statement_timeout = '{st}s';
 SET idle_in_transaction_session_timeout = '{it}s';
@@ -300,24 +307,42 @@ SET effective_cache_size = '{ecs}';"#,
 // ─── Env helpers ─────────────────────────────────────────
 
 fn env_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    match std::env::var(key) {
+        Ok(ref v) => match v.parse() {
+            Ok(val) => val,
+            Err(_) => {
+                warn!(env = key, value = %v, "failed to parse as u32, using default {default}");
+                default
+            }
+        },
+        Err(_) => default,
+    }
 }
 
 fn env_i32(key: &str, default: i32) -> i32 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    match std::env::var(key) {
+        Ok(ref v) => match v.parse() {
+            Ok(val) => val,
+            Err(_) => {
+                warn!(env = key, value = %v, "failed to parse as i32, using default {default}");
+                default
+            }
+        },
+        Err(_) => default,
+    }
 }
 
 fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    match std::env::var(key) {
+        Ok(ref v) => match v.parse() {
+            Ok(val) => val,
+            Err(_) => {
+                warn!(env = key, value = %v, "failed to parse as f64, using default {default}");
+                default
+            }
+        },
+        Err(_) => default,
+    }
 }
 
 /// Like `env_str`, but validates the env value with a predicate.
@@ -385,10 +410,16 @@ fn env_bool(key: &str, default: bool) -> bool {
 }
 
 fn env_duration(key: &str, default_secs: u64) -> Duration {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| parse_duration(&v))
-        .unwrap_or_else(|| Duration::from_secs(default_secs))
+    match std::env::var(key) {
+        Ok(ref v) => match parse_duration(v) {
+            Some(d) => d,
+            None => {
+                warn!(env = key, value = %v, "failed to parse duration, using default {default_secs}s");
+                Duration::from_secs(default_secs)
+            }
+        },
+        Err(_) => Duration::from_secs(default_secs),
+    }
 }
 
 /// Parse a duration string: `500ms`, `10s`, `5m`, `2h`, or bare secs.

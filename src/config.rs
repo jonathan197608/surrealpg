@@ -2,6 +2,56 @@
 
 use std::time::Duration;
 
+/// Percent-decode a URL-encoded string.
+///
+/// Handles `%XX` sequences (e.g. `%20` → space, `%2F` → `/`).
+/// Returns the decoded string on success, or the original string
+/// if decoding fails (graceful degradation for malformed input).
+fn percent_decode(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut bytes = input.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            let hi = bytes.next();
+            let lo = bytes.next();
+            match (hi, lo) {
+                (Some(h), Some(l)) => {
+                    let hi_val = hex_digit(h);
+                    let lo_val = hex_digit(l);
+                    if let (Some(hv), Some(lv)) = (hi_val, lo_val) {
+                        result.push(char::from(hv * 16 + lv));
+                    } else {
+                        // Invalid hex sequence — keep as-is
+                        result.push('%');
+                        result.push(char::from(h));
+                        result.push(char::from(l));
+                    }
+                }
+                _ => {
+                    // Incomplete %XX — keep as-is
+                    result.push('%');
+                    if let Some(h) = hi {
+                        result.push(char::from(h));
+                    }
+                }
+            }
+        } else {
+            result.push(char::from(b));
+        }
+    }
+    result
+}
+
+/// Convert a hex byte to its numeric value (0–15), or None if not a hex digit.
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// PostgreSQL storage engine configuration
 #[derive(Clone, Debug)]
 pub struct PgConfig {
@@ -222,6 +272,12 @@ impl PgConfig {
         if let Some(query) = url.split('?').nth(1) {
             for pair in query.split('&') {
                 if let Some((key, value)) = pair.split_once('=') {
+                    // B4: Percent-decode the value — URL parameters may contain
+                    // %XX sequences (e.g. passwords with special chars, or
+                    // table names with non-ASCII characters). We decode only
+                    // the value, not the key, because our key names are ASCII
+                    // and don't need decoding.
+                    let value = percent_decode(value);
                     match key {
                         "max_connections" => {
                             match value.parse::<u32>() {
@@ -269,8 +325,8 @@ impl PgConfig {
                             }
                         }
                         "table_name" => {
-                            Self::validate_identifier(value)?;
-                            self.table_name = value.to_string();
+                            Self::validate_identifier(&value)?;
+                            self.table_name = value;
                         }
                         "isolation_level" => {
                             self.isolation_level = match value.to_ascii_lowercase().as_str() {
@@ -286,7 +342,7 @@ impl PgConfig {
                             };
                         }
                         "persistent_statements" => {
-                            match PersistentStatements::parse(value) {
+                            match PersistentStatements::parse(&value) {
                                 Some(v) => self.persistent_statements = v,
                                 None => tracing::warn!(
                                     "persistent_statements='{value}' is not recognized, ignoring"

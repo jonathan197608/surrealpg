@@ -24,8 +24,10 @@ use crate::tune::PgTuneConfig;
 #[derive(Clone)]
 pub struct PgStore {
     pool: PgPool,
-    config: PgConfig,
-    tune: PgTuneConfig,
+    /// B6: Arc-wrapped config to avoid deep clone on PgStore::clone().
+    config: Arc<PgConfig>,
+    /// B6: Arc-wrapped tune to avoid deep clone on PgStore::clone().
+    tune: Arc<PgTuneConfig>,
     /// Resolved persistent-statements flag (concrete `bool` after startup probe).
     persistent: bool,
     /// Cancellation token — checked before starting new transactions.
@@ -170,13 +172,26 @@ impl PgStore {
         // ── Resolve persistent-statements policy ──
         let persistent = match config.persistent_statements {
             PersistentStatements::Auto => {
-                let detected = Self::probe_persistent(&pool).await;
-                info!(
-                    policy = %config.persistent_statements,
-                    detected,
-                    "persistent-statements auto-detected"
-                );
-                detected
+                // B3: Small pool (pool_max ≤ 2) cannot reliably probe — the
+                // probe requires acquiring and releasing conn1 before acquiring
+                // conn2. With only 2 connections, the pool may not have enough
+                // headroom. Skip the probe and default to false (safe for pgbouncer).
+                if pool_max <= 2 {
+                    info!(
+                        policy = %config.persistent_statements,
+                        pool_max,
+                        "persistent-statements auto: pool too small for probe, defaulting to false"
+                    );
+                    false
+                } else {
+                    let detected = Self::probe_persistent(&pool).await;
+                    info!(
+                        policy = %config.persistent_statements,
+                        detected,
+                        "persistent-statements auto-detected"
+                    );
+                    detected
+                }
             }
             ref p => {
                 let resolved = p.resolve(false);
@@ -200,8 +215,8 @@ impl PgStore {
 
         Ok(Arc::new(Self {
             pool,
-            config,
-            tune,
+            config: Arc::new(config),
+            tune: Arc::new(tune),
             persistent,
             canceller,
             pool_max,

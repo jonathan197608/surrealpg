@@ -3,8 +3,9 @@
 //! This is the core of the backend: every SurrealDB KV operation maps to one
 //! or more SQL statements executed within a single PG transaction.
 
-use std::ops::{DerefMut, Range};
+use std::ops::DerefMut;
 use std::sync::Arc;
+use std::ops::Range;
 
 use sqlx::{Executor, Row};
 use tracing::{debug, trace, warn};
@@ -20,9 +21,14 @@ pub type Val = Vec<u8>;
 
 /// Pre-built SQL strings for all KV operations.
 ///
-/// Constructed once when a `PgTransaction` is created. Stored separately from
-/// the connection so that SQL references (`&sql.x`) don't conflict with
-/// `&mut self` borrows on the connection.
+/// Constructed once when a `PgStore` is created, then shared with every
+/// `PgTransaction` via `Arc<Sql>` (1 atomic refcount increment per tx).
+///
+/// Each method on `PgTransaction` references SQL strings directly via
+/// `&self.sql.field` without cloning the `Arc`, eliminating per-operation
+/// atomic overhead on the hot path. This works because Rust allows
+/// simultaneous borrows of **different fields** of `self` — `&self.sql`
+/// (immutable) and `&mut self.conn` (mutable) never conflict.
 ///
 /// # Range-scan pagination
 ///
@@ -137,9 +143,11 @@ pub struct PgTransaction {
     /// Whether to use persistent prepared statements.
     /// Must be false for pgbouncer/Supabase Pooler (transaction mode).
     persistent: bool,
-    /// Pre-built SQL strings, shared via Arc so cloning is an atomic
-    /// increment (no heap allocation) and borrows don't conflict with
-    /// `&mut self` on the connection.
+    /// Pre-built SQL strings. Shared from `PgStore` via `Arc<Sql>` —
+    /// one atomic refcount increment per transaction, zero per operation.
+    ///
+    /// On the hot path, methods borrow `&self.sql.field` directly alongside
+    /// `&mut self.conn` — Rust allows this because they are different fields.
     sql: Arc<Sql>,
 }
 
@@ -171,6 +179,11 @@ impl PgTransaction {
     // ─── Internal helpers ────────────────────────────────
 
     /// Get a mutable reference to the inner `PgConnection`.
+    ///
+    /// **Note**: This method borrows `&mut self` and is only used by
+    /// non-KV methods (commit/cancel/savepoint). All KV operation methods
+    /// use inline destructured borrows instead to avoid conflicts with
+    /// `&self.sql` references.
     fn conn_mut(&mut self) -> Result<&mut sqlx::postgres::PgConnection> {
         if self.closed {
             return Err(PgStoreError::TxClosed);
@@ -339,14 +352,22 @@ impl PgTransaction {
     }
 
     // ─── Read operations ─────────────────────────────────
+    //
+    // All KV operation methods use "destructured borrows": they access
+    // `self.conn` (mutable) and `self.sql` (immutable) as **separate
+    // fields** of `self`. Rust allows simultaneous borrows of different
+    // fields, so `&self.sql.field` and `conn.deref_mut()` coexist in the
+    // same scope without `Arc::clone`. This eliminates per-operation
+    // atomic refcount overhead on the hot path.
 
     /// Check whether a key exists.
     pub async fn exists(&mut self, key: Key) -> Result<bool> {
-        let sql = self.sql.clone();
+        if self.closed { return Err(PgStoreError::TxClosed); }
+        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
-        let row = Self::build_query(persistent, &sql.exists)
+        let row = Self::build_query(persistent, &self.sql.exists)
             .bind(&key)
-            .fetch_optional(self.conn_mut()?)
+            .fetch_optional(conn.deref_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?;
         Ok(row.is_some())
@@ -354,11 +375,12 @@ impl PgTransaction {
 
     /// Get the value for a key.
     pub async fn get(&mut self, key: Key) -> Result<Option<Val>> {
-        let sql = self.sql.clone();
+        if self.closed { return Err(PgStoreError::TxClosed); }
+        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
-        let row = Self::build_query(persistent, &sql.get)
+        let row = Self::build_query(persistent, &self.sql.get)
             .bind(&key)
-            .fetch_optional(self.conn_mut()?)
+            .fetch_optional(conn.deref_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?;
         Ok(row.map(|r| r.get::<Vec<u8>, _>("val")))
@@ -371,12 +393,14 @@ impl PgTransaction {
         }
 
         let keys_ref: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
-        let sql = self.sql.clone();
+
+        if self.closed { return Err(PgStoreError::TxClosed); }
+        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
 
-        let rows = Self::build_query(persistent, &sql.getm)
+        let rows = Self::build_query(persistent, &self.sql.getm)
             .bind(&keys_ref)
-            .fetch_all(self.conn_mut()?)
+            .fetch_all(conn.deref_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
 
@@ -414,12 +438,13 @@ impl PgTransaction {
     /// Set a key to a value (insert or update).
     pub async fn set(&mut self, key: Key, val: Val) -> Result<()> {
         self.check_writable()?;
-        let sql = self.sql.clone();
+        if self.closed { return Err(PgStoreError::TxClosed); }
+        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
-        Self::build_query(persistent, &sql.set)
+        Self::build_query(persistent, &self.sql.set)
             .bind(key.as_slice())
             .bind(val.as_slice())
-            .execute(self.conn_mut()?)
+            .execute(conn.deref_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?;
         trace!(key_len = key.len(), "set");
@@ -439,17 +464,18 @@ impl PgTransaction {
             return Ok(());
         }
 
-        let sql = self.sql.clone();
+        if self.closed { return Err(PgStoreError::TxClosed); }
+        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
 
         // Split into two Vec<Vec<u8>> for UNNEST binding.
         let keys: Vec<&[u8]> = pairs.iter().map(|(k, _)| k.as_slice()).collect();
         let vals: Vec<&[u8]> = pairs.iter().map(|(_, v)| v.as_slice()).collect();
 
-        Self::build_query(persistent, &sql.setm)
+        Self::build_query(persistent, &self.sql.setm)
             .bind(&keys)
             .bind(&vals)
-            .execute(self.conn_mut()?)
+            .execute(conn.deref_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
 
@@ -461,12 +487,13 @@ impl PgTransaction {
     /// Returns `KeyAlreadyExists` if the key exists.
     pub async fn put(&mut self, key: Key, val: Val) -> Result<()> {
         self.check_writable()?;
-        let sql = self.sql.clone();
+        if self.closed { return Err(PgStoreError::TxClosed); }
+        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
-        let result = Self::build_query(persistent, &sql.put)
+        let result = Self::build_query(persistent, &self.sql.put)
             .bind(key.as_slice())
             .bind(val.as_slice())
-            .execute(self.conn_mut()?)
+            .execute(conn.deref_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?;
         if result.rows_affected() == 0 {
@@ -484,13 +511,14 @@ impl PgTransaction {
             return self.put(key, val).await;
         };
 
-        let sql = self.sql.clone();
+        if self.closed { return Err(PgStoreError::TxClosed); }
+        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
-        let affected = Self::build_query(persistent, &sql.putc)
+        let affected = Self::build_query(persistent, &self.sql.putc)
             .bind(key.as_slice())
             .bind(val.as_slice())
             .bind(expected.as_slice())
-            .execute(self.conn_mut()?)
+            .execute(conn.deref_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?
             .rows_affected();
@@ -505,11 +533,12 @@ impl PgTransaction {
     /// Delete a key.
     pub async fn del(&mut self, key: Key) -> Result<()> {
         self.check_writable()?;
-        let sql = self.sql.clone();
+        if self.closed { return Err(PgStoreError::TxClosed); }
+        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
-        Self::build_query(persistent, &sql.del)
+        Self::build_query(persistent, &self.sql.del)
             .bind(key.as_slice())
-            .execute(self.conn_mut()?)
+            .execute(conn.deref_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?;
         trace!(key_len = key.len(), "del");
@@ -525,12 +554,13 @@ impl PgTransaction {
             return self.del(key).await;
         };
 
-        let sql = self.sql.clone();
+        if self.closed { return Err(PgStoreError::TxClosed); }
+        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
-        let result = Self::build_query(persistent, &sql.delc)
+        let result = Self::build_query(persistent, &self.sql.delc)
             .bind(key.as_slice())
             .bind(expected.as_slice())
-            .execute(self.conn_mut()?)
+            .execute(conn.deref_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?;
         if result.rows_affected() == 0 {
@@ -547,12 +577,13 @@ impl PgTransaction {
         if rng.start >= rng.end {
             return Ok(());
         }
-        let sql = self.sql.clone();
+        if self.closed { return Err(PgStoreError::TxClosed); }
+        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
-        let deleted = Self::build_query(persistent, &sql.delr)
+        let deleted = Self::build_query(persistent, &self.sql.delr)
             .bind(rng.start.as_slice())
             .bind(rng.end.as_slice())
-            .execute(self.conn_mut()?)
+            .execute(conn.deref_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?
             .rows_affected();
@@ -570,8 +601,14 @@ impl PgTransaction {
     // needed. See the `Sql` struct doc comment for details.
 
     /// Internal: execute an OFFSET-based range scan, returning raw rows.
+    ///
+    /// This is an associated function (not `&mut self`) so that callers can
+    /// pass `&self.sql.xxx` as `range_sql` without conflicting with the
+    /// `&mut self.conn` borrow — Rust sees them as borrows of different
+    /// fields, which is allowed.
     async fn range_query_offset(
-        &mut self,
+        conn: &mut sqlx::postgres::PgConnection,
+        persistent: bool,
         range_sql: &str,
         rng: Range<Key>,
         limit: u32,
@@ -588,13 +625,12 @@ impl PgTransaction {
                 "large OFFSET in range scan — consider cursor-based pagination"
             );
         }
-        let persistent = self.persistent;
         Self::build_query(persistent, range_sql)
             .bind(rng.start.as_slice())
             .bind(rng.end.as_slice())
             .bind(limit as i64)
             .bind(skip as i64)
-            .fetch_all(self.conn_mut()?)
+            .fetch_all(conn)
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))
     }
@@ -615,15 +651,23 @@ impl PgTransaction {
 
     /// Scan keys in a range (ascending).
     pub async fn keys(&mut self, rng: Range<Key>, limit: u32, skip: u32) -> Result<Vec<Key>> {
-        let sql = self.sql.clone();
-        let rows = self.range_query_offset(&sql.range_keys_asc, rng, limit, skip).await?;
+        if self.closed { return Err(PgStoreError::TxClosed); }
+        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        let persistent = self.persistent;
+        let rows = Self::range_query_offset(
+            conn.deref_mut(), persistent, &self.sql.range_keys_asc, rng, limit, skip
+        ).await?;
         Ok(Self::rows_to_keys(rows))
     }
 
     /// Scan keys in a range (descending).
     pub async fn keysr(&mut self, rng: Range<Key>, limit: u32, skip: u32) -> Result<Vec<Key>> {
-        let sql = self.sql.clone();
-        let rows = self.range_query_offset(&sql.range_keys_desc, rng, limit, skip).await?;
+        if self.closed { return Err(PgStoreError::TxClosed); }
+        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        let persistent = self.persistent;
+        let rows = Self::range_query_offset(
+            conn.deref_mut(), persistent, &self.sql.range_keys_desc, rng, limit, skip
+        ).await?;
         Ok(Self::rows_to_keys(rows))
     }
 
@@ -634,8 +678,12 @@ impl PgTransaction {
         limit: u32,
         skip: u32,
     ) -> Result<Vec<(Key, Val)>> {
-        let sql = self.sql.clone();
-        let rows = self.range_query_offset(&sql.range_kv_asc, rng, limit, skip).await?;
+        if self.closed { return Err(PgStoreError::TxClosed); }
+        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        let persistent = self.persistent;
+        let rows = Self::range_query_offset(
+            conn.deref_mut(), persistent, &self.sql.range_kv_asc, rng, limit, skip
+        ).await?;
         Ok(Self::rows_to_pairs(rows))
     }
 
@@ -646,8 +694,12 @@ impl PgTransaction {
         limit: u32,
         skip: u32,
     ) -> Result<Vec<(Key, Val)>> {
-        let sql = self.sql.clone();
-        let rows = self.range_query_offset(&sql.range_kv_desc, rng, limit, skip).await?;
+        if self.closed { return Err(PgStoreError::TxClosed); }
+        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        let persistent = self.persistent;
+        let rows = Self::range_query_offset(
+            conn.deref_mut(), persistent, &self.sql.range_kv_desc, rng, limit, skip
+        ).await?;
         Ok(Self::rows_to_pairs(rows))
     }
 
@@ -657,12 +709,13 @@ impl PgTransaction {
         if rng.start >= rng.end {
             return Ok(0);
         }
-        let sql = self.sql.clone();
+        if self.closed { return Err(PgStoreError::TxClosed); }
+        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
-        let row = Self::build_query(persistent, &sql.count)
+        let row = Self::build_query(persistent, &self.sql.count)
             .bind(rng.start.as_slice())
             .bind(rng.end.as_slice())
-            .fetch_one(self.conn_mut()?)
+            .fetch_one(conn.deref_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
         // COUNT(*) always returns ≥ 0; .max(0) is purely defensive —
@@ -678,11 +731,12 @@ impl PgTransaction {
     /// may be stale if `ANALYZE` hasn't run recently. Returns `None` if the
     /// table has no statistics.
     pub async fn count_approx(&mut self) -> Result<Option<u64>> {
-        let sql = self.sql.clone();
+        if self.closed { return Err(PgStoreError::TxClosed); }
+        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
-        let row = Self::build_query(persistent, &sql.count_approx)
-            .bind(&*sql.table_name)
-            .fetch_optional(self.conn_mut()?)
+        let row = Self::build_query(persistent, &self.sql.count_approx)
+            .bind(&*self.sql.table_name)
+            .fetch_optional(conn.deref_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
         Ok(row.map(|r| r.get::<i64, _>("approx_cnt") as u64))
