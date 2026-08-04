@@ -10,6 +10,7 @@ use tracing::{info, warn};
 
 use crate::config::{PersistentStatements, PgConfig};
 use crate::error::{PgStoreError, Result};
+use crate::transaction::Sql;
 use crate::transaction::PgTransaction;
 use crate::tune::PgTuneConfig;
 
@@ -42,6 +43,10 @@ pub struct PgStore {
     /// binding (PG limitation), but `table_name` is validated by
     /// `validate_identifier`, so this is safe.
     vacuum_sql: Arc<str>,
+    /// Pre-built SQL strings for all KV operations. Shared with each
+    /// `PgTransaction` via `Arc::clone` (1 atomic increment) instead of
+    /// rebuilding 14 `format!()` strings per transaction.
+    sql: Arc<Sql>,
 }
 
 impl PgStore {
@@ -83,6 +88,8 @@ impl PgStore {
         let max_lifetime = config.max_lifetime.or(Some(tune.pool_max_lifetime));
         // Pre-build the VACUUM SQL — table_name is validated by validate_identifier.
         let vacuum_sql: Arc<str> = format!("VACUUM ANALYZE {}", config.table_name).into();
+
+        let sql: Arc<Sql> = Arc::new(Sql::new(&config.table_name));
 
         // Pre-build BEGIN SQL — isolation_level and read_only_optimization are
         // immutable after construction, so we build both variants once here
@@ -201,6 +208,7 @@ impl PgStore {
             begin_write_sql,
             begin_read_sql,
             vacuum_sql,
+            sql,
         }))
     }
 
@@ -265,12 +273,12 @@ impl PgStore {
             }
         }
 
-        Ok(PgTransaction::new(
+        Ok(PgTransaction::new_with_sql(
             conn,
             write,
             self.config.isolation_level,
             self.persistent,
-            &self.config.table_name,
+            Arc::clone(&self.sql),
         ))
     }
 
@@ -418,8 +426,13 @@ impl PgStore {
             return false;
         }
 
-        // Clean up and release conn1 back to the pool.
-        let _ = Executor::execute(&mut *conn1, sqlx::raw_sql("DEALLOCATE ALL")).await;
+        // Release conn1 back to the pool. Do NOT DEALLOCATE ALL here —
+        // the named prepared statement (`sqlx_s_1`) must remain on the
+        // server so that conn2 can detect a conflict if they share the
+        // same backend session (pgbouncer transaction mode). Removing it
+        // would defeat the probe, making it always return true (direct PG).
+        // The statement is cleaned up by conn2's DEALLOCATE ALL below,
+        // or by PG's session cleanup when the connection is eventually closed.
         drop(conn1);
 
         // Phase 2: acquire conn2 and attempt the same named prepared statement.

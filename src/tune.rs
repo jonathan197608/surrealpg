@@ -247,17 +247,17 @@ ALTER TABLE {table} SET (
         // Defense-in-depth: validate all memory size strings before
         // embedding them in SQL. If someone constructed PgTuneConfig
         // directly with malicious values, we catch it here.
-        debug_assert!(
+        assert!(
             validate_pg_memory_size(&self.server_work_mem),
             "server_work_mem failed validation: {}",
             self.server_work_mem
         );
-        debug_assert!(
+        assert!(
             validate_pg_memory_size(&self.server_maintenance_work_mem),
             "server_maintenance_work_mem failed validation: {}",
             self.server_maintenance_work_mem
         );
-        debug_assert!(
+        assert!(
             validate_pg_memory_size(&self.server_effective_cache_size),
             "server_effective_cache_size failed validation: {}",
             self.server_effective_cache_size

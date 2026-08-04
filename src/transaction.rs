@@ -34,7 +34,7 @@ pub type Val = Vec<u8>;
 /// (exclusive lower bound) between batches. This is functionally
 /// equivalent to `WHERE key > $cursor` keyset pagination, so a separate
 /// cursor-based SQL variant is unnecessary.
-struct Sql {
+pub(crate) struct Sql {
     exists: String,
     get: String,
     getm: String,
@@ -61,7 +61,7 @@ struct Sql {
 }
 
 impl Sql {
-    fn new(table: &str) -> Self {
+    pub(crate) fn new(table: &str) -> Self {
         Self {
             exists: format!("SELECT 1 AS exists_flag FROM {table} WHERE key = $1"),
             get: format!("SELECT val FROM {table} WHERE key = $1"),
@@ -147,13 +147,14 @@ impl PgTransaction {
     /// Create a new transaction wrapping an acquired PG connection.
     ///
     /// The caller must have already executed `BEGIN` on the connection.
-    /// All SQL strings are pre-built here once, avoiding per-operation allocations.
-    pub(crate) fn new(
+    /// SQL strings are provided as a pre-built `Arc<Sql>`, shared from
+    /// `PgStore` to avoid per-transaction `format!()` allocations.
+    pub(crate) fn new_with_sql(
         conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
         writeable: bool,
         isolation: PgIsolation,
         persistent: bool,
-        table: &str,
+        sql: Arc<Sql>,
     ) -> Self {
         Self {
             conn: Some(conn),
@@ -163,7 +164,7 @@ impl PgTransaction {
             savepoints: Vec::new(),
             isolation,
             persistent,
-            sql: Arc::new(Sql::new(table)),
+            sql,
         }
     }
 

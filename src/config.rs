@@ -137,7 +137,7 @@ impl PgConfig {
         }
         // PostgreSQL requires unquoted identifiers to start with a letter or
         // underscore; a leading digit (e.g. "123table") is a syntax error.
-        let first = name.chars().next().unwrap();
+        let first = name.chars().next().expect("non-empty (checked above)");
         if !first.is_ascii_alphabetic() && first != '_' {
             return Err(format!(
                 "invalid table name '{name}': first character must be a letter or underscore"
