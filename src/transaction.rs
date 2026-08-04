@@ -389,10 +389,7 @@ impl PgTransaction {
         // repeatedly inside find() which would allocate a new Vec per comparison.
         let use_linear = rows.len() <= 64 && rows.len().saturating_mul(keys.len()) <= 8192;
         if use_linear {
-            let extracted: Vec<(Vec<u8>, Vec<u8>)> = rows
-                .into_iter()
-                .map(|r| (r.get::<Vec<u8>, _>("key"), r.get::<Vec<u8>, _>("val")))
-                .collect();
+            let extracted = Self::rows_to_pairs(rows);
             Ok(keys
                 .into_iter()
                 .map(|k| {
@@ -404,9 +401,7 @@ impl PgTransaction {
                 .collect())
         } else {
             let mut map = std::collections::HashMap::with_capacity(rows.len());
-            for row in rows {
-                let k: Vec<u8> = row.get::<Vec<u8>, _>("key");
-                let v: Vec<u8> = row.get::<Vec<u8>, _>("val");
+            for (k, v) in Self::rows_to_pairs(rows) {
                 map.insert(k, v);
             }
             Ok(keys.into_iter().map(|k| map.get(&k).cloned()).collect())
