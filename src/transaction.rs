@@ -437,8 +437,8 @@ impl PgTransaction {
 
     /// Set a key to a value (insert or update).
     pub async fn set(&mut self, key: Key, val: Val) -> Result<()> {
-        self.check_writable()?;
         if self.closed { return Err(PgStoreError::TxClosed); }
+        self.check_writable()?;
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         Self::build_query(persistent, &self.sql.set)
@@ -459,6 +459,7 @@ impl PgTransaction {
     ///
     /// If `pairs` is empty, returns immediately without hitting the DB.
     pub async fn setm(&mut self, pairs: Vec<(Key, Val)>) -> Result<()> {
+        if self.closed { return Err(PgStoreError::TxClosed); }
         self.check_writable()?;
         if pairs.is_empty() {
             return Ok(());
@@ -486,8 +487,8 @@ impl PgTransaction {
     /// Set a key only if it does not already exist (insert-if-absent).
     /// Returns `KeyAlreadyExists` if the key exists.
     pub async fn put(&mut self, key: Key, val: Val) -> Result<()> {
-        self.check_writable()?;
         if self.closed { return Err(PgStoreError::TxClosed); }
+        self.check_writable()?;
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let result = Self::build_query(persistent, &self.sql.put)
@@ -506,6 +507,7 @@ impl PgTransaction {
     /// `chk = None` means "only if key does not exist" (delegates to `put`).
     /// `chk = Some(v)` means "only if current value equals v".
     pub async fn putc(&mut self, key: Key, val: Val, chk: Option<Val>) -> Result<()> {
+        if self.closed { return Err(PgStoreError::TxClosed); }
         self.check_writable()?;
         let Some(expected) = chk else {
             return self.put(key, val).await;
@@ -532,8 +534,8 @@ impl PgTransaction {
 
     /// Delete a key.
     pub async fn del(&mut self, key: Key) -> Result<()> {
-        self.check_writable()?;
         if self.closed { return Err(PgStoreError::TxClosed); }
+        self.check_writable()?;
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         Self::build_query(persistent, &self.sql.del)
@@ -549,6 +551,7 @@ impl PgTransaction {
     /// `chk = None` → unconditional delete (delegates to `del`).
     /// `chk = Some(v)` → key must exist and value must equal v.
     pub async fn delc(&mut self, key: Key, chk: Option<Val>) -> Result<()> {
+        if self.closed { return Err(PgStoreError::TxClosed); }
         self.check_writable()?;
         let Some(expected) = chk else {
             return self.del(key).await;
@@ -572,6 +575,7 @@ impl PgTransaction {
 
     /// Delete all keys in a range (inclusive start, exclusive end).
     pub async fn delr(&mut self, rng: Range<Key>) -> Result<()> {
+        if self.closed { return Err(PgStoreError::TxClosed); }
         self.check_writable()?;
         // Empty range — skip DB round-trip.
         if rng.start >= rng.end {
@@ -727,15 +731,18 @@ impl PgTransaction {
     /// Approximate row count using `pg_class.reltuples`.
     ///
     /// Returns an O(1) estimate based on the most recent `ANALYZE` statistics.
-    /// This is a **whole-table** estimate (range parameters are ignored) and
-    /// may be stale if `ANALYZE` hasn't run recently. Returns `None` if the
-    /// table has no statistics.
+    /// This is a **whole-table** estimate — the `range` parameters from the
+    /// calling `Transactable` method are **not** passed to `pg_class`, so the
+    /// result reflects the entire table regardless of the key range. Returns
+    /// `None` if the table has no statistics (e.g. before the first `ANALYZE`).
+    ///
+    /// **Note**: The estimate may be stale if `ANALYZE` hasn't run recently.
     pub async fn count_approx(&mut self) -> Result<Option<u64>> {
         if self.closed { return Err(PgStoreError::TxClosed); }
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let row = Self::build_query(persistent, &self.sql.count_approx)
-            .bind(&*self.sql.table_name)
+            .bind(&self.sql.table_name)
             .fetch_optional(conn.deref_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;

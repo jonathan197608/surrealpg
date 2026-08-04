@@ -25,8 +25,10 @@ use crate::tune::PgTuneConfig;
 pub struct PgStore {
     pool: PgPool,
     /// B6: Arc-wrapped config to avoid deep clone on PgStore::clone().
+    /// Arc-shared: immutable after construction. Do not use Arc::get_mut().
     config: Arc<PgConfig>,
     /// B6: Arc-wrapped tune to avoid deep clone on PgStore::clone().
+    /// Arc-shared: immutable after construction. Do not use Arc::get_mut().
     tune: Arc<PgTuneConfig>,
     /// Resolved persistent-statements flag (concrete `bool` after startup probe).
     persistent: bool,
@@ -101,18 +103,10 @@ impl PgStore {
             config.isolation_level.as_sql()
         )
         .into();
-        let begin_read_sql: Arc<str> = if config.read_only_optimization {
-            format!(
-                "BEGIN ISOLATION LEVEL {} READ ONLY",
-                config.isolation_level.as_sql()
-            )
-            .into()
-        } else {
-            // Without READ ONLY, read and write transactions use the same
-            // BEGIN SQL (same isolation level). Share the Arc to avoid
-            // storing the same string twice.
-            Arc::clone(&begin_write_sql)
-        };
+        // begin_read_sql is built after persistent resolution (see F3 below).
+
+        // F5: Guard against zero max_connections — sqlx panics with pool_max=0.
+        assert!(pool_max > 0, "max_connections must be > 0, got {pool_max}");
 
         let opts: PgConnectOptions = url
             .parse()
@@ -204,6 +198,33 @@ impl PgStore {
             }
         };
 
+        // F3: pgbouncer transaction mode does not support BEGIN READ ONLY —
+        // the pooler routes each statement to an arbitrary backend, and
+        // READ ONLY is a transaction property that must persist across all
+        // statements. When persistent=false (pgbouncer detected), disable
+        // read_only_optimization to avoid runtime errors.
+        let read_only_optimization = if !persistent {
+            info!(
+                "pgbouncer/pooler detected: disabling read_only_optimization \
+                 (BEGIN READ ONLY is unsupported in transaction-pooling mode)"
+            );
+            false
+        } else {
+            config.read_only_optimization
+        };
+        let begin_read_sql: Arc<str> = if read_only_optimization {
+            format!(
+                "BEGIN ISOLATION LEVEL {} READ ONLY",
+                config.isolation_level.as_sql()
+            )
+            .into()
+        } else {
+            // Without READ ONLY, read and write transactions use the same
+            // BEGIN SQL (same isolation level). Share the Arc to avoid
+            // storing the same string twice.
+            Arc::clone(&begin_write_sql)
+        };
+
         info!(
             max_conn = pool_max,
             min_conn = pool_min,
@@ -275,6 +296,12 @@ impl PgStore {
                     if matches!(db.code().as_deref(), Some("25P02")));
                 if is_failed_tx {
                     // Leaked transaction detected — clean up and retry.
+                    //
+                    // P3: No need to re-execute session SET statements after ROLLBACK.
+                    // PostgreSQL session-level SET (e.g. work_mem, timezone) persists
+                    // across ROLLBACK — only transaction-local SET LOCAL is undone.
+                    // Our after_connect hook uses SET (not SET LOCAL), so the settings
+                    // survive the ROLLBACK and the subsequent BEGIN.
                     let _ = Executor::execute(&mut *conn, sqlx::raw_sql("ROLLBACK"))
                         .await
                         .inspect_err(|e| warn!("ROLLBACK of leaked transaction failed: {e}"));

@@ -4,14 +4,18 @@ use std::time::Duration;
 
 /// Percent-decode a URL-encoded string.
 ///
-/// Handles `%XX` sequences (e.g. `%20` → space, `%2F` → `/`).
+/// Handles `%XX` sequences (e.g. `%20` → space, `%2F` → `/`) and
+/// `+` → space (for `application/x-www-form-urlencoded` compatibility).
 /// Returns the decoded string on success, or the original string
 /// if decoding fails (graceful degradation for malformed input).
 fn percent_decode(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut bytes = input.bytes();
     while let Some(b) = bytes.next() {
-        if b == b'%' {
+        if b == b'+' {
+            // B2: Handle + → space (application/x-www-form-urlencoded)
+            result.push(' ');
+        } else if b == b'%' {
             let hi = bytes.next();
             let lo = bytes.next();
             match (hi, lo) {
@@ -212,22 +216,41 @@ impl PgConfig {
         Ok(())
     }
 
-    /// Check if a name is a common SQL reserved word (case-insensitive).
+    /// Check if a name is a SQL reserved word (case-insensitive).
+    ///
+    /// B5: Uses a sorted array + binary search for O(log n) lookups
+    /// instead of linear scan. The list covers PostgreSQL's reserved words
+    /// that would cause immediate syntax errors when used as unquoted
+    /// identifiers in DDL/DML.
     fn is_sql_reserved(name: &str) -> bool {
-        // Curated list of reserved words most likely to appear as accidental
-        // table names. PG has ~500 reserved words; we check the most common
-        // DDL/DML keywords that would cause immediate syntax errors.
+        // Sorted alphabetically for binary search. Covers the most common
+        // PG reserved words that would cause syntax errors as identifiers.
         const RESERVED: &[&str] = &[
-            "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER",
-            "TABLE", "INDEX", "VIEW", "FROM", "WHERE", "SET", "VALUES", "INTO",
-            "ORDER", "GROUP", "HAVING", "LIMIT", "OFFSET", "AS", "ON", "AND",
-            "OR", "NOT", "NULL", "DEFAULT", "PRIMARY", "KEY", "FOREIGN",
-            "REFERENCES", "UNIQUE", "CHECK", "CONSTRAINT", "BEGIN", "COMMIT",
-            "ROLLBACK", "SAVEPOINT", "GRANT", "REVOKE", "EXPLAIN", "VACUUM",
-            "TRUNCATE", "RETURNING", "WITH", "UNION", "INTERSECT", "EXCEPT",
+            "ALL", "AND", "ANY", "AS", "ASC",
+            "BETWEEN", "BY",
+            "CASE", "CHECK", "CONSTRAINT", "CREATE", "CROSS", "CURRENT",
+            "DEFAULT", "DELETE", "DESC", "DISTINCT", "DROP",
+            "ELSE", "EXCEPT", "EXISTS", "EXPLAIN",
+            "FALSE", "FETCH", "FOR", "FOREIGN", "FROM", "FULL",
+            "GRANT", "GROUP",
+            "HAVING",
+            "ILIKE", "IN", "INDEX", "INNER", "INSERT", "INTERSECT",
+            "INTO", "IS",
+            "JOIN",
+            "KEY",
+            "LEFT", "LIKE", "LIMIT",
+            "NATURAL", "NOT", "NULL", "NULLS",
+            "OFFSET", "ON", "OR", "ORDER", "OUTER", "OVER",
+            "PRIMARY",
+            "REFERENCES", "RETURNING", "RIGHT", "ROLLBACK",
+            "SELECT", "SET", "SIMILAR", "SOME", "SAVEPOINT",
+            "TABLE", "THEN", "TRUE", "TRUNCATE",
+            "UNION", "UNIQUE", "USING",
+            "VALUES", "VIEW",
+            "WHEN", "WHERE", "WITH",
         ];
         let upper = name.to_ascii_uppercase();
-        RESERVED.contains(&upper.as_str())
+        RESERVED.binary_search(&upper.as_str()).is_ok()
     }
 
     /// Apply configuration from environment variables.
@@ -424,5 +447,59 @@ mod tests {
         assert!(PgConfig::validate_identifier("TABLE").is_err());
         assert!(PgConfig::validate_identifier("table").is_err());
         assert!(PgConfig::validate_identifier("DROP").is_err());
+    }
+
+    // ── F7: percent_decode & hex_digit tests ──
+
+    #[test]
+    fn test_percent_decode_normal() {
+        assert_eq!(percent_decode("hello%20world"), "hello world");
+        assert_eq!(percent_decode("a%2Fb%3Fc"), "a/b?c");
+    }
+
+    #[test]
+    fn test_percent_decode_consecutive() {
+        // Consecutive %XX sequences
+        assert_eq!(percent_decode("%2F%2F"), "//");
+        assert_eq!(percent_decode("%41%42%43"), "ABC");
+    }
+
+    #[test]
+    fn test_percent_decode_invalid() {
+        // Invalid hex in %XX — kept as-is
+        assert_eq!(percent_decode("%GG"), "%GG");
+        assert_eq!(percent_decode("%2Z"), "%2Z");
+    }
+
+    #[test]
+    fn test_percent_decode_trailing_percent() {
+        // Trailing % without two hex digits
+        assert_eq!(percent_decode("hello%"), "hello%");
+        assert_eq!(percent_decode("hello%2"), "hello%2");
+    }
+
+    #[test]
+    fn test_percent_decode_empty() {
+        assert_eq!(percent_decode(""), "");
+    }
+
+    #[test]
+    fn test_percent_decode_plus() {
+        // B2: + should decode to space
+        assert_eq!(percent_decode("hello+world"), "hello world");
+        assert_eq!(percent_decode("a+b%3Fc"), "a b?c");
+        assert_eq!(percent_decode("++"), "  ");
+    }
+
+    #[test]
+    fn test_hex_digit() {
+        assert_eq!(hex_digit(b'0'), Some(0));
+        assert_eq!(hex_digit(b'9'), Some(9));
+        assert_eq!(hex_digit(b'a'), Some(10));
+        assert_eq!(hex_digit(b'f'), Some(15));
+        assert_eq!(hex_digit(b'A'), Some(10));
+        assert_eq!(hex_digit(b'F'), Some(15));
+        assert_eq!(hex_digit(b'g'), None);
+        assert_eq!(hex_digit(b' '), None);
     }
 }

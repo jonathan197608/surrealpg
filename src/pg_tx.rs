@@ -100,10 +100,17 @@ impl Transactable for PgTx {
 
     fn cancel(&self) -> BoxFut<'_, kvs::Result<()>> {
         Box::pin(async move {
-            if self.done.swap(true, Ordering::AcqRel) {
+            // Fast check before acquiring the lock — if already done,
+            // return early without blocking.
+            if self.done.load(Ordering::Relaxed) {
                 return Err(kvs::Error::TransactionFinished);
             }
             let mut guard = self.inner.lock().await;
+            // Double-check under lock: another concurrent call may have
+            // already set done. Use swap to atomically claim the close.
+            if self.done.swap(true, Ordering::AcqRel) {
+                return Err(kvs::Error::TransactionFinished);
+            }
             if let Some(tx) = guard.as_mut()
                 && let Err(e) = tx.cancel().await
             {
@@ -123,11 +130,21 @@ impl Transactable for PgTx {
 
     fn commit(&self) -> BoxFut<'_, kvs::Result<()>> {
         Box::pin(async move {
+            // Fast check before acquiring the lock — if already done,
+            // return early without blocking.
+            if self.done.load(Ordering::Relaxed) {
+                return Err(kvs::Error::TransactionFinished);
+            }
+            let mut guard = self.inner.lock().await;
+            // Double-check under lock: another concurrent call may have
+            // already set done. Use swap to atomically claim the close.
+            // B1: swap must happen AFTER acquiring the lock (matching cancel()),
+            // so that closed() returning true always means the connection is
+            // released — no window where done=true but the lock is still held.
             if self.done.swap(true, Ordering::AcqRel) {
                 return Err(kvs::Error::TransactionFinished);
             }
             // PG natively supports COMMIT on read-only transactions.
-            let mut guard = self.inner.lock().await;
             if let Some(tx) = guard.as_mut()
                 && let Err(e) = tx.commit().await
             {
