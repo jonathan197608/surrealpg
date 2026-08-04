@@ -131,6 +131,7 @@ impl Transactable for PgTx {
                 // Release the connection even on error — PG will auto-rollback
                 // when the PoolConnection is dropped and returned to the pool.
                 *guard = None;
+                self.tx_rolled_back.fetch_add(1, Ordering::Relaxed);
                 return Err(kvs::Error::from(e));
             }
             let had_tx = guard.is_some();
@@ -165,9 +166,9 @@ impl Transactable for PgTx {
                 && let Err(e) = tx.commit().await
             {
                 // Release the connection even on error (e.g. serialization
-                // conflict). PG will auto-rollback when the PoolConnection
-                // is returned to the pool.
+                // conflict). PG auto-rollbacks on COMMIT failure.
                 *guard = None;
+                self.tx_rolled_back.fetch_add(1, Ordering::Relaxed);
                 return Err(kvs::Error::from(e));
             }
             let had_tx = guard.is_some();
