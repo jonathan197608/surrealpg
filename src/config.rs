@@ -293,8 +293,24 @@ impl PgConfig {
     pub fn merge_url_params(&mut self, url: &str) -> Result<(), String> {
         // Parse the query string manually to avoid adding a URL-parsing dep.
         if let Some(query) = url.split('?').nth(1) {
+            // B6: Track seen parameter names to detect duplicates.
+            let mut seen = std::collections::HashSet::<&str>::new();
+            // Known parameter names that we actually process.
+            const KNOWN_PARAMS: &[&str] = &[
+                "max_connections", "min_connections", "max_lifetime",
+                "auto_create_table", "table_name", "isolation_level",
+                "persistent_statements", "connect_timeout", "idle_timeout",
+                "read_only_optimization",
+            ];
             for pair in query.split('&') {
                 if let Some((key, value)) = pair.split_once('=') {
+                    // B6: Warn on duplicate known parameters.
+                    if KNOWN_PARAMS.contains(&key) && !seen.insert(key) {
+                        tracing::warn!(
+                            param = key,
+                            "duplicate URL parameter '{key}': last occurrence wins"
+                        );
+                    }
                     // B4: Percent-decode the value — URL parameters may contain
                     // %XX sequences (e.g. passwords with special chars, or
                     // table names with non-ASCII characters). We decode only

@@ -8,12 +8,15 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum PgStoreError {
     /// A unique constraint was violated (key already exists) — used by `put`.
+    /// B4: Uses `Box<[u8]>` instead of `Vec<u8>` to avoid storing unused
+    /// capacity and reduce allocation overhead on the write-conflict path.
     #[error("key already exists: {0:?}")]
-    KeyAlreadyExists(Vec<u8>),
+    KeyAlreadyExists(Box<[u8]>),
 
     /// A compare-and-swap condition was not met — used by `putc`/`delc`.
+    /// B4: Same `Box<[u8]>` optimization as `KeyAlreadyExists`.
     #[error("condition not met for key: {0:?}")]
-    ConditionNotMet(Vec<u8>),
+    ConditionNotMet(Box<[u8]>),
 
     /// The transaction has been closed (committed or rolled back)
     #[error("transaction already closed")]
@@ -72,7 +75,7 @@ impl PgStoreError {
                 match code.as_ref() {
                     // unique_violation
                     "23505" => key
-                        .map(|k| Self::KeyAlreadyExists(k.to_vec()))
+                        .map(|k| Self::KeyAlreadyExists(k.to_vec().into_boxed_slice()))
                         .unwrap_or_else(|| Self::Other(format!("unique violation: {msg}"))),
 
                     // connection exception (08xxx)
@@ -86,8 +89,10 @@ impl PgStoreError {
                     // serialization failure
                     "40001" => Self::SerializationFailure(msg),
 
-                    // no active transaction
-                    "25P01" => Self::TxClosed,
+                    // no active transaction — F4: preserve SQLSTATE context
+                    // instead of mapping to TxClosed, which may be misleading
+                    // (the transaction might never have started, not just closed).
+                    "25P01" => Self::Postgres(format!("[25P01]: {msg}")),
 
                     c => Self::Postgres(format!("[{c}]: {msg}")),
                 }

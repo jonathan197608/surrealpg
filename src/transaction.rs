@@ -498,7 +498,7 @@ impl PgTransaction {
             .await
             .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?;
         if result.rows_affected() == 0 {
-            return Err(PgStoreError::KeyAlreadyExists(key));
+            return Err(PgStoreError::KeyAlreadyExists(key.into_boxed_slice()));
         }
         Ok(())
     }
@@ -526,7 +526,7 @@ impl PgTransaction {
             .rows_affected();
 
         if affected == 0 {
-            Err(PgStoreError::ConditionNotMet(key))
+            Err(PgStoreError::ConditionNotMet(key.into_boxed_slice()))
         } else {
             Ok(())
         }
@@ -567,7 +567,7 @@ impl PgTransaction {
             .await
             .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?;
         if result.rows_affected() == 0 {
-            Err(PgStoreError::ConditionNotMet(key))
+            Err(PgStoreError::ConditionNotMet(key.into_boxed_slice()))
         } else {
             Ok(())
         }

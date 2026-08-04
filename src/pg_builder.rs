@@ -41,7 +41,12 @@ impl TransactionBuilder for PgStore {
     ) -> BoxFut<'_, anyhow::Result<(Box<dyn Transactable>, bool)>> {
         Box::pin(async move {
             let tx = self.begin(write).await.map_err(kvs::Error::from)?;
-            let pg_tx = PgTx::new(tx);
+            let (tx_committed, tx_rolled_back) = self.tx_commit_rollback_arcs();
+            let pg_tx = PgTx::new(
+                tx,
+                tx_committed,
+                tx_rolled_back,
+            );
             // `true` = local transaction (same process), matching mem/rocksdb
             Ok((Box::new(pg_tx) as Box<dyn Transactable>, true))
         })
@@ -70,6 +75,19 @@ impl TransactionBuilder for PgStore {
                     name: "pg_pool_max",
                     description: "Maximum number of connections allowed in the pool",
                 },
+                // F8: Transaction lifecycle metrics.
+                Metric {
+                    name: "pg_tx_started",
+                    description: "Total number of transactions started",
+                },
+                Metric {
+                    name: "pg_tx_committed",
+                    description: "Total number of transactions committed successfully",
+                },
+                Metric {
+                    name: "pg_tx_rolled_back",
+                    description: "Total number of transactions rolled back or cancelled",
+                },
             ],
         })
     }
@@ -79,6 +97,10 @@ impl TransactionBuilder for PgStore {
             "pg_pool_size" => Some(self.pool_size().0 as u64),
             "pg_pool_idle" => Some(self.pool_size().1 as u64),
             "pg_pool_max" => Some(self.pool_max() as u64),
+            // F8: Transaction metric counters.
+            "pg_tx_started" => Some(self.tx_metrics().0),
+            "pg_tx_committed" => Some(self.tx_metrics().1),
+            "pg_tx_rolled_back" => Some(self.tx_metrics().2),
             _ => None,
         }
     }

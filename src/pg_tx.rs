@@ -5,7 +5,8 @@
 //! backend pattern).
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use surrealdb_core::kvs::{self, Key, KeysResult, ScanResult, Transactable, Val};
 use tokio::sync::Mutex;
@@ -27,17 +28,30 @@ pub struct PgTx {
     done: AtomicBool,
     /// Whether this is a write transaction.
     write: bool,
+    /// F8: Shared commit counter (from PgStore).
+    tx_committed: Arc<AtomicU64>,
+    /// F8: Shared rollback counter (from PgStore).
+    tx_rolled_back: Arc<AtomicU64>,
 }
 
 impl PgTx {
     /// Create a new `PgTx` wrapping a `PgTransaction`.
+    ///
+    /// F8: Accepts shared metric counters from PgStore for tracking
+    /// commit/rollback events.
     #[must_use]
-    pub fn new(tx: PgTransaction) -> Self {
+    pub fn new(
+        tx: PgTransaction,
+        tx_committed: Arc<AtomicU64>,
+        tx_rolled_back: Arc<AtomicU64>,
+    ) -> Self {
         let write = tx.is_writeable();
         Self {
             inner: Mutex::new(Some(tx)),
             done: AtomicBool::new(false),
             write,
+            tx_committed,
+            tx_rolled_back,
         }
     }
 
@@ -122,6 +136,8 @@ impl Transactable for PgTx {
             let had_tx = guard.is_some();
             *guard = None; // Drop the transaction, returning the connection to the pool
             if had_tx {
+                // F8: Record rollback in metric counter.
+                self.tx_rolled_back.fetch_add(1, Ordering::Relaxed);
                 info!("PostgreSQL transaction cancelled");
             }
             Ok(())
@@ -157,6 +173,8 @@ impl Transactable for PgTx {
             let had_tx = guard.is_some();
             *guard = None;
             if had_tx {
+                // F8: Record commit in metric counter.
+                self.tx_committed.fetch_add(1, Ordering::Relaxed);
                 info!("PostgreSQL transaction committed");
             }
             Ok(())

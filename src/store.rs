@@ -2,6 +2,7 @@
 //! and spawns [`PgTransaction`] instances.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use sqlx::Executor;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
@@ -51,6 +52,13 @@ pub struct PgStore {
     /// `PgTransaction` via `Arc::clone` (1 atomic increment) instead of
     /// rebuilding 14 `format!()` strings per transaction.
     sql: Arc<Sql>,
+    // ── F8: Transaction metrics (AtomicU64 for lock-free concurrent updates) ──
+    /// Total number of transactions started (both read and write).
+    tx_started: Arc<AtomicU64>,
+    /// Total number of transactions committed successfully.
+    tx_committed: Arc<AtomicU64>,
+    /// Total number of transactions rolled back / cancelled.
+    tx_rolled_back: Arc<AtomicU64>,
 }
 
 impl PgStore {
@@ -245,6 +253,10 @@ impl PgStore {
             begin_read_sql,
             vacuum_sql,
             sql,
+            // F8: Initialize transaction metric counters.
+            tx_started: Arc::new(AtomicU64::new(0)),
+            tx_committed: Arc::new(AtomicU64::new(0)),
+            tx_rolled_back: Arc::new(AtomicU64::new(0)),
         }))
     }
 
@@ -314,6 +326,9 @@ impl PgStore {
                 }
             }
         }
+
+        // F8: Increment started-transaction counter.
+        self.tx_started.fetch_add(1, AtomicOrdering::Relaxed);
 
         Ok(PgTransaction::new_with_sql(
             conn,
@@ -391,6 +406,35 @@ impl PgStore {
     #[must_use]
     pub fn pool_size(&self) -> (u32, u32) {
         (self.pool.size(), self.pool.num_idle() as u32)
+    }
+
+    // ── F8: Transaction metric methods ──
+
+    /// Record a successful transaction commit.
+    pub fn record_commit(&self) {
+        self.tx_committed.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    /// Record a transaction rollback / cancel.
+    pub fn record_rollback(&self) {
+        self.tx_rolled_back.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    /// Get transaction metric counters: (started, committed, rolled_back).
+    #[must_use]
+    pub fn tx_metrics(&self) -> (u64, u64, u64) {
+        (
+            self.tx_started.load(AtomicOrdering::Relaxed),
+            self.tx_committed.load(AtomicOrdering::Relaxed),
+            self.tx_rolled_back.load(AtomicOrdering::Relaxed),
+        )
+    }
+
+    /// F8: Get Arc clones of the commit/rollback counters for PgTx.
+    /// Used by pg_builder to pass counters when constructing PgTx.
+    #[must_use]
+    pub(crate) fn tx_commit_rollback_arcs(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+        (Arc::clone(&self.tx_committed), Arc::clone(&self.tx_rolled_back))
     }
 
     /// Attempt to dynamically resize the connection pool.
