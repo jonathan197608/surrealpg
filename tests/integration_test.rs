@@ -505,7 +505,9 @@ fn test_count_approx(store: &Arc<PgStore>) -> futures::future::BoxFuture<'_, Res
             let mut tx = store.begin(true).await.map_err(|e| e.to_string())?;
             for i in 0..10u32 {
                 let key = format!("test:approx:{i:03}").into_bytes();
-                tx.set(key, b"v".to_vec()).await.map_err(|e| e.to_string())?;
+                tx.set(key, b"v".to_vec())
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
             tx.commit().await.map_err(|e| e.to_string())?;
         }
@@ -525,10 +527,7 @@ fn test_count_approx(store: &Arc<PgStore>) -> futures::future::BoxFuture<'_, Res
 
         // Clean up
         {
-            let mut tx = store
-                .begin(true)
-                .await
-                .map_err(|e| e.to_string())?;
+            let mut tx = store.begin(true).await.map_err(|e| e.to_string())?;
             tx.delr(b"test:approx:".to_vec()..b"test:approx;".to_vec())
                 .await
                 .map_err(|e| e.to_string())?;

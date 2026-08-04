@@ -187,7 +187,10 @@ impl PgConfig {
     /// because they would cause syntax errors when interpolated into DDL/DML.
     pub(crate) fn validate_identifier(name: &str) -> Result<(), String> {
         if name.is_empty() {
-            return Err("invalid table name '': must be non-empty and contain only [a-zA-Z0-9_]".to_string());
+            return Err(
+                "invalid table name '': must be non-empty and contain only [a-zA-Z0-9_]"
+                    .to_string(),
+            );
         }
         // PostgreSQL requires unquoted identifiers to start with a letter or
         // underscore; a leading digit (e.g. "123table") is a syntax error.
@@ -197,10 +200,7 @@ impl PgConfig {
                 "invalid table name '{name}': first character must be a letter or underscore"
             ));
         }
-        if !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(format!(
                 "invalid table name '{name}': must contain only [a-zA-Z0-9_]"
             ));
@@ -209,9 +209,7 @@ impl PgConfig {
         // This is not exhaustive (PG has ~500 reserved words) but covers the
         // most likely accidental misconfigurations.
         if Self::is_sql_reserved(name) {
-            return Err(format!(
-                "invalid table name '{name}': SQL reserved word"
-            ));
+            return Err(format!("invalid table name '{name}': SQL reserved word"));
         }
         Ok(())
     }
@@ -230,28 +228,82 @@ impl PgConfig {
         // Sorted alphabetically for binary search. Covers the most common
         // PG reserved words that would cause syntax errors as identifiers.
         const RESERVED: &[&str] = &[
-            "ALL", "AND", "ANY", "AS", "ASC",
-            "BETWEEN", "BY",
-            "CASE", "CHECK", "CONSTRAINT", "CREATE", "CROSS", "CURRENT",
-            "DEFAULT", "DELETE", "DESC", "DISTINCT", "DROP",
-            "ELSE", "EXCEPT", "EXISTS", "EXPLAIN",
-            "FALSE", "FETCH", "FOR", "FOREIGN", "FROM", "FULL",
-            "GRANT", "GROUP",
+            "ALL",
+            "AND",
+            "ANY",
+            "AS",
+            "ASC",
+            "BETWEEN",
+            "BY",
+            "CASE",
+            "CHECK",
+            "CONSTRAINT",
+            "CREATE",
+            "CROSS",
+            "CURRENT",
+            "DEFAULT",
+            "DELETE",
+            "DESC",
+            "DISTINCT",
+            "DROP",
+            "ELSE",
+            "EXCEPT",
+            "EXISTS",
+            "EXPLAIN",
+            "FALSE",
+            "FETCH",
+            "FOR",
+            "FOREIGN",
+            "FROM",
+            "FULL",
+            "GRANT",
+            "GROUP",
             "HAVING",
-            "ILIKE", "IN", "INDEX", "INNER", "INSERT", "INTERSECT",
-            "INTO", "IS",
+            "ILIKE",
+            "IN",
+            "INDEX",
+            "INNER",
+            "INSERT",
+            "INTERSECT",
+            "INTO",
+            "IS",
             "JOIN",
             "KEY",
-            "LEFT", "LIKE", "LIMIT",
-            "NATURAL", "NOT", "NULL", "NULLS",
-            "OFFSET", "ON", "OR", "ORDER", "OUTER", "OVER",
+            "LEFT",
+            "LIKE",
+            "LIMIT",
+            "NATURAL",
+            "NOT",
+            "NULL",
+            "NULLS",
+            "OFFSET",
+            "ON",
+            "OR",
+            "ORDER",
+            "OUTER",
+            "OVER",
             "PRIMARY",
-            "REFERENCES", "RETURNING", "RIGHT", "ROLLBACK",
-            "SELECT", "SET", "SIMILAR", "SOME", "SAVEPOINT",
-            "TABLE", "THEN", "TRUE", "TRUNCATE",
-            "UNION", "UNIQUE", "USING",
-            "VALUES", "VIEW",
-            "WHEN", "WHERE", "WITH",
+            "REFERENCES",
+            "RETURNING",
+            "RIGHT",
+            "ROLLBACK",
+            "SELECT",
+            "SET",
+            "SIMILAR",
+            "SOME",
+            "SAVEPOINT",
+            "TABLE",
+            "THEN",
+            "TRUE",
+            "TRUNCATE",
+            "UNION",
+            "UNIQUE",
+            "USING",
+            "VALUES",
+            "VIEW",
+            "WHEN",
+            "WHERE",
+            "WITH",
         ];
         // Fast path: if name is already all-ASCII-uppercase (the typical
         // case for "SELECT", "TABLE", etc.), use it directly — zero alloc.
@@ -307,9 +359,15 @@ impl PgConfig {
             let mut seen = std::collections::HashSet::<&str>::new();
             // Known parameter names that we actually process.
             const KNOWN_PARAMS: &[&str] = &[
-                "max_connections", "min_connections", "max_lifetime",
-                "auto_create_table", "table_name", "isolation_level",
-                "persistent_statements", "connect_timeout", "idle_timeout",
+                "max_connections",
+                "min_connections",
+                "max_lifetime",
+                "auto_create_table",
+                "table_name",
+                "isolation_level",
+                "persistent_statements",
+                "connect_timeout",
+                "idle_timeout",
                 "read_only_optimization",
             ];
             for pair in query.split('&') {
@@ -328,58 +386,52 @@ impl PgConfig {
                     // and don't need decoding.
                     let value = percent_decode(value);
                     match key {
-                        "max_connections" => {
-                            match value.parse::<u32>() {
-                                Ok(0) => {
-                                    tracing::warn!("max_connections=0 is invalid, ignoring");
+                        "max_connections" => match value.parse::<u32>() {
+                            Ok(0) => {
+                                tracing::warn!("max_connections=0 is invalid, ignoring");
+                            }
+                            Ok(v) => self.max_connections = Some(v),
+                            Err(_) => tracing::warn!(
+                                "max_connections='{value}' is not a valid u32, ignoring"
+                            ),
+                        },
+                        "min_connections" => match value.parse::<u32>() {
+                            Ok(v) => {
+                                if let Some(max) = self.max_connections
+                                    && v > max
+                                {
+                                    tracing::warn!(
+                                        "min_connections={v} > max_connections={max}, ignoring"
+                                    );
+                                } else {
+                                    self.min_connections = Some(v);
                                 }
-                                Ok(v) => self.max_connections = Some(v),
-                                Err(_) => tracing::warn!(
-                                    "max_connections='{value}' is not a valid u32, ignoring"
-                                ),
                             }
-                        }
-                        "min_connections" => {
-                            match value.parse::<u32>() {
-                                Ok(v) => {
-                                    if let Some(max) = self.max_connections
-                                        && v > max
-                                    {
-                                        tracing::warn!(
-                                            "min_connections={v} > max_connections={max}, ignoring"
-                                        );
-                                    } else {
-                                        self.min_connections = Some(v);
-                                    }
-                                }
-                                Err(_) => tracing::warn!(
-                                    "min_connections='{value}' is not a valid u32, ignoring"
-                                ),
-                            }
-                        }
-                        "max_lifetime" => {
-                            match value.parse::<u64>() {
-                                Ok(secs) => self.max_lifetime = Some(Duration::from_secs(secs)),
-                                Err(_) => tracing::warn!(
-                                    "max_lifetime='{value}' is not a valid number, ignoring"
-                                ),
-                            }
-                        }
-                        "auto_create_table" => {
-                            match value.parse::<bool>() {
-                                Ok(v) => self.auto_create_table = v,
-                                Err(_) => tracing::warn!(
-                                    "auto_create_table='{value}' is not a valid bool, ignoring"
-                                ),
-                            }
-                        }
+                            Err(_) => tracing::warn!(
+                                "min_connections='{value}' is not a valid u32, ignoring"
+                            ),
+                        },
+                        "max_lifetime" => match value.parse::<u64>() {
+                            Ok(secs) => self.max_lifetime = Some(Duration::from_secs(secs)),
+                            Err(_) => tracing::warn!(
+                                "max_lifetime='{value}' is not a valid number, ignoring"
+                            ),
+                        },
+                        "auto_create_table" => match value.parse::<bool>() {
+                            Ok(v) => self.auto_create_table = v,
+                            Err(_) => tracing::warn!(
+                                "auto_create_table='{value}' is not a valid bool, ignoring"
+                            ),
+                        },
                         "table_name" => {
                             Self::validate_identifier(&value)?;
                             self.table_name = value;
                         }
                         "isolation_level" => {
                             self.isolation_level = match value.to_ascii_lowercase().as_str() {
-                                "repeatable_read" | "repeatable read" => PgIsolation::RepeatableRead,
+                                "repeatable_read" | "repeatable read" => {
+                                    PgIsolation::RepeatableRead
+                                }
                                 "serializable" => PgIsolation::Serializable,
                                 "read_committed" | "read committed" => PgIsolation::ReadCommitted,
                                 _ => {
@@ -390,38 +442,30 @@ impl PgConfig {
                                 }
                             };
                         }
-                        "persistent_statements" => {
-                            match PersistentStatements::parse(&value) {
-                                Some(v) => self.persistent_statements = v,
-                                None => tracing::warn!(
-                                    "persistent_statements='{value}' is not recognized, ignoring"
-                                ),
-                            }
-                        }
-                        "connect_timeout" => {
-                            match value.parse::<u64>() {
-                                Ok(secs) => self.connect_timeout = Some(Duration::from_secs(secs)),
-                                Err(_) => tracing::warn!(
-                                    "connect_timeout='{value}' is not a valid number, ignoring"
-                                ),
-                            }
-                        }
-                        "idle_timeout" => {
-                            match value.parse::<u64>() {
-                                Ok(secs) => self.idle_timeout = Some(Duration::from_secs(secs)),
-                                Err(_) => tracing::warn!(
-                                    "idle_timeout='{value}' is not a valid number, ignoring"
-                                ),
-                            }
-                        }
-                        "read_only_optimization" => {
-                            match value.parse::<bool>() {
-                                Ok(v) => self.read_only_optimization = v,
-                                Err(_) => tracing::warn!(
-                                    "read_only_optimization='{value}' is not a valid bool, ignoring"
-                                ),
-                            }
-                        }
+                        "persistent_statements" => match PersistentStatements::parse(&value) {
+                            Some(v) => self.persistent_statements = v,
+                            None => tracing::warn!(
+                                "persistent_statements='{value}' is not recognized, ignoring"
+                            ),
+                        },
+                        "connect_timeout" => match value.parse::<u64>() {
+                            Ok(secs) => self.connect_timeout = Some(Duration::from_secs(secs)),
+                            Err(_) => tracing::warn!(
+                                "connect_timeout='{value}' is not a valid number, ignoring"
+                            ),
+                        },
+                        "idle_timeout" => match value.parse::<u64>() {
+                            Ok(secs) => self.idle_timeout = Some(Duration::from_secs(secs)),
+                            Err(_) => tracing::warn!(
+                                "idle_timeout='{value}' is not a valid number, ignoring"
+                            ),
+                        },
+                        "read_only_optimization" => match value.parse::<bool>() {
+                            Ok(v) => self.read_only_optimization = v,
+                            Err(_) => tracing::warn!(
+                                "read_only_optimization='{value}' is not a valid bool, ignoring"
+                            ),
+                        },
                         _ => {}
                     }
                 }

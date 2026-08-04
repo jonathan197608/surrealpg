@@ -4,8 +4,8 @@
 //! or more SQL statements executed within a single PG transaction.
 
 use std::ops::DerefMut;
-use std::sync::Arc;
 use std::ops::Range;
+use std::sync::Arc;
 
 use sqlx::{Executor, Row};
 use tracing::{debug, trace, warn};
@@ -273,8 +273,10 @@ impl PgTransaction {
         // Using from_utf8_unchecked avoids a redundant validation branch,
         // but we add a debug_assert for defense-in-depth.
         let name_slice = &buf[..pos];
-        debug_assert!(std::str::from_utf8(name_slice).is_ok(),
-            "savepoint name must be valid UTF-8");
+        debug_assert!(
+            std::str::from_utf8(name_slice).is_ok(),
+            "savepoint name must be valid UTF-8"
+        );
         let name = unsafe { std::str::from_utf8_unchecked(name_slice) }.to_string();
         self.savepoints.push(name.clone());
         name
@@ -303,8 +305,10 @@ impl PgTransaction {
         buf[..prefix_len].copy_from_slice(prefix.as_bytes());
         buf[prefix_len..total].copy_from_slice(name_bytes);
         // Safety: same as push_savepoint_name — only ASCII bytes.
-        debug_assert!(std::str::from_utf8(&buf[..total]).is_ok(),
-            "savepoint SQL must be valid UTF-8");
+        debug_assert!(
+            std::str::from_utf8(&buf[..total]).is_ok(),
+            "savepoint SQL must be valid UTF-8"
+        );
         unsafe { std::str::from_utf8_unchecked(&buf[..total]) }.to_string()
     }
 
@@ -362,7 +366,9 @@ impl PgTransaction {
 
     /// Check whether a key exists.
     pub async fn exists(&mut self, key: Key) -> Result<bool> {
-        if self.closed { return Err(PgStoreError::TxClosed); }
+        if self.closed {
+            return Err(PgStoreError::TxClosed);
+        }
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let row = Self::build_query(persistent, &self.sql.exists)
@@ -375,7 +381,9 @@ impl PgTransaction {
 
     /// Get the value for a key.
     pub async fn get(&mut self, key: Key) -> Result<Option<Val>> {
-        if self.closed { return Err(PgStoreError::TxClosed); }
+        if self.closed {
+            return Err(PgStoreError::TxClosed);
+        }
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let row = Self::build_query(persistent, &self.sql.get)
@@ -388,7 +396,9 @@ impl PgTransaction {
 
     /// Batch-get multiple keys.
     pub async fn getm(&mut self, keys: Vec<Key>) -> Result<Vec<Option<Val>>> {
-        if self.closed { return Err(PgStoreError::TxClosed); }
+        if self.closed {
+            return Err(PgStoreError::TxClosed);
+        }
         if keys.is_empty() {
             return Ok(Vec::new());
         }
@@ -436,7 +446,9 @@ impl PgTransaction {
 
     /// Set a key to a value (insert or update).
     pub async fn set(&mut self, key: Key, val: Val) -> Result<()> {
-        if self.closed { return Err(PgStoreError::TxClosed); }
+        if self.closed {
+            return Err(PgStoreError::TxClosed);
+        }
         self.check_writable()?;
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
@@ -458,7 +470,9 @@ impl PgTransaction {
     ///
     /// If `pairs` is empty, returns immediately without hitting the DB.
     pub async fn setm(&mut self, pairs: Vec<(Key, Val)>) -> Result<()> {
-        if self.closed { return Err(PgStoreError::TxClosed); }
+        if self.closed {
+            return Err(PgStoreError::TxClosed);
+        }
         self.check_writable()?;
         if pairs.is_empty() {
             return Ok(());
@@ -485,7 +499,9 @@ impl PgTransaction {
     /// Set a key only if it does not already exist (insert-if-absent).
     /// Returns `KeyAlreadyExists` if the key exists.
     pub async fn put(&mut self, key: Key, val: Val) -> Result<()> {
-        if self.closed { return Err(PgStoreError::TxClosed); }
+        if self.closed {
+            return Err(PgStoreError::TxClosed);
+        }
         self.check_writable()?;
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
@@ -505,7 +521,9 @@ impl PgTransaction {
     /// `chk = None` means "only if key does not exist" (delegates to `put`).
     /// `chk = Some(v)` means "only if current value equals v".
     pub async fn putc(&mut self, key: Key, val: Val, chk: Option<Val>) -> Result<()> {
-        if self.closed { return Err(PgStoreError::TxClosed); }
+        if self.closed {
+            return Err(PgStoreError::TxClosed);
+        }
         self.check_writable()?;
         let Some(expected) = chk else {
             return self.put(key, val).await;
@@ -531,7 +549,9 @@ impl PgTransaction {
 
     /// Delete a key.
     pub async fn del(&mut self, key: Key) -> Result<()> {
-        if self.closed { return Err(PgStoreError::TxClosed); }
+        if self.closed {
+            return Err(PgStoreError::TxClosed);
+        }
         self.check_writable()?;
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
@@ -548,7 +568,9 @@ impl PgTransaction {
     /// `chk = None` → unconditional delete (delegates to `del`).
     /// `chk = Some(v)` → key must exist and value must equal v.
     pub async fn delc(&mut self, key: Key, chk: Option<Val>) -> Result<()> {
-        if self.closed { return Err(PgStoreError::TxClosed); }
+        if self.closed {
+            return Err(PgStoreError::TxClosed);
+        }
         self.check_writable()?;
         let Some(expected) = chk else {
             return self.del(key).await;
@@ -571,7 +593,9 @@ impl PgTransaction {
 
     /// Delete all keys in a range (inclusive start, exclusive end).
     pub async fn delr(&mut self, rng: Range<Key>) -> Result<()> {
-        if self.closed { return Err(PgStoreError::TxClosed); }
+        if self.closed {
+            return Err(PgStoreError::TxClosed);
+        }
         self.check_writable()?;
         // Empty range — skip DB round-trip.
         if rng.start >= rng.end {
@@ -620,8 +644,7 @@ impl PgTransaction {
         if skip > 1000 {
             warn!(
                 skip,
-                limit,
-                "large OFFSET in range scan — consider cursor-based pagination"
+                limit, "large OFFSET in range scan — consider cursor-based pagination"
             );
         }
         Self::build_query(persistent, range_sql)
@@ -650,23 +673,39 @@ impl PgTransaction {
 
     /// Scan keys in a range (ascending).
     pub async fn keys(&mut self, rng: Range<Key>, limit: u32, skip: u32) -> Result<Vec<Key>> {
-        if self.closed { return Err(PgStoreError::TxClosed); }
+        if self.closed {
+            return Err(PgStoreError::TxClosed);
+        }
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let rows = Self::range_query_offset(
-            conn.deref_mut(), persistent, &self.sql.range_keys_asc, rng, limit, skip
-        ).await?;
+            conn.deref_mut(),
+            persistent,
+            &self.sql.range_keys_asc,
+            rng,
+            limit,
+            skip,
+        )
+        .await?;
         Ok(Self::rows_to_keys(rows))
     }
 
     /// Scan keys in a range (descending).
     pub async fn keysr(&mut self, rng: Range<Key>, limit: u32, skip: u32) -> Result<Vec<Key>> {
-        if self.closed { return Err(PgStoreError::TxClosed); }
+        if self.closed {
+            return Err(PgStoreError::TxClosed);
+        }
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let rows = Self::range_query_offset(
-            conn.deref_mut(), persistent, &self.sql.range_keys_desc, rng, limit, skip
-        ).await?;
+            conn.deref_mut(),
+            persistent,
+            &self.sql.range_keys_desc,
+            rng,
+            limit,
+            skip,
+        )
+        .await?;
         Ok(Self::rows_to_keys(rows))
     }
 
@@ -677,12 +716,20 @@ impl PgTransaction {
         limit: u32,
         skip: u32,
     ) -> Result<Vec<(Key, Val)>> {
-        if self.closed { return Err(PgStoreError::TxClosed); }
+        if self.closed {
+            return Err(PgStoreError::TxClosed);
+        }
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let rows = Self::range_query_offset(
-            conn.deref_mut(), persistent, &self.sql.range_kv_asc, rng, limit, skip
-        ).await?;
+            conn.deref_mut(),
+            persistent,
+            &self.sql.range_kv_asc,
+            rng,
+            limit,
+            skip,
+        )
+        .await?;
         Ok(Self::rows_to_pairs(rows))
     }
 
@@ -693,19 +740,29 @@ impl PgTransaction {
         limit: u32,
         skip: u32,
     ) -> Result<Vec<(Key, Val)>> {
-        if self.closed { return Err(PgStoreError::TxClosed); }
+        if self.closed {
+            return Err(PgStoreError::TxClosed);
+        }
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let rows = Self::range_query_offset(
-            conn.deref_mut(), persistent, &self.sql.range_kv_desc, rng, limit, skip
-        ).await?;
+            conn.deref_mut(),
+            persistent,
+            &self.sql.range_kv_desc,
+            rng,
+            limit,
+            skip,
+        )
+        .await?;
         Ok(Self::rows_to_pairs(rows))
     }
 
     /// Count keys in a range.
     pub async fn count(&mut self, rng: Range<Key>) -> Result<u64> {
         // B1: Check closed first — consistency with all other methods.
-        if self.closed { return Err(PgStoreError::TxClosed); }
+        if self.closed {
+            return Err(PgStoreError::TxClosed);
+        }
         // Empty range — skip DB round-trip.
         if rng.start >= rng.end {
             return Ok(0);
@@ -735,7 +792,9 @@ impl PgTransaction {
     ///
     /// **Note**: The estimate may be stale if `ANALYZE` hasn't run recently.
     pub async fn count_approx(&mut self) -> Result<Option<u64>> {
-        if self.closed { return Err(PgStoreError::TxClosed); }
+        if self.closed {
+            return Err(PgStoreError::TxClosed);
+        }
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let row = Self::build_query(persistent, &self.sql.count_approx)
@@ -791,9 +850,7 @@ impl PgTransaction {
 impl Drop for PgTransaction {
     fn drop(&mut self) {
         if !self.closed {
-            warn!(
-                "PgTransaction dropped without explicit commit/cancel; PG will auto-rollback"
-            );
+            warn!("PgTransaction dropped without explicit commit/cancel; PG will auto-rollback");
         }
     }
 }

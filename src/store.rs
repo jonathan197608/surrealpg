@@ -11,8 +11,8 @@ use tracing::{info, warn};
 
 use crate::config::{PersistentStatements, PgConfig};
 use crate::error::{PgStoreError, Result};
-use crate::transaction::Sql;
 use crate::transaction::PgTransaction;
+use crate::transaction::Sql;
 use crate::tune::PgTuneConfig;
 
 // ─── PgStore ────────────────────────────────────────────
@@ -73,9 +73,7 @@ impl PgStore {
     pub async fn new(url: &str, canceller: CancellationToken) -> Result<Arc<Self>> {
         // ── Load configs ──
         let mut config = PgConfig::default();
-        config
-            .merge_url_params(url)
-            .map_err(PgStoreError::Other)?;
+        config.merge_url_params(url).map_err(PgStoreError::Other)?;
         config.merge_env();
 
         // Post-merge cross-validation: min_connections must not exceed max_connections.
@@ -84,9 +82,7 @@ impl PgStore {
         if let (Some(min), Some(max)) = (config.min_connections, config.max_connections)
             && min > max
         {
-            warn!(
-                "min_connections={min} > max_connections={max}, capping min to max"
-            );
+            warn!("min_connections={min} > max_connections={max}, capping min to max");
             config.min_connections = Some(max);
         }
 
@@ -106,11 +102,8 @@ impl PgStore {
         // Pre-build BEGIN SQL — isolation_level and read_only_optimization are
         // immutable after construction, so we build both variants once here
         // and avoid a format!() allocation on every begin() call.
-        let begin_write_sql: Arc<str> = format!(
-            "BEGIN ISOLATION LEVEL {}",
-            config.isolation_level.as_sql()
-        )
-        .into();
+        let begin_write_sql: Arc<str> =
+            format!("BEGIN ISOLATION LEVEL {}", config.isolation_level.as_sql()).into();
         // begin_read_sql is built after persistent resolution (see F3 below).
 
         // F5: Guard against zero max_connections — sqlx panics with pool_max=0.
@@ -424,7 +417,10 @@ impl PgStore {
     /// Used by pg_builder to pass counters when constructing PgTx.
     #[must_use]
     pub(crate) fn tx_commit_rollback_arcs(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
-        (Arc::clone(&self.tx_committed), Arc::clone(&self.tx_rolled_back))
+        (
+            Arc::clone(&self.tx_committed),
+            Arc::clone(&self.tx_rolled_back),
+        )
     }
 
     /// Attempt to dynamically resize the connection pool.
@@ -439,9 +435,7 @@ impl PgStore {
                 "max_connections ({max}) must be >= min_connections ({min})"
             )));
         }
-        info!(
-            "pool resize requested: max={max}, min={min} (not yet supported by sqlx 0.8)"
-        );
+        info!("pool resize requested: max={max}, min={min} (not yet supported by sqlx 0.8)");
         Ok(())
     }
 

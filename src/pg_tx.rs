@@ -5,8 +5,8 @@
 //! backend pattern).
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use surrealdb_core::kvs::{self, Key, KeysResult, ScanResult, Transactable, Val};
 use tokio::sync::Mutex;

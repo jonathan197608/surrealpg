@@ -45,7 +45,10 @@ async fn surreal_kv_basic_crud() {
     if let Err(e) = ds.execute("DEFINE DATABASE crud_test", &sess, None).await {
         eprintln!("[WARN] DEFINE DATABASE failed (may already exist): {e}");
     }
-    if let Err(e) = ds.execute("DEFINE TABLE person SCHEMAFULL", &sess, None).await {
+    if let Err(e) = ds
+        .execute("DEFINE TABLE person SCHEMAFULL", &sess, None)
+        .await
+    {
         eprintln!("[WARN] DEFINE TABLE failed (may already exist): {e}");
     }
     if let Err(e) = ds

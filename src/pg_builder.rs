@@ -42,11 +42,7 @@ impl TransactionBuilder for PgStore {
         Box::pin(async move {
             let tx = self.begin(write).await.map_err(kvs::Error::from)?;
             let (tx_committed, tx_rolled_back) = self.tx_commit_rollback_arcs();
-            let pg_tx = PgTx::new(
-                tx,
-                tx_committed,
-                tx_rolled_back,
-            );
+            let pg_tx = PgTx::new(tx, tx_committed, tx_rolled_back);
             // `true` = local transaction (same process), matching mem/rocksdb
             Ok((Box::new(pg_tx) as Box<dyn Transactable>, true))
         })
