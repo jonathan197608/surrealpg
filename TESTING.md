@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: '52f0e174-8741-4289-811d-40962fc77b5f'
-  PropagateID: '52f0e174-8741-4289-811d-40962fc77b5f'
-  ReservedCode1: 'ebfdbea3-d0fa-4893-adb6-ecac15754a8d'
-  ReservedCode2: 'ebfdbea3-d0fa-4893-adb6-ecac15754a8d'
+  ProduceID: 'efe0b39d-883f-4b8c-821e-875e945d8e90'
+  PropagateID: 'efe0b39d-883f-4b8c-821e-875e945d8e90'
+  ReservedCode1: '2ae2478f-16d9-4398-b90c-ae8b5f390cfc'
+  ReservedCode2: '2ae2478f-16d9-4398-b90c-ae8b5f390cfc'
 ---
 
 # 测试文档
@@ -15,17 +15,38 @@ AIGC:
 
 | 层级 | 文件 | 测试数 | 说明 |
 |------|------|--------|------|
-| 单元测试 | `src/tune.rs` | 5 | PgTuneConfig 的参数解析、SQL 生成、Duration 解析 |
-| 集成测试 | `tests/integration_test.rs` | 10 | 直接测试 KV 层（PgStore / PgTransaction），不经过 SurrealDB 引擎 |
+| 单元测试 | `src/config.rs` | 13 | URL 参数解析、percent-decode、标识符校验、SQL 保留字检测 |
+| 单元测试 | `src/tune.rs` | 9 | PgTuneConfig 参数解析、SQL 生成、Duration 解析、checkpoint_target clamp |
+| 集成测试 | `tests/integration_test.rs` | 19 | 直接测试 KV 层（PgStore / PgTransaction），不经过 SurrealDB 引擎 |
 | SurrealQL 测试 | `tests/surreal_kv_suite.rs` | 2 | 通过 SurrealDB Datastore API 端到端验证 SurrealQL 语句 |
 
-**合计 17 个测试**，单元测试无需数据库即可运行，集成测试和 SurrealQL 测试需要 `PG_TEST_URL` 环境变量。
+**合计 43 个测试**，22 个单元测试无需数据库即可运行，集成测试和 SurrealQL 测试需要 `PG_TEST_URL` 环境变量。
 
 ---
 
-## 单元测试（src/tune.rs）
+## 单元测试
 
-无需数据库连接，验证调优配置的正确性。
+无需数据库连接，验证配置解析与调优参数的正确性。
+
+### `src/config.rs`（13 个）
+
+| 测试名 | 验证内容 |
+|--------|---------|
+| `test_validate_identifier_valid` | 合法标识符通过（`kv`、`kv_test`、`_kv`、`Mixed_Case123`） |
+| `test_validate_identifier_empty` | 空字符串被拒绝 |
+| `test_validate_identifier_leading_digit` | 首字符为数字被拒绝（PG 标识符规则） |
+| `test_validate_identifier_invalid_chars` | 含 `-`、`.`、空格、`;`、`'` 等非法字符被拒绝 |
+| `test_validate_identifier_reserved` | SQL 保留字被拒绝（含 SAVEPOINT 回归测试） |
+| `test_is_sql_reserved_case_insensitive` | 保留字检测支持大写/小写/混合大小写 |
+| `test_percent_decode_normal` | `%20` → 空格、`%2F` → `/` 等标准解码 |
+| `test_percent_decode_consecutive` | 连续 `%XX` 序列正确解码 |
+| `test_percent_decode_invalid` | 无效 hex 序列原样保留 |
+| `test_percent_decode_trailing_percent` | 尾部 `%` 或 `%2` 不完整序列原样保留 |
+| `test_percent_decode_empty` | 空字符串输入返回空字符串 |
+| `test_percent_decode_plus` | `+` → 空格（form-urlencoded 兼容） |
+| `test_hex_digit` | 十六进制字符转数值（0-9, a-f, A-F） |
+
+### `src/tune.rs`（9 个）
 
 | 测试名 | 验证内容 |
 |--------|---------|
@@ -34,10 +55,21 @@ AIGC:
 | `test_session_sql_contains_all_params` | session SQL 包含所有运行时级参数的 SET 语句 |
 | `test_create_table_sql` | 建表 SQL 包含 fillfactor、TOAST、UNLOGGED 等表存储参数 |
 | `test_tune_table_sql` | ALTER TABLE SQL 包含 autovacuum 参数 |
+| `test_validate_pg_memory_size` | PG 内存大小校验（`64MB`、`1GB` 等，拒绝 SQL 注入） |
+| `test_validate_toast_storage` | TOAST 存储策略校验（external/extended/main/plain） |
+| `test_env_bool` | 环境变量布尔值解析（true/false/1/0/yes/no/on/off，含大小写） |
+| `test_checkpoint_target_clamping` | checkpoint_completion_target 超范围 clamp 到 [0.0, 1.0] |
 
 运行：
 
 ```bash
+# 全部单元测试
+cargo test --lib
+
+# 仅 config 模块
+cargo test --lib config
+
+# 仅 tune 模块
 cargo test --lib tune
 ```
 
@@ -59,6 +91,17 @@ cargo test --lib tune
 | `test_delc` | delc（compare-and-delete），匹配/不匹配 check 值 |
 | `test_keys_direction` | keys 正序 / keysr 反序扫描 |
 | `test_read_only_rejects_writes` | 只读事务拒绝写操作 |
+| `test_count_approx` | count_approx 近似计数（pg_class.reltuples） |
+| `test_health_check` | health_check（SELECT 1）健康检查 |
+| `test_pool_size` | pool_size / pool_max 连接池信息读取 |
+| `test_setm` | setm 批量写入 + upsert 更新 + 空输入 no-op |
+| `test_vacuum` | VACUUM ANALYZE 执行 |
+| `test_try_resize_pool` | try_resize_pool 参数校验（max < min 拒绝） |
+| `test_empty_range` | 空范围（start >= end）的 keys/count/scan/delr 返回空 |
+| `test_nested_savepoint` | 两层嵌套 savepoint 回滚，验证栈式管理 |
+| `test_setm_delc_combo` | setm 批量写入 + delc 条件删除组合操作 |
+
+集成测试运行结束后会写入一条 `test:marker` 记录，包含通过/失败数和时间戳，可用于验证数据确实到达 PG。
 
 ---
 
@@ -142,6 +185,18 @@ BINDGEN_EXTRA_CLANG_ARGS = "-isysroot /Applications/Xcode.app/Contents/Developer
 ## 代码质量检查
 
 ```bash
-# clippy 零告警（每次修改代码后必须执行）
-cargo clippy --all-targets
+# clippy 零告警（每次修改代码后必须执行，-D warnings 将告警视为错误）
+cargo clippy --all-targets -- -D warnings
 ```
+
+## Rust 2024 注意事项
+
+项目使用 Rust edition 2024。在该 edition 下，`std::env::set_var` 和 `std::env::remove_var` 是 unsafe 操作（因为它们涉及全局可变状态），测试中需用 `unsafe { }` 块包裹：
+
+```rust
+// 正确写法（edition 2024）
+unsafe { std::env::set_var("PG_TUNED_SERVER_CHECKPOINT_TARGET", "1.5") };
+unsafe { std::env::remove_var("PG_TUNED_SERVER_CHECKPOINT_TARGET") };
+```
+
+`src/tune.rs` 的 `test_env_bool` 和 `test_checkpoint_target_clamping` 测试涉及环境变量操作，均已按此规则处理。

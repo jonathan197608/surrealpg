@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: '16fbadef-198f-4499-bca9-11b889a23017'
-  PropagateID: '16fbadef-198f-4499-bca9-11b889a23017'
-  ReservedCode1: 'ea8efced-acc5-4909-af35-68c8644a3a66'
-  ReservedCode2: 'ea8efced-acc5-4909-af35-68c8644a3a66'
+  ProduceID: '61f6c4eb-8ae5-4b52-ad46-dc72bf8506b9'
+  PropagateID: '61f6c4eb-8ae5-4b52-ad46-dc72bf8506b9'
+  ReservedCode1: '9447e102-49bf-4f25-8da2-50785b03063a'
+  ReservedCode2: '9447e102-49bf-4f25-8da2-50785b03063a'
 ---
 
 # surreal-pg
@@ -18,10 +18,12 @@ AIGC:
 ## 目录
 
 - [特色与优势](#特色与优势)
+- [架构设计](#架构设计)
 - [应用场景](#应用场景)
 - [快速开始](#快速开始)
 - [配置参数](#配置参数)
 - [生产部署](#生产部署)
+- [监控指标](#监控指标)
 - [测试](TESTING.md)
 
 ---
@@ -51,7 +53,7 @@ SurrealDB 的事务语义 1:1 映射到 PostgreSQL 的 `BEGIN` / `COMMIT` / `ROL
 
 ### Pooler 自动适配
 
-连接池初始化时自动探测服务器是否在 pgbouncer / Supavisor 之后，动态切换 prepared statement 策略：直连 PG 使用 named prepared statement 获得最佳性能；检测到 transaction-mode pooler 时自动降级为 unnamed statement 保证兼容性。也可通过环境变量手动覆盖。
+连接池初始化时自动探测服务器是否在 pgbouncer / Supavisor 之后，动态切换 prepared statement 策略：直连 PG 使用 named prepared statement 获得最佳性能；检测到 transaction-mode pooler 时自动降级为 unnamed statement 保证兼容性。也可通过环境变量手动覆盖。探测策略采用双连接 named prepared statement 冲突检测——两个连接分别创建同名 prepared statement，若发生 `42P05`（duplicate_prepared_statement）则判定为 pooler。小连接池（≤ 2）跳过探测默认关闭，避免池耗尽。
 
 ### 5 层 26 参数精细化调优
 
@@ -66,6 +68,79 @@ SurrealDB 的事务语义 1:1 映射到 PostgreSQL 的 `BEGIN` / `COMMIT` / `ROL
 ### Rust 单二进制，零运行时依赖
 
 纯 Rust 实现，编译为单一可执行文件，无 GC、无 JVM、无 Node.js 运行时。依赖 crates.io 发布的 `surrealdb-server` 和 `surrealdb-core`，升级路径清晰。
+
+---
+
+## 架构设计
+
+### 委托模式
+
+`PostgresComposer` 包装 `CommunityComposer`，仅拦截 `postgresql://` 和 `postgres://` 连接路径，将其路由到 `PgStore`。其他所有后端（`memory://`、`rocksdb://`、`tikv://` 等）透传给 community composer，行为与官方 SurrealDB 完全一致。
+
+```
+surreal-pg start postgresql://host:5432/db
+    │
+    ▼
+PostgresComposer::new_transaction_builder(path)
+    │
+    ├── postgresql:// → PgStore::new() → TransactionBuilder
+    │
+    └── 其他 scheme → CommunityComposer (透传)
+```
+
+### 三层结构
+
+| 层 | 结构体 | 文件 | 职责 |
+|----|--------|------|------|
+| 工厂层 | `PgStore` | `store.rs` | 持有连接池，创建事务，管理生命周期指标 |
+| 事务层 | `PgTransaction` | `transaction.rs` | 底层 PG 事务，实现全部 KV 操作的 SQL 映射 |
+| 适配层 | `PgTx` | `pg_tx.rs` | `Transactable` trait wrapper，用 `Mutex` 提供内部可变性 |
+
+`PgStore` 返回 `Arc<Self>`，是 `Clone` 的（所有字段用 `Arc` 包装），`PgTx` 通过 `Mutex<Option<PgTransaction>>` 实现 `&self` 上的可变操作——满足 SurrealDB 的 `Transactable` trait 约束。
+
+### KV → SQL 映射
+
+SurrealDB 的 KV 层将所有数据视为字节对 `(Vec<u8>, Vec<u8>)`，存储在单张 PG 表中：
+
+```sql
+CREATE TABLE kv (key BYTEA PRIMARY KEY, val BYTEA NOT NULL);
+```
+
+| KV 操作 | SQL | 说明 |
+|---------|-----|------|
+| `set(k, v)` | `INSERT … ON CONFLICT DO UPDATE` | Upsert |
+| `setm(pairs)` | `INSERT … SELECT * FROM UNNEST(…)` | 批量 upsert，自动分块（≤ 32,000 对/批） |
+| `put(k, v)` | `INSERT … ON CONFLICT DO NOTHING` | Insert-if-absent，0 行受影响时返回 `KeyAlreadyExists` |
+| `get(k)` | `SELECT val WHERE key = $1` | 单键查询 |
+| `getm(keys)` | `SELECT key, val WHERE key = ANY($1)` | 批量查询，小结果集用线性扫描，大结果集用 HashMap |
+| `del(k)` | `DELETE WHERE key = $1` | 单键删除 |
+| `delr(range)` | `DELETE WHERE key >= $1 AND key < $2` | 范围删除 |
+| `putc(k, v, chk)` | `UPDATE SET val = $2 WHERE key = $1 AND val = $3` | Compare-and-swap |
+| `delc(k, chk)` | `DELETE WHERE key = $1 AND val = $2` | Compare-and-delete |
+| `keys/scan(range)` | `SELECT key[/,val] WHERE key >= $1 AND key < $2 ORDER BY key [ASC\|DESC] LIMIT $3 OFFSET $4` | 范围扫描，支持正向/反向 |
+| `count(range)` | `SELECT count(*) WHERE key >= $1 AND key < $2` | 精确计数 |
+| `count_approx()` | `SELECT reltuples FROM pg_class WHERE relname = $1` | O(1) 近似计数（基于 ANALYZE 统计） |
+| `exists(k)` | `SELECT 1 WHERE key = $1` | 存在性检查 |
+| savepoint | `SAVEPOINT sp_N` / `ROLLBACK TO SAVEPOINT sp_N` / `RELEASE SAVEPOINT sp_N` | PG 原生 savepoint，名字栈式管理 |
+
+所有 SQL 在 `PgStore::new()` 时预构建为 `Arc<Sql>`，每个事务通过 `Arc::clone` 共享（1 次原子引用计数），操作时零 `format!()` 堆分配。热路径利用 Rust 的"不同字段可同时借用"规则：`&self.sql.field`（不可变）与 `conn.deref_mut()`（可变）并存于同一作用域。
+
+### 错误映射
+
+PostgreSQL SQLSTATE 语义错误自动映射到 SurrealDB 的 `kvs::Error`：
+
+| SQLSTATE | 含义 | 映射到 |
+|----------|------|--------|
+| `23505` | unique_violation | `TransactionKeyAlreadyExists` |
+| `40P01` | deadlock_detected | `TransactionConflict` |
+| `40001` | serialization_failure | `TransactionConflict` |
+| `08xxx` | connection_exception | `ConnectionFailed` |
+| `25P01` | no_active_sql_transaction | 保留上下文，映射为 `Transaction` |
+| 其他 | — | `Transaction` |
+
+### 连接泄漏恢复
+
+从池中获取的连接可能残留前一个泄漏的事务状态。`begin()` 采用乐观策略——直接执行 `BEGIN`，仅在遇到 `25P02`（in_failed_sql_transaction）时才执行 `ROLLBACK` 清理并重试。这避免了正常路径的额外网络往返，同时安全处理异常情况。
 
 ---
 
@@ -154,18 +229,20 @@ curl -X POST -u "root:secret" \
 
 ### 基础配置（URL 参数）
 
-通过连接字符串的 query 参数传递：
+通过连接字符串的 query 参数传递，值支持 percent-decode（`%XX` 序列和 `+` → 空格）：
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `max_connections` | 20 | 连接池最大连接数 |
-| `min_connections` | 5 | 连接池最小保持连接数 |
-| `statement_timeout` | 30（秒） | SQL 执行超时 |
+| `max_connections` | 20 | 连接池最大连接数（0 会被忽略） |
+| `min_connections` | 5 | 连接池最小保持连接数（若 > max_connections 则被忽略） |
+| `connect_timeout` | 10（秒） | 获取连接超时 |
+| `idle_timeout` | 600（秒） | 空闲连接回收时间 |
 | `max_lifetime` | 1800（秒） | 连接最大生存时间 |
-| `auto_create_table` | true | 启动时自动建表 |
-| `table_name` | `kv` | 表名（测试用 `kv_test`） |
+| `auto_create_table` | true | 启动时自动建表 + 表调优 |
+| `table_name` | `kv` | 表名（需符合 PG 标识符规则，拒绝 SQL 保留字） |
 | `isolation_level` | `read_committed` | 事务隔离级别（`read_committed` / `repeatable_read` / `serializable`） |
-| `persistent_statements` | `auto` | prepared statement 策略（`auto` / `true` / `false`） |
+| `read_only_optimization` | true | 为只读事务使用 `BEGIN READ ONLY`（pgbouncer 下自动关闭） |
+| `persistent_statements` | `auto` | prepared statement 策略（`auto` / `true` / `false` / `on` / `off` / `yes` / `no` / `1` / `0`） |
 
 示例：`postgresql://user:pass@host:5432/db?max_connections=30&isolation_level=serializable`
 
@@ -173,9 +250,12 @@ curl -X POST -u "root:secret" \
 
 | 环境变量 | 说明 |
 |---------|------|
-| `PG_PERSISTENT_STATEMENTS` | 覆盖 persistent statements 策略（`auto`/`true`/`false`） |
+| `PG_PERSISTENT_STATEMENTS` | 覆盖 persistent statements 策略（`auto`/`true`/`false`/`on`/`off` 等） |
 
-优先级：**环境变量 > URL 参数 > 默认值**。
+优先级规则：
+- **persistent_statements**：`PG_PERSISTENT_STATEMENTS` 环境变量 > URL 参数 > 默认值 `auto`
+- **pool 参数**（max/min_connections、timeouts）：URL 参数 > `PG_TUNED_*` 调优默认值
+- **其他 URL 参数**：URL 参数 > 默认值；不识别的值打印 `warn` 并用默认值
 
 ### 调优配置（26 个参数，5 层）
 
@@ -264,8 +344,6 @@ PG_TUNED_QUERY_STATEMENT_TIMEOUT=15s \
 
 ---
 
----
-
 ## 生产部署
 
 ### PostgreSQL 配置建议
@@ -290,7 +368,7 @@ checkpoint_completion_target = 0.9
 
 示例：8 核 CPU + 1 SSD → min(17, 90) → 取 20。
 
-### 监控指标
+### PostgreSQL 内部监控
 
 | 指标 | 查询方式 | 健康阈值 |
 |------|---------|---------|
@@ -298,6 +376,25 @@ checkpoint_completion_target = 0.9
 | 死元组比例 | `n_dead_tup / n_live_tup` | < 5% |
 | HOT 更新比例 | `n_tup_hot_upd / n_tup_upd` | > 90% |
 | 连接池使用率 | `active / max_connections` | 60%~80% |
+
+---
+
+## 监控指标
+
+`PgStore` 通过 SurrealDB 的 `Metrics` 接口暴露以下内置指标，可通过 `register_metrics()` / `collect_u64_metric()` 查询：
+
+| 指标名 | 说明 |
+|--------|------|
+| `pg_pool_size` | 当前连接池总连接数（含空闲） |
+| `pg_pool_idle` | 空闲连接数 |
+| `pg_pool_max` | 连接池最大连接数 |
+| `pg_tx_started` | 累计启动的事务数 |
+| `pg_tx_committed` | 累计提交的事务数 |
+| `pg_tx_rolled_back` | 累计回滚/取消的事务数 |
+
+指标恒等式：`tx_started = tx_committed + tx_rolled_back`（commit/cancel 失败也计入 rolled_back）。
+
+连接池利用率超过 80% 时自动输出一次性 `warn` 日志，避免日志刷屏。
 
 ### 定期维护
 
@@ -313,14 +410,16 @@ VACUUM ANALYZE kv;
 
 | 组件 | 版本 | 用途 |
 |------|------|------|
-| `surrealdb-server` | 3.2.3 | SurrealDB 服务器引擎（init / CLI / HTTP / WS） |
-| `surrealdb-core` | 3.2.3 | 核心库（CommunityComposer / kvs traits） |
+| `surrealdb-server` | ^3.2 | SurrealDB 服务器引擎（init / CLI / HTTP / WS） |
+| `surrealdb-core` | ^3.2 | 核心库（CommunityComposer / kvs traits） |
 | `sqlx` | 0.8 | PostgreSQL 异步驱动 + 连接池 |
 | `tokio` | 1 | 异步运行时 |
+| `tokio-util` | 0.7 | CancellationToken（优雅关停） |
 | `thiserror` | 2 | 错误类型派生 |
 | `tracing` | 0.1 | 结构化日志 |
+| `axum` | 0.8 | HTTP 框架（RouterFactory 返回类型） |
 
-**Edition**: Rust 2024。已 pin `surrealdb-server` / `surrealdb-core` 精确版本 `3.2.3`，升级时需运行完整测试套件验证兼容性。
+**Edition**: Rust 2024。依赖 `surrealdb-server` / `surrealdb-core` 版本范围为 `^3.2`，升级时需运行完整测试套件验证兼容性。
 
 ---
 
