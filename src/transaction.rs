@@ -387,7 +387,7 @@ impl PgTransaction {
         // We extract key/val from rows **once** into a Vec of tuples,
         // then search that Vec. This avoids calling r.get::<Vec<u8>,_>("key")
         // repeatedly inside find() which would allocate a new Vec per comparison.
-        let use_linear = rows.len() <= 64 && (rows.len() as usize).saturating_mul(keys.len()) <= 8192;
+        let use_linear = rows.len() <= 64 && rows.len().saturating_mul(keys.len()) <= 8192;
         if use_linear {
             let extracted: Vec<(Vec<u8>, Vec<u8>)> = rows
                 .into_iter()

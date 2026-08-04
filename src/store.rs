@@ -99,14 +99,10 @@ impl PgStore {
             )
             .into()
         } else {
-            // Even without READ ONLY, use the same isolation level as write
-            // transactions to avoid isolation-level mismatch between read
-            // and write paths.
-            format!(
-                "BEGIN ISOLATION LEVEL {}",
-                config.isolation_level.as_sql()
-            )
-            .into()
+            // Without READ ONLY, read and write transactions use the same
+            // BEGIN SQL (same isolation level). Share the Arc to avoid
+            // storing the same string twice.
+            Arc::clone(&begin_write_sql)
         };
 
         let opts: PgConnectOptions = url
