@@ -99,7 +99,14 @@ impl PgStore {
             )
             .into()
         } else {
-            "BEGIN".into()
+            // Even without READ ONLY, use the same isolation level as write
+            // transactions to avoid isolation-level mismatch between read
+            // and write paths.
+            format!(
+                "BEGIN ISOLATION LEVEL {}",
+                config.isolation_level.as_sql()
+            )
+            .into()
         };
 
         let opts: PgConnectOptions = url

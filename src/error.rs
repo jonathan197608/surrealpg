@@ -63,7 +63,10 @@ impl PgStoreError {
     pub fn from_sqlx(key: Option<&[u8]>, e: &sqlx::Error) -> Self {
         match e {
             sqlx::Error::Database(db_err) => {
-                let code = db_err.code().unwrap_or(Cow::Borrowed("00000"));
+                // When the SQLSTATE code is missing, use "58000" (system error)
+                // instead of "00000" (successful completion) — we are in an
+                // error path, so "00000" would be semantically misleading.
+                let code = db_err.code().unwrap_or(Cow::Borrowed("58000"));
                 let msg = db_err.message().to_string();
 
                 match code.as_ref() {

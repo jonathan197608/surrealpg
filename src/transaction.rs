@@ -383,13 +383,23 @@ impl PgTransaction {
         // than a HashMap. We check the product of keys × rows to avoid
         // O(n²) blow-up when many keys are requested but few exist.
         // Threshold: 8192 comparisons ≈ 128 keys × 64 rows.
+        //
+        // We extract key/val from rows **once** into a Vec of tuples,
+        // then search that Vec. This avoids calling r.get::<Vec<u8>,_>("key")
+        // repeatedly inside find() which would allocate a new Vec per comparison.
         let use_linear = rows.len() <= 64 && (rows.len() as usize).saturating_mul(keys.len()) <= 8192;
         if use_linear {
-            Ok(keys.into_iter()
+            let extracted: Vec<(Vec<u8>, Vec<u8>)> = rows
+                .into_iter()
+                .map(|r| (r.get::<Vec<u8>, _>("key"), r.get::<Vec<u8>, _>("val")))
+                .collect();
+            Ok(keys
+                .into_iter()
                 .map(|k| {
-                    rows.iter()
-                        .find(|r| r.get::<Vec<u8>, _>("key") == k)
-                        .map(|r| r.get::<Vec<u8>, _>("val"))
+                    extracted
+                        .iter()
+                        .find(|(row_key, _)| *row_key == k)
+                        .map(|(_, v)| v.clone())
                 })
                 .collect())
         } else {
