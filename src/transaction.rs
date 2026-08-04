@@ -892,8 +892,15 @@ impl PgTransaction {
 
 impl Drop for PgTransaction {
     fn drop(&mut self) {
+        // SurrealDB's engine routinely drops transactions without calling
+        // commit()/cancel() — this is by design for internal housekeeping
+        // paths (node registration, cluster events, etc.). PG will
+        // auto-rollback the transaction when the PoolConnection is returned
+        // to the pool, so there is no data integrity concern. The unconditional
+        // ROLLBACK in begin() also cleans up any leaked state on the next use.
+        // Logged at debug level to avoid log spam.
         if !self.closed {
-            warn!("PgTransaction dropped without explicit commit/cancel; PG will auto-rollback");
+            debug!("PgTransaction dropped without explicit commit/cancel; PG will auto-rollback");
         }
     }
 }

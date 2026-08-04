@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use sqlx::Executor;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{PersistentStatements, PgConfig};
 use crate::error::{PgStoreError, Result};
@@ -207,6 +207,13 @@ impl PgStore {
         // READ ONLY is a transaction property that must persist across all
         // statements. When persistent=false (pgbouncer detected), disable
         // read_only_optimization to avoid runtime errors.
+        //
+        // Additionally, read_only_optimization defaults to false because
+        // SurrealDB's engine sometimes issues write operations (e.g. node
+        // registration, event processing) inside transactions it requested
+        // as read-only. PG's READ ONLY is a hard constraint (unlike RocksDB
+        // backends that tolerate incidental writes), which would cause
+        // 25006 errors.
         let read_only_optimization = if !persistent {
             info!(
                 "pgbouncer/pooler detected: disabling read_only_optimization \
@@ -284,46 +291,30 @@ impl PgStore {
             &*self.begin_read_sql
         };
 
-        // Attempt BEGIN directly. On the normal path (no leaked transaction),
-        // this saves a network round-trip compared to always doing ROLLBACK first.
+        // Clean up any leaked transaction state before opening a new one.
         //
-        // Recovery: if BEGIN fails with 25P02 (in_failed_sql_transaction), the
-        // connection has a leaked failed transaction — we ROLLBACK and retry.
+        // SurrealDB's engine does not always call commit()/cancel() before
+        // dropping a PgTx — e.g. internal housekeeping transactions (node
+        // registration, cluster events) may be silently dropped. When this
+        // happens, the underlying PoolConnection is returned to the pool
+        // with an active PG transaction still open. The next begin() would
+        // execute BEGIN on top of that, producing PG WARNING "there is
+        // already a transaction in progress" (sqlx escalates PG NOTICE to
+        // WARN log level).
         //
-        // Note: 25P01 (no_active_sql_transaction) is intentionally NOT checked
-        // because BEGIN never produces it — BEGIN's purpose is to *start* a
-        // transaction. A non-failed leaked active transaction would only
-        // produce a WARNING (not an error), so it cannot be detected here;
-        // that is a known limitation of the optimistic approach.
-        let result = Executor::execute(&mut *conn, sqlx::raw_sql(begin_sql)).await;
-        match result {
-            Ok(_) => {}
-            Err(e) => {
-                // Use SQLSTATE codes instead of string matching for
-                // cross-version reliability.
-                // 25P02 = in_failed_sql_transaction
-                let is_failed_tx = matches!(&e, sqlx::Error::Database(db)
-                    if matches!(db.code().as_deref(), Some("25P02")));
-                if is_failed_tx {
-                    // Leaked transaction detected — clean up and retry.
-                    //
-                    // P3: No need to re-execute session SET statements after ROLLBACK.
-                    // PostgreSQL session-level SET (e.g. work_mem, timezone) persists
-                    // across ROLLBACK — only transaction-local SET LOCAL is undone.
-                    // Our after_connect hook uses SET (not SET LOCAL), so the settings
-                    // survive the ROLLBACK and the subsequent BEGIN.
-                    let _ = Executor::execute(&mut *conn, sqlx::raw_sql("ROLLBACK"))
-                        .await
-                        .inspect_err(|e| warn!("ROLLBACK of leaked transaction failed: {e}"));
-                    Executor::execute(&mut *conn, sqlx::raw_sql(begin_sql))
-                        .await
-                        .map_err(|e2| PgStoreError::from_sqlx(None, &e2))?;
-                    warn!("cleaned up leaked transaction from pool connection");
-                } else {
-                    return Err(PgStoreError::from_sqlx(None, &e));
-                }
-            }
-        }
+        // To guarantee a clean connection, we unconditionally send ROLLBACK
+        // before BEGIN. If no transaction is active, ROLLBACK is a no-op
+        // (PG emits a WARNING notice which sqlx logs at debug level, not an
+        // error). The cost is one extra network round-trip per begin(),
+        // which is negligible compared to the cost of acquiring a connection
+        // from the pool.
+        let _ = Executor::execute(&mut *conn, sqlx::raw_sql("ROLLBACK"))
+            .await
+            .inspect_err(|e| debug!("pre-BEGIN ROLLBACK failed (may be harmless if no tx active): {e}"));
+
+        Executor::execute(&mut *conn, sqlx::raw_sql(begin_sql))
+            .await
+            .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
 
         // F8: Increment started-transaction counter.
         self.tx_started.fetch_add(1, AtomicOrdering::Relaxed);

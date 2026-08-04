@@ -215,11 +215,13 @@ impl PgTuneConfig {
         crate::config::PgConfig::validate_identifier(table)
             .expect("table name must be a valid SQL identifier");
         format!(
-            r#"
+                r#"
 -- Table storage tuning
-ALTER TABLE {table} SET (fillfactor = {fillfactor});
+ALTER TABLE {table} SET (
+    fillfactor = {fillfactor},
+    toast_tuple_target = {toast_threshold}
+);
 ALTER TABLE {table} ALTER COLUMN val SET STORAGE {toast};
-ALTER TABLE {table} ALTER COLUMN val SET (toast_tuple_target = {toast_threshold});
 -- Autovacuum tuning
 ALTER TABLE {table} SET (
     autovacuum_vacuum_scale_factor = {vscale},

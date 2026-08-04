@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: '61f6c4eb-8ae5-4b52-ad46-dc72bf8506b9'
-  PropagateID: '61f6c4eb-8ae5-4b52-ad46-dc72bf8506b9'
-  ReservedCode1: '9447e102-49bf-4f25-8da2-50785b03063a'
-  ReservedCode2: '9447e102-49bf-4f25-8da2-50785b03063a'
+  ProduceID: 'c3e62207-da22-41ec-98e8-39e0f940f570'
+  PropagateID: 'c3e62207-da22-41ec-98e8-39e0f940f570'
+  ReservedCode1: '6293aa79-73d6-4d81-84a7-0d8187033077'
+  ReservedCode2: '6293aa79-73d6-4d81-84a7-0d8187033077'
 ---
 
 # surreal-pg
@@ -241,7 +241,7 @@ curl -X POST -u "root:secret" \
 | `auto_create_table` | true | 启动时自动建表 + 表调优 |
 | `table_name` | `kv` | 表名（需符合 PG 标识符规则，拒绝 SQL 保留字） |
 | `isolation_level` | `read_committed` | 事务隔离级别（`read_committed` / `repeatable_read` / `serializable`） |
-| `read_only_optimization` | true | 为只读事务使用 `BEGIN READ ONLY`（pgbouncer 下自动关闭） |
+| `read_only_optimization` | false | 为只读事务使用 `BEGIN READ ONLY`（默认关闭，因 SurrealDB 引擎可能在只读事务中执行内部写操作；pgbouncer 下自动关闭） |
 | `persistent_statements` | `auto` | prepared statement 策略（`auto` / `true` / `false` / `on` / `off` / `yes` / `no` / `1` / `0`） |
 
 示例：`postgresql://user:pass@host:5432/db?max_connections=30&isolation_level=serializable`

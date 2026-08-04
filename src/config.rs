@@ -169,7 +169,7 @@ impl Default for PgConfig {
             auto_create_table: true,
             table_name: "kv".to_string(),
             isolation_level: PgIsolation::default(),
-            read_only_optimization: true,
+            read_only_optimization: false,
             persistent_statements: PersistentStatements::Auto,
         }
     }
