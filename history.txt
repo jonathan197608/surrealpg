@@ -1,0 +1,5 @@
+#V2
+DEFINE TABLE person SCHEMAFULL;
+DEFINE FIELD name ON TABLE person TYPE string;
+DEFINE FIELD age ON TABLE person TYPE int;
+CREATE person SET name = 'Alice', age = 30;

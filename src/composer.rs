@@ -99,7 +99,7 @@ impl TransactionBuilderFactory for PostgresComposer {
             // Explicitly ignore to make the intent clear.
             let _ = &config;
 
-            let store = PgStore::new(path, canceller.clone()).await?;
+            let store = PgStore::new(path).await?;
 
             info!("Started PostgreSQL kvs store");
 

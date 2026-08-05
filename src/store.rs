@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
 use sqlx::Executor;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
-use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::config::{PersistentStatements, PgConfig};
@@ -33,10 +32,6 @@ pub struct PgStore {
     tune: Arc<PgTuneConfig>,
     /// Resolved persistent-statements flag (concrete `bool` after startup probe).
     persistent: bool,
-    /// Cancellation token — checked before starting new transactions.
-    /// When the server shuts down, this token is cancelled and all in-flight
-    /// `begin()` calls return `TxCancelled` instead of acquiring a connection.
-    canceller: CancellationToken,
     /// Maximum pool connections (from config), used by metrics reporting.
     /// sqlx 0.8 `PgPool` doesn't expose `max_connections()`, so we store it.
     pool_max: u32,
@@ -79,7 +74,7 @@ impl PgStore {
     /// Tuning parameters are loaded from `PG_TUNED_*` environment variables;
     /// URL query params (`max_connections`, `min_connections`, etc.) override
     /// the pool-level tuning defaults.
-    pub async fn new(url: &str, canceller: CancellationToken) -> Result<Arc<Self>> {
+    pub async fn new(url: &str) -> Result<Arc<Self>> {
         // ── Load configs ──
         let mut config = PgConfig::default();
         config.merge_url_params(url).map_err(PgStoreError::Other)?;
@@ -220,7 +215,6 @@ impl PgStore {
             config: Arc::new(config),
             tune: Arc::new(tune),
             persistent,
-            canceller,
             pool_max,
             begin_sql,
             vacuum_sql,
@@ -251,13 +245,15 @@ impl PgStore {
     /// which conflicts with SurrealDB's internal write operations (node
     /// registration, event processing) that may occur inside transactions
     /// requested as read-only.
+    ///
+    /// Note: the former `canceller.is_cancelled()` check has been removed.
+    /// SurrealDB's shutdown sequence cancels the `CancellationToken` *before*
+    /// calling `Datastore::shutdown()`, which needs to create a transaction
+    /// to archive the node. The canceller check prevented this shutdown
+    /// transaction from being created, causing "Couldn't update a finished
+    /// transaction" errors. Connection pool closure (`pool.close()`) already
+    /// prevents new transactions after shutdown completes.
     pub async fn begin(&self, write: bool) -> Result<PgTransaction> {
-        // Check cancellation before acquiring a connection from the pool.
-        // This prevents new transactions from starting during shutdown.
-        if self.canceller.is_cancelled() {
-            return Err(PgStoreError::TxCancelled);
-        }
-
         // Use sqlx's Transaction API: begin_with() executes the custom
         // BEGIN SQL (with isolation level), increments sqlx's internal
         // transaction_depth counter, and returns a Transaction that
