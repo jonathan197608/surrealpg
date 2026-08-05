@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: '27a7b7d4-bd9d-45f0-be1b-df9af5aea200'
-  PropagateID: '27a7b7d4-bd9d-45f0-be1b-df9af5aea200'
-  ReservedCode1: '614982a4-2018-4742-bfd6-899908ad55c9'
-  ReservedCode2: '614982a4-2018-4742-bfd6-899908ad55c9'
+  ProduceID: 'a776f1f9-a030-4a86-afb0-5a304dcc9557'
+  PropagateID: 'a776f1f9-a030-4a86-afb0-5a304dcc9557'
+  ReservedCode1: '446b5fa7-e197-41ca-b16e-a1b32f0f9e86'
+  ReservedCode2: '446b5fa7-e197-41ca-b16e-a1b32f0f9e86'
 ---
 
 # surreal-pg
@@ -375,7 +375,66 @@ PG_TUNED_AUTOVAC_VACUUM_SCALE=0.03 \
 PG_TUNED_QUERY_STATEMENT_TIMEOUT=15s \
 ./target/release/surreal-pg start --user root --pass secret \
     postgresql://prod-pg:5432/surrealdb
+
+# Supabase / 云 Pooler（跨 region 部署）
+PG_TUNED_POOL_ACQUIRE_TIMEOUT=30s \
+PG_TUNED_POOL_MIN_CONNECTIONS=5 \
+./target/release/surreal-pg start --user root --pass secret \
+    --query-timeout 5m \
+    postgresql://user:pass@host.pooler.supabase.com:6543/postgres?sslmode=require&min_connections=5&connect_timeout=30
 ```
+
+### Supabase / 云 Pooler 场景配置指南
+
+Supabase Pooler（基于 PgBouncer/Supavisor）在 transaction 模式下，连接不是 1:1 映射到后端 PG 进程，而是通过池复用。跨 region 部署时（例如应用在亚洲、Supabase 在美东），新建连接的延迟可达 2-3 秒。这会导致以下连锁告警：
+
+```
+① query exceeded the timeout: 1m
+   → ② Timed out updating node registration after 60s
+      → ③ connection pool timeout
+```
+
+**根因**：连接池 `acquire_timeout`（默认 10s）在高并发下不够用，任务排队等不到连接，进而触发上层超时。节点注册的 60s 超时是 SurrealDB 硬编码的，不可配置，但如果连接池不超时，节点注册通常在毫秒级完成，远不会到 60s。
+
+#### 必须调整的参数
+
+| 参数 | 推荐值 | 原因 |
+|------|--------|------|
+| `PG_TUNED_POOL_ACQUIRE_TIMEOUT` | `30s` | 跨 region 连接建立慢（2-3s/连接），高并发时 10s 不够排队 |
+| `min_connections`（URL 或 `PG_TUNED_POOL_MIN_CONNECTIONS`） | `5` | 保持更多热连接，减少冷启动建连频率 |
+
+#### 建议调整的参数
+
+| 参数 | 推荐值 | 原因 |
+|------|--------|------|
+| `--query-timeout`（SurrealDB CLI） | `5m` | 节点注册和内部操作可能因连接池排队耗时较长，1m 可能不够 |
+| `connect_timeout`（URL 参数） | `30` | 与 acquire_timeout 对齐，避免 URL 层的连接超时先于池超时 |
+
+#### 完整启动命令
+
+```bash
+PG_TUNED_POOL_ACQUIRE_TIMEOUT=30s \
+PG_TUNED_POOL_MIN_CONNECTIONS=5 \
+./target/release/surreal-pg start \
+    --user root --pass secret \
+    --query-timeout 5m \
+    postgresql://user:pass@host.pooler.supabase.com:6543/postgres?sslmode=require&min_connections=5&connect_timeout=30
+```
+
+#### 超时层次对照表
+
+理解超时层次关系有助于排查问题：外层超时应 >= 内层超时之和，否则内层还未完成就被外层取消。
+
+| 层次 | 超时 | 默认值 | 可调？ | 说明 |
+|------|------|--------|--------|------|
+| 1. PG 服务器 | `statement_timeout` | 30s | `PG_TUNED_QUERY_STATEMENT_TIMEOUT` | 单条 SQL 执行上限 |
+| 2. PG 服务器 | `lock_timeout` | 10s | `PG_TUNED_QUERY_LOCK_TIMEOUT` | 等锁超时 |
+| 3. 连接池 | `acquire_timeout` | 10s | `PG_TUNED_POOL_ACQUIRE_TIMEOUT` | **推荐 30s** |
+| 4. SurrealDB | `query-timeout` | 无限制 | `--query-timeout` / `SURREAL_QUERY_TIMEOUT` | 查询总执行上限 |
+| 5. SurrealDB | 节点注册超时 | 60s | **不可配置** | 硬编码常量 |
+| 6. SurrealDB | 事务超时 | 无限制 | `--transaction-timeout` / `SURREAL_TRANSACTION_TIMEOUT` | 事务总执行上限 |
+
+推荐关系：`lock_timeout ≤ statement_timeout < acquire_timeout ≤ query-timeout`
 
 ---
 
