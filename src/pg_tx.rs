@@ -93,6 +93,17 @@ impl PgTx {
     }
 }
 
+// R2-L3: Manual Debug impl — PgTx contains Mutex and AtomicBool which
+// don't implement Debug. We provide a useful summary instead.
+impl fmt::Debug for PgTx {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PgTx")
+            .field("done", &self.done.load(Ordering::Relaxed))
+            .field("write", &self.write)
+            .finish_non_exhaustive()
+    }
+}
+
 impl fmt::Display for PgTx {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "PostgreSQL transaction")

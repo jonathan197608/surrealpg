@@ -503,6 +503,11 @@ fn env_duration(key: &str, default_secs: u64) -> Duration {
 }
 
 /// Parse a duration string: `500ms`, `10s`, `5m`, `2h`, or bare secs.
+///
+/// R2-M2: Validates that the prefix before the suffix is a valid integer.
+/// `strip_suffix('m')` alone would match `5km` or `5am`, leading to
+/// incorrect parsing. By checking `prefix.parse::<u64>()`, we ensure
+/// only pure-numeric prefixes are accepted.
 fn parse_duration(v: &str) -> Option<Duration> {
     let v = v.trim();
     if let Some(n) = v.strip_suffix("ms") {

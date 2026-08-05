@@ -95,7 +95,7 @@ fn strip_custom_params(url: &str) -> String {
     let Some(qmark) = url.find('?') else {
         return url.to_string();
     };
-    let base = &url[..=qmark]; // includes '?'
+    let base_before_qmark = &url[..qmark]; // excludes '?'
     let query = &url[qmark + 1..];
     let fragment_start = query.find('#');
     let (query_part, fragment) = match fragment_start {
@@ -112,10 +112,13 @@ fn strip_custom_params(url: &str) -> String {
         .collect::<Vec<_>>()
         .join("&");
 
+    // R2-H1: When all custom params are stripped and nothing remains,
+    // omit the trailing '?' — a bare '?' is semantically "empty query
+    // string" which some parsers treat differently from "no query string".
     if filtered.is_empty() {
-        format!("{base}{fragment}")
+        format!("{base_before_qmark}{fragment}")
     } else {
-        format!("{base}{filtered}{fragment}")
+        format!("{base_before_qmark}?{filtered}{fragment}")
     }
 }
 
@@ -622,9 +625,10 @@ mod test_strip {
 
     #[test]
     fn strip_all_custom() {
+        // R2-H1: When all custom params are stripped, no trailing '?' remains.
         assert_eq!(
             strip_custom_params("postgresql://u:p@h/db?min_connections=0&max_connections=20"),
-            "postgresql://u:p@h/db?"
+            "postgresql://u:p@h/db"
         );
     }
 
@@ -648,9 +652,10 @@ mod test_strip {
 
     #[test]
     fn with_fragment() {
+        // R2-H1: All custom params stripped → no trailing '?' before fragment.
         assert_eq!(
             strip_custom_params("postgresql://u:p@h/db?min_connections=0#frag"),
-            "postgresql://u:p@h/db?#frag"
+            "postgresql://u:p@h/db#frag"
         );
     }
 }
