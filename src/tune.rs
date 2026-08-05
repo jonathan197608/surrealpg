@@ -28,6 +28,20 @@ pub struct PgTuneConfig {
     pub pool_idle_timeout: Duration,
     pub pool_max_lifetime: Duration,
 
+    // ── TCP keepalive (3) ──
+    /// TCP keepalive idle time — seconds before the first keepalive probe.
+    /// Default 60s. Supabase Pooler typically drops idle connections after ~60s,
+    /// so we probe just before that to keep the connection alive.
+    pub keepalive_idle: Duration,
+    /// TCP keepalive interval — seconds between successive probes.
+    /// Default 10s. After the first probe, re-probe every 10s.
+    pub keepalive_interval: Duration,
+    /// TCP keepalive count — number of unacknowledged probes before the
+    /// connection is considered dead. Default 5. Combined with interval,
+    /// a dead connection is detected in idle + interval*count seconds
+    /// (e.g. 60 + 10*5 = 110s).
+    pub keepalive_count: u32,
+
     // ── KV table storage (4) ──
     pub fillfactor: i32,
     pub toast_storage: String,
@@ -66,6 +80,10 @@ impl Default for PgTuneConfig {
             pool_acquire_timeout: Duration::from_secs(10),
             pool_idle_timeout: Duration::from_secs(600),
             pool_max_lifetime: Duration::from_secs(1800),
+
+            keepalive_idle: Duration::from_secs(60),
+            keepalive_interval: Duration::from_secs(10),
+            keepalive_count: 5,
 
             fillfactor: 90,
             toast_storage: "external".to_string(),
@@ -157,6 +175,11 @@ impl PgTuneConfig {
             pool_acquire_timeout: env_duration("PG_TUNED_POOL_ACQUIRE_TIMEOUT", 10),
             pool_idle_timeout: env_duration("PG_TUNED_POOL_IDLE_TIMEOUT", 600),
             pool_max_lifetime: env_duration("PG_TUNED_POOL_MAX_LIFETIME", 1800),
+
+            // TCP keepalive
+            keepalive_idle: env_duration("PG_TUNED_KEEPALIVE_IDLE", 60),
+            keepalive_interval: env_duration("PG_TUNED_KEEPALIVE_INTERVAL", 10),
+            keepalive_count: env_u32("PG_TUNED_KEEPALIVE_COUNT", 5),
 
             // Table
             fillfactor,
@@ -540,6 +563,9 @@ mod tests {
         assert_eq!(c.fillfactor, 90);
         assert!(!c.use_unlogged);
         assert_eq!(c.statement_timeout, Duration::from_secs(30));
+        assert_eq!(c.keepalive_idle, Duration::from_secs(60));
+        assert_eq!(c.keepalive_interval, Duration::from_secs(10));
+        assert_eq!(c.keepalive_count, 5);
     }
 
     #[test]

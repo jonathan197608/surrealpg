@@ -206,6 +206,28 @@ impl PgStore {
 
         // ── Build session SQL for after_connect ──
         let session_sql: Arc<str> = tune.session_sql().into();
+        // ── TCP keepalive SQL ──
+        // Supabase Pooler / pgbouncer can silently reclaim idle connections
+        // on the server side. Without keepalive, sqlx doesn't know the
+        // connection is dead until it tries to use it (test_before_acquire
+        // ping). By setting aggressive TCP keepalive, the OS proactively
+        // detects dead connections, allowing sqlx's idle_timeout / max_lifetime
+        // to recycle them before they cause pool exhaustion.
+        //
+        // Default: idle=60s, interval=10s, count=5 → detects dead conn in ~110s.
+        // These are PG session parameters, so they work even behind poolers
+        // (each client connection gets its own backend process).
+        // Note: Supabase / some hosted PG may ignore tcp_keepalive settings,
+        // but setting them is harmless and helps with direct PG connections.
+        let keepalive_sql: Arc<str> = format!(
+            "SET tcp_keepalives_idle = {idle}; \
+             SET tcp_keepalives_interval = {interval}; \
+             SET tcp_keepalives_count = {count}",
+            idle = tune.keepalive_idle.as_secs(),
+            interval = tune.keepalive_interval.as_secs(),
+            count = tune.keepalive_count,
+        )
+        .into();
 
         let mut pool_opts = PgPoolOptions::new()
             .max_connections(pool_max)
@@ -221,9 +243,36 @@ impl PgStore {
         let pool = pool_opts
             .after_connect(move |conn, _meta| {
                 let sql = session_sql.clone(); // Arc clone — atomic refcount, no heap alloc
+                let ka = keepalive_sql.clone();
                 Box::pin(async move {
+                    // Apply TCP keepalive first — if this fails (e.g. hosted PG
+                    // doesn't support it), log a warning but don't fail the
+                    // connection. The session SET below may also set keepalive
+                    // params, but these explicit SETs give a more specific error.
+                    if let Err(e) = Executor::execute(&mut *conn, sqlx::raw_sql(&ka)).await {
+                        warn!(
+                            error = %e,
+                            "tcp_keepalive SET failed (non-fatal, may not be supported by this PG)"
+                        );
+                    }
                     Executor::execute(conn, sqlx::raw_sql(&sql)).await?;
                     Ok(())
+                })
+            })
+            .before_acquire(|conn, meta| {
+                // Conditional ping: only ping connections that have been idle
+                // longer than the keepalive idle threshold. This avoids the
+                // overhead of pinging recently-used connections (the common
+                // case) while still catching stale connections that survived
+                // the keepalive detection window.
+                //
+                // Returns Ok(true) = connection is usable, Ok(false) = discard
+                // and try another, Err = connection error.
+                Box::pin(async move {
+                    if meta.idle_for > std::time::Duration::from_secs(60) {
+                        sqlx::Connection::ping(conn).await?;
+                    }
+                    Ok(true)
                 })
             })
             .connect_with(opts)
@@ -394,17 +443,45 @@ impl PgStore {
                     // whether the pool is exhausted or depleted.
                     let (size, idle) = self.pool_size();
                     let active = self.tx_active.load(AtomicOrdering::Relaxed);
-                    warn!(
-                        attempt,
-                        max_retries = BEGIN_MAX_RETRIES,
-                        pool_size = size,
-                        pool_idle = idle,
-                        pool_max = self.pool_max,
-                        tx_active = active,
-                        write,
-                        error = %pg_err,
-                        "begin_with() failed — pool diagnostics logged"
-                    );
+
+                    // Detect the "zombie pool" pattern: all connections are
+                    // checked out from the pool (idle=0) but none are held
+                    // by our code (tx_active=0). This means sqlx internally
+                    // holds all connections — likely they are being rebuilt
+                    // after the server-side (Pooler) silently closed them.
+                    // Output actionable guidance to help the operator recover.
+                    if idle == 0 && active == 0 && size > 0 {
+                        warn!(
+                            attempt,
+                            max_retries = BEGIN_MAX_RETRIES,
+                            pool_size = size,
+                            pool_idle = idle,
+                            pool_max = self.pool_max,
+                            tx_active = active,
+                            write,
+                            error = %pg_err,
+                            "begin_with() failed — ZOMBIE POOL detected: \
+                             all {size} connections held by sqlx (not by our code). \
+                             Root cause: Pooler/server silently closed connections. \
+                             Recovery: set PG_TUNED_POOL_ACQUIRE_TIMEOUT=30s, \
+                             add ?min_connections=5 to URL, and reduce \
+                             PG_TUNED_POOL_IDLE_TIMEOUT to 300s to recycle \
+                             stale connections faster. Consider restarting the process \
+                             if the pool is completely stuck."
+                        );
+                    } else {
+                        warn!(
+                            attempt,
+                            max_retries = BEGIN_MAX_RETRIES,
+                            pool_size = size,
+                            pool_idle = idle,
+                            pool_max = self.pool_max,
+                            tx_active = active,
+                            write,
+                            error = %pg_err,
+                            "begin_with() failed — pool diagnostics logged"
+                        );
+                    }
 
                     // Only retry on pool timeout (transient); don't retry
                     // on other errors (e.g. PoolClosed, connection auth failure).
