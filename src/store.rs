@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use sqlx::Executor;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::config::{PersistentStatements, PgConfig};
 use crate::error::{PgStoreError, Result};
@@ -43,7 +43,12 @@ pub struct PgStore {
     /// Pre-built BEGIN SQL (isolation level fixed at construction).
     /// Used for both read and write transactions — all SurrealDB transactions
     /// use the same BEGIN since read-only enforcement is handled at the
-    /// application layer via `check_writable()`.
+    /// application layer via `check_writable()`. Passed to sqlx's
+    /// `pool.begin_with()` which manages the transaction lifecycle
+    /// (including automatic ROLLBACK on Drop), eliminating the
+    /// "there is already a transaction in progress" WARNING that
+    /// occurred with raw `execute("BEGIN …")` + manual `PoolConnection`
+    /// management.
     begin_sql: Arc<str>,
     /// Pre-built VACUUM SQL string. VACUUM doesn't support parameterised
     /// binding (PG limitation), but `table_name` is validated by
@@ -231,8 +236,15 @@ impl PgStore {
 
     /// Begin a new transaction.
     ///
-    /// Both read and write transactions use the same `BEGIN ISOLATION LEVEL`
-    /// SQL. Read-only enforcement is handled at the application layer via
+    /// Uses sqlx's `pool.begin_with()` to start a transaction with the
+    /// configured isolation level. sqlx manages the full transaction
+    /// lifecycle: `Transaction::drop` automatically queues a ROLLBACK
+    /// (via `start_rollback`) for any uncommitted transaction, preventing
+    /// the "there is already a transaction in progress" WARNING that
+    /// occurred when `PoolConnection` was returned to the pool with an
+    /// active transaction.
+    ///
+    /// Read-only enforcement is handled at the application layer via
     /// `check_writable()` — SurrealDB's `Transactable` trait distinguishes
     /// read/write transactions, and our write methods reject writes on
     /// non-writable transactions. This avoids PG's hard `READ ONLY` constraint
@@ -246,65 +258,22 @@ impl PgStore {
             return Err(PgStoreError::TxCancelled);
         }
 
-        let mut conn = self
+        // Use sqlx's Transaction API: begin_with() executes the custom
+        // BEGIN SQL (with isolation level), increments sqlx's internal
+        // transaction_depth counter, and returns a Transaction that
+        // auto-rollbacks on Drop. This eliminates the need for manual
+        // 25P02 (in_failed_sql_transaction) error recovery.
+        let tx = self
             .pool
-            .acquire()
+            .begin_with(String::from(&*self.begin_sql))
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
-
-        // BEGIN SQL is pre-built at construction time (immutable config).
-        // Zero allocation on the hot path.
-        let begin_sql: &str = &self.begin_sql;
-
-        // Attempt BEGIN directly. On the normal path (no leaked transaction),
-        // this saves a network round-trip compared to always doing ROLLBACK first.
-        //
-        // Recovery: if BEGIN fails with 25P02 (in_failed_sql_transaction), the
-        // connection has a leaked failed transaction — we ROLLBACK and retry.
-        //
-        // Note: 25P01 (no_active_sql_transaction) is intentionally NOT checked
-        // because BEGIN never produces it — BEGIN's purpose is to *start* a
-        // transaction. A non-failed leaked active transaction would only
-        // produce a WARNING (not an error), so it cannot be detected here;
-        // that is a known limitation of the optimistic approach. The Drop
-        // impl for PgTransaction logs at debug level when a transaction is
-        // dropped without explicit commit/cancel, and PG auto-rollbacks the
-        // transaction when the connection is returned to the pool.
-        let result = Executor::execute(&mut *conn, sqlx::raw_sql(begin_sql)).await;
-        match result {
-            Ok(_) => {}
-            Err(e) => {
-                // Use SQLSTATE codes instead of string matching for
-                // cross-version reliability.
-                // 25P02 = in_failed_sql_transaction
-                let is_failed_tx = matches!(&e, sqlx::Error::Database(db)
-                    if matches!(db.code().as_deref(), Some("25P02")));
-                if is_failed_tx {
-                    // Leaked transaction detected — clean up and retry.
-                    //
-                    // P3: No need to re-execute session SET statements after ROLLBACK.
-                    // PostgreSQL session-level SET (e.g. work_mem, timezone) persists
-                    // across ROLLBACK — only transaction-local SET LOCAL is undone.
-                    // Our after_connect hook uses SET (not SET LOCAL), so the settings
-                    // survive the ROLLBACK and the subsequent BEGIN.
-                    let _ = Executor::execute(&mut *conn, sqlx::raw_sql("ROLLBACK"))
-                        .await
-                        .inspect_err(|e| debug!("ROLLBACK of leaked transaction failed: {e}"));
-                    Executor::execute(&mut *conn, sqlx::raw_sql(begin_sql))
-                        .await
-                        .map_err(|e2| PgStoreError::from_sqlx(None, &e2))?;
-                    debug!("cleaned up leaked transaction from pool connection");
-                } else {
-                    return Err(PgStoreError::from_sqlx(None, &e));
-                }
-            }
-        }
 
         // F8: Increment started-transaction counter.
         self.tx_started.fetch_add(1, AtomicOrdering::Relaxed);
 
         Ok(PgTransaction::new_with_sql(
-            conn,
+            tx,
             write,
             self.config.isolation_level,
             self.persistent,

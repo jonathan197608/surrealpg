@@ -7,6 +7,7 @@ use std::ops::DerefMut;
 use std::ops::Range;
 use std::sync::Arc;
 
+use sqlx::Transaction;
 use sqlx::{Executor, Row};
 use tracing::{debug, trace, warn};
 
@@ -136,8 +137,14 @@ impl Sql {
 /// All SQL strings are pre-built at construction time to eliminate per-operation
 /// `format!()` heap allocations on the hot path.
 pub struct PgTransaction {
-    /// The dedicated PG connection (returned to pool on drop)
-    conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+    /// The sqlx-managed PG transaction (auto-rollbacks on Drop).
+    ///
+    /// Using sqlx's `Transaction` API instead of raw `execute("BEGIN")` +
+    /// `PoolConnection` ensures that `transaction_depth` is correctly
+    /// maintained and `Transaction::drop` automatically queues a ROLLBACK
+    /// for any uncommitted transaction, preventing the "there is already
+    /// a transaction in progress" WARNING when connections return to the pool.
+    conn: Option<Transaction<'static, sqlx::Postgres>>,
     /// Whether this is a write transaction
     writeable: bool,
     /// Whether the transaction has been closed
@@ -161,13 +168,14 @@ pub struct PgTransaction {
 }
 
 impl PgTransaction {
-    /// Create a new transaction wrapping an acquired PG connection.
+    /// Create a new transaction wrapping a sqlx `Transaction`.
     ///
-    /// The caller must have already executed `BEGIN` on the connection.
-    /// SQL strings are provided as a pre-built `Arc<Sql>`, shared from
-    /// `PgStore` to avoid per-transaction `format!()` allocations.
+    /// The caller must have already started the transaction via
+    /// `pool.begin_with()`. SQL strings are provided as a pre-built
+    /// `Arc<Sql>`, shared from `PgStore` to avoid per-transaction
+    /// `format!()` allocations.
     pub(crate) fn new_with_sql(
-        conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
+        conn: Transaction<'static, sqlx::Postgres>,
         writeable: bool,
         isolation: PgIsolation,
         persistent: bool,
@@ -190,15 +198,15 @@ impl PgTransaction {
     /// Get a mutable reference to the inner `PgConnection`.
     ///
     /// **Note**: This method borrows `&mut self` and is only used by
-    /// non-KV methods (commit/cancel/savepoint). All KV operation methods
+    /// non-KV methods (savepoint operations). All KV operation methods
     /// use inline destructured borrows instead to avoid conflicts with
     /// `&self.sql` references.
     fn conn_mut(&mut self) -> Result<&mut sqlx::postgres::PgConnection> {
         if self.closed {
             return Err(PgStoreError::TxClosed);
         }
-        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
-        Ok(conn.deref_mut())
+        let tx = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        Ok(tx.deref_mut())
     }
 
     fn check_writable(&self) -> Result<()> {
@@ -208,14 +216,8 @@ impl PgTransaction {
         Ok(())
     }
 
-    /// Release the connection back to the pool (after commit/rollback).
-    fn close(&mut self) {
-        self.closed = true;
-        self.savepoints.clear();
-        let _ = self.conn.take();
-    }
-
     /// Execute a parameterless SQL statement via simple query protocol.
+    /// Used by savepoint operations only (commit/cancel go through sqlx API).
     async fn execute_simple(&mut self, sql: &str, key_for_err: Option<&[u8]>) -> Result<()> {
         let conn = self.conn_mut()?;
         Executor::execute(conn, sqlx::raw_sql(sql))
@@ -325,29 +327,47 @@ impl PgTransaction {
 
     /// Commit the transaction.
     ///
-    /// On success, the connection is released back to the pool.
-    /// On error (e.g. serialization conflict), the connection is still
-    /// released — PG auto-rollbacks on connection drop. The transaction
-    /// is marked closed regardless of outcome to prevent further operations.
+    /// Uses sqlx's `Transaction::commit()` which sends `COMMIT` to PG
+    /// and releases the connection back to the pool. On error (e.g.
+    /// serialization conflict), the connection is still released — PG
+    /// auto-rollbacks. The transaction is marked closed regardless of
+    /// outcome to prevent further operations.
     pub async fn commit(&mut self) -> Result<()> {
-        let result = self.execute_simple("COMMIT", None).await;
-        self.close(); // Always close — even on error, connection goes back to pool
-        result?;
+        if self.closed {
+            return Ok(());
+        }
+        // Take ownership of the Transaction — sqlx's commit() consumes self.
+        // On success, PG commits. On error, PG auto-rollbacks.
+        let tx = self.conn.take().ok_or(PgStoreError::TxClosed)?;
+        self.closed = true;
+        self.savepoints.clear();
+        let result = tx.commit().await;
+        if let Err(e) = &result {
+            debug!("COMMIT failed (PG will auto-rollback): {e}");
+        }
+        result.map_err(|e| PgStoreError::from_sqlx(None, &e))?;
         debug!("transaction committed");
         Ok(())
     }
 
     /// Rollback (cancel) the transaction.
     ///
-    /// On success, the connection is released back to the pool.
-    /// On error, the connection is still released via `close()`.
+    /// Uses sqlx's `Transaction::rollback()` which sends `ROLLBACK` to PG
+    /// and releases the connection back to the pool. On error, the
+    /// connection is still released via sqlx's Drop handling.
     pub async fn cancel(&mut self) -> Result<()> {
         if self.closed {
             return Ok(());
         }
-        let result = self.execute_simple("ROLLBACK", None).await;
-        self.close(); // Always close — release connection even on error
-        result?;
+        // Take ownership of the Transaction — sqlx's rollback() consumes self.
+        let tx = self.conn.take().ok_or(PgStoreError::TxClosed)?;
+        self.closed = true;
+        self.savepoints.clear();
+        let result = tx.rollback().await;
+        if let Err(e) = &result {
+            debug!("ROLLBACK failed: {e}");
+        }
+        result.map_err(|e| PgStoreError::from_sqlx(None, &e))?;
         debug!("transaction rolled back");
         Ok(())
     }
@@ -894,14 +914,19 @@ impl Drop for PgTransaction {
     fn drop(&mut self) {
         // SurrealDB's engine routinely drops transactions without calling
         // commit()/cancel() — this is by design for internal housekeeping
-        // paths (node registration, cluster events, etc.). PG will
-        // auto-rollback the transaction when the PoolConnection is returned
-        // to the pool, so there is no data integrity concern. The optimistic
-        // begin() path detects leaked failed transactions (25P02 error) and
-        // recovers via ROLLBACK + retry on the next use.
+        // paths (node registration, cluster events, etc.).
+        //
+        // sqlx's `Transaction::drop` automatically calls `start_rollback`,
+        // which synchronously queues a ROLLBACK command into the connection's
+        // write buffer (without flushing). The ROLLBACK is executed when the
+        // connection is next used or returned to the pool (via `ping()`).
+        // This ensures the connection always returns to the pool in Idle
+        // state, preventing the "there is already a transaction in progress"
+        // WARNING on the next `begin()` call.
+        //
         // Logged at debug level to avoid log spam.
         if !self.closed {
-            debug!("PgTransaction dropped without explicit commit/cancel; PG will auto-rollback");
+            debug!("PgTransaction dropped without explicit commit/cancel; sqlx will auto-rollback");
         }
     }
 }
