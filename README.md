@@ -3,17 +3,17 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: '5444da46-7218-44c3-9eb3-71a9dd2e82d0'
-  PropagateID: '5444da46-7218-44c3-9eb3-71a9dd2e82d0'
-  ReservedCode1: '0f6fd16d-6060-441f-ad7d-9da9753302fb'
-  ReservedCode2: '0f6fd16d-6060-441f-ad7d-9da9753302fb'
+  ProduceID: 'f4f88452-4ce1-48c1-9b6e-7a9c259e651e'
+  PropagateID: 'f4f88452-4ce1-48c1-9b6e-7a9c259e651e'
+  ReservedCode1: 'b58e546d-9607-42ee-9ed2-0329caad5678'
+  ReservedCode2: 'b58e546d-9607-42ee-9ed2-0329caad5678'
 ---
 
 # surreal-pg
 
 **SurrealDB PostgreSQL 存储适配器** — 以 PostgreSQL 为底层存储引擎运行完整的 SurrealDB 服务器。
 
-基于 SurrealDB 官方可插拔存储架构，通过委托模式包装 `CommunityComposer`，拦截 `postgresql://` 连接路径，将 SurrealDB 的 KV 操作映射到 PostgreSQL 的 B-tree + MVCC 之上。开箱即用 SurrealDB 全部能力：SurrealQL、GraphQL、HTTP、WebSocket、多模型（文档/图/向量/关系/时序）、权限系统。
+基于 SurrealDB 官方可插拔存储架构，通过委托模式包装 `CommunityComposer`，拦截 `postgresql://` 连接路径，将 SurrealDB 的 KV 操作映射到 PostgreSQL 的 B-tree + MVCC 之上。开箱即用 SurrealDB 全部能力：SurrealQL、ISO GQL（实验性）、GraphQL、HTTP、WebSocket、多模型（文档/图/向量/关系/时序）、权限系统。
 
 ## 目录
 
@@ -49,7 +49,7 @@ SurrealDB 的事务语义 1:1 映射到 PostgreSQL 的 `BEGIN` / `COMMIT` / `ROL
 
 ### 开箱即用的全栈能力
 
-拿到的是完整的 SurrealDB 服务器——SurrealQL 查询引擎、GraphQL 自动生成、HTTP/WebSocket API、多模型支持（文档/图/向量/关系/时序）、权限系统、事件触发器——只是底层存储换成了 PostgreSQL。
+拿到的是完整的 SurrealDB 服务器——SurrealQL 查询引擎、GraphQL 自动生成（需 `DEFINE CONFIG GRAPHQL AUTO`）、ISO GQL 图模式查询（实验性，需 `--allow-experimental gql`）、HTTP/WebSocket API、多模型支持（文档/图/向量/关系/时序）、权限系统、事件触发器——只是底层存储换成了 PostgreSQL。
 
 ### Pooler 自动适配
 
@@ -204,13 +204,16 @@ cargo build --release
 
 ### 使用 GraphQL
 
-```bash
-# 启用实验性 GraphQL
-SURREAL_CAPS_ALLOW_EXPERIMENTAL=graphql \
-./target/release/surreal-pg start --user root --pass secret \
-    postgresql://user:pass@localhost:5432/surrealdb
+GraphQL 已内置，无需 experimental flag。通过 `DEFINE CONFIG GRAPHQL AUTO` 启用后即可查询：
 
+```bash
 # 在 SurrealQL 中定义 schema 并开启 GraphQL
+./target/release/surreal-pg sql -u root -p secret --namespace myapp --database myapp
+
+> DEFINE TABLE person SCHEMAFULL;
+> DEFINE FIELD name ON TABLE person TYPE string;
+> DEFINE FIELD age ON TABLE person TYPE int;
+> CREATE person SET name = 'Alice', age = 30;
 > DEFINE CONFIG GRAPHQL AUTO;
 
 # 通过 GraphQL 查询
@@ -219,6 +222,24 @@ curl -X POST -u "root:secret" \
   -H "Content-Type: application/json" \
   -d '{"query": "{ person { id name age } }"}' \
   http://localhost:8000/graphql
+```
+
+### 使用 ISO GQL（实验性）
+
+ISO GQL 是图模式查询语言（`MATCH … RETURN`），需要 `--allow-experimental gql` 启用：
+
+```bash
+# 启动时启用 ISO GQL 实验
+./target/release/surreal-pg start --allow-experimental gql \
+    --user root --pass secret \
+    postgresql://user:pass@localhost:5432/surrealdb
+
+# 通过 GQL 查询
+curl -X POST -u "root:secret" \
+  -H "Surreal-NS: myapp" -H "Surreal-DB: myapp" \
+  -H "Content-Type: text/plain" \
+  -d 'MATCH (n:person) RETURN n.name AS name ORDER BY name' \
+  http://localhost:8000/gql
 ```
 
 ---
