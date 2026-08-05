@@ -80,6 +80,7 @@ const CUSTOM_PARAMS: &[&str] = &[
     "persistent_statements",
     "connect_timeout",
     "idle_timeout",
+    "slow_acquire_threshold_secs",
 ];
 
 /// Strip our custom query parameters from a PostgreSQL URL so that sqlx's
@@ -149,6 +150,7 @@ impl PgStore {
         let acquire_timeout = config.connect_timeout.unwrap_or(tune.pool_acquire_timeout);
         let idle_timeout = config.idle_timeout.or(Some(tune.pool_idle_timeout));
         let max_lifetime = config.max_lifetime.or(Some(tune.pool_max_lifetime));
+        let slow_acquire = config.slow_acquire_threshold_secs;
         // Pre-build the VACUUM SQL — table_name is validated by validate_identifier.
         let vacuum_sql: Arc<str> = format!("VACUUM ANALYZE {}", config.table_name).into();
 
@@ -169,12 +171,18 @@ impl PgStore {
         // ── Build session SQL for after_connect ──
         let session_sql: Arc<str> = tune.session_sql().into();
 
-        let pool = PgPoolOptions::new()
+        let mut pool_opts = PgPoolOptions::new()
             .max_connections(pool_max)
             .min_connections(pool_min)
             .acquire_timeout(acquire_timeout)
             .idle_timeout(idle_timeout)
-            .max_lifetime(max_lifetime)
+            .max_lifetime(max_lifetime);
+
+        if let Some(threshold) = slow_acquire {
+            pool_opts = pool_opts.acquire_slow_threshold(threshold);
+        }
+
+        let pool = pool_opts
             .after_connect(move |conn, _meta| {
                 let sql = session_sql.clone(); // Arc clone — atomic refcount, no heap alloc
                 Box::pin(async move {
@@ -188,8 +196,8 @@ impl PgStore {
 
         info!(
             "connection pool created: max={}, min={}, acquire_timeout={:?}, \
-             idle_timeout={:?}, max_lifetime={:?}",
-            pool_max, pool_min, acquire_timeout, idle_timeout, max_lifetime
+             idle_timeout={:?}, max_lifetime={:?}, slow_acquire_threshold={:?}",
+            pool_max, pool_min, acquire_timeout, idle_timeout, max_lifetime, slow_acquire
         );
 
         // ── DDL: create table + table tuning ──

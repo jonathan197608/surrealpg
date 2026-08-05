@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: '995288f3-a2a9-4ee2-b6b2-b138d47cef64'
-  PropagateID: '995288f3-a2a9-4ee2-b6b2-b138d47cef64'
-  ReservedCode1: '2e47857e-5728-426d-b87a-c379ec836f7e'
-  ReservedCode2: '2e47857e-5728-426d-b87a-c379ec836f7e'
+  ProduceID: 'cc8a0b7c-1b11-466c-8bd9-aa03301df5ba'
+  PropagateID: 'cc8a0b7c-1b11-466c-8bd9-aa03301df5ba'
+  ReservedCode1: 'e0f49728-e11a-48f7-be9c-57a57b2e12a3'
+  ReservedCode2: 'e0f49728-e11a-48f7-be9c-57a57b2e12a3'
 ---
 
 # surreal-pg
@@ -272,6 +272,7 @@ curl -X POST -u "root:secret" \
 | `connect_timeout` | 10（秒） | 获取连接超时 |
 | `idle_timeout` | 600（秒） | 空闲连接回收时间 |
 | `max_lifetime` | 1800（秒） | 连接最大生存时间 |
+| `slow_acquire_threshold_secs` | 2（秒） | 获取连接耗时超过此值时输出 WARN 日志（sqlx 默认 2s） |
 | `auto_create_table` | true | 启动时自动建表 + 表调优 |
 | `table_name` | `kv` | 表名（需符合 PG 标识符规则，拒绝 SQL 保留字） |
 | `isolation_level` | `read_committed` | 事务隔离级别（`read_committed` / `repeatable_read` / `serializable`） |

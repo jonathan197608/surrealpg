@@ -69,6 +69,8 @@ pub struct PgConfig {
     pub idle_timeout: Option<Duration>,
     /// Maximum connection lifetime (None = defer to PgTuneConfig)
     pub max_lifetime: Option<Duration>,
+    /// Slow-acquire warning threshold (None = defer to sqlx default 2s)
+    pub slow_acquire_threshold_secs: Option<Duration>,
     /// Automatically create the table on startup
     pub auto_create_table: bool,
     /// Table name (default `kv`; use `kv_test` for tests)
@@ -164,6 +166,7 @@ impl Default for PgConfig {
             connect_timeout: None,
             idle_timeout: None,
             max_lifetime: None,
+            slow_acquire_threshold_secs: None,
             auto_create_table: true,
             table_name: "kv".to_string(),
             isolation_level: PgIsolation::default(),
@@ -373,6 +376,7 @@ impl PgConfig {
                 "persistent_statements",
                 "connect_timeout",
                 "idle_timeout",
+                "slow_acquire_threshold_secs",
             ];
             for pair in query.split('&') {
                 if let Some((key, value)) = pair.split_once('=') {
@@ -462,6 +466,14 @@ impl PgConfig {
                             Ok(secs) => self.idle_timeout = Some(Duration::from_secs(secs)),
                             Err(_) => tracing::warn!(
                                 "idle_timeout='{value}' is not a valid number, ignoring"
+                            ),
+                        },
+                        "slow_acquire_threshold_secs" => match value.parse::<u64>() {
+                            Ok(secs) => {
+                                self.slow_acquire_threshold_secs = Some(Duration::from_secs(secs))
+                            }
+                            Err(_) => tracing::warn!(
+                                "slow_acquire_threshold_secs='{value}' is not a valid number, ignoring"
                             ),
                         },
                         _ => {}

@@ -5,3 +5,5 @@ DEFINE FIELD age ON TABLE person TYPE int;
 CREATE person SET name = 'Alice', age = 30;
 SELECT * FROM person WHERE name = 'Alice';
 DEFINE CONFIG GRAPHQL AUTO;
+DEFINE TABLE person SCHEMAFULL;
+DEFINE FIELD name ON TABLE person TYPE string;
