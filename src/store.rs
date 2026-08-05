@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
+use sqlx::ConnectOptions;
 use sqlx::Executor;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use tracing::{info, warn};
@@ -81,6 +82,7 @@ const CUSTOM_PARAMS: &[&str] = &[
     "connect_timeout",
     "idle_timeout",
     "slow_acquire_threshold_secs",
+    "slow_statements_threshold_secs",
 ];
 
 /// Strip our custom query parameters from a PostgreSQL URL so that sqlx's
@@ -150,7 +152,6 @@ impl PgStore {
         let acquire_timeout = config.connect_timeout.unwrap_or(tune.pool_acquire_timeout);
         let idle_timeout = config.idle_timeout.or(Some(tune.pool_idle_timeout));
         let max_lifetime = config.max_lifetime.or(Some(tune.pool_max_lifetime));
-        let slow_acquire = config.slow_acquire_threshold_secs;
         // Pre-build the VACUUM SQL — table_name is validated by validate_identifier.
         let vacuum_sql: Arc<str> = format!("VACUUM ANALYZE {}", config.table_name).into();
 
@@ -164,9 +165,16 @@ impl PgStore {
         // F5: Guard against zero max_connections — sqlx panics with pool_max=0.
         assert!(pool_max > 0, "max_connections must be > 0, got {pool_max}");
 
-        let opts: PgConnectOptions = strip_custom_params(url)
+        let slow_acquire = config.slow_acquire_threshold_secs;
+        let slow_stmts = config.slow_statements_threshold_secs;
+
+        let mut opts: PgConnectOptions = strip_custom_params(url)
             .parse()
             .map_err(|e: sqlx::Error| PgStoreError::Postgres(format!("invalid URL: {e}")))?;
+
+        if let Some(threshold) = slow_stmts {
+            opts = opts.log_slow_statements(tracing::log::LevelFilter::Warn, threshold);
+        }
 
         // ── Build session SQL for after_connect ──
         let session_sql: Arc<str> = tune.session_sql().into();

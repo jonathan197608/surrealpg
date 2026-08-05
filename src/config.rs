@@ -71,6 +71,8 @@ pub struct PgConfig {
     pub max_lifetime: Option<Duration>,
     /// Slow-acquire warning threshold (None = defer to sqlx default 2s)
     pub slow_acquire_threshold_secs: Option<Duration>,
+    /// Slow-statement warning threshold (None = defer to sqlx default 1s)
+    pub slow_statements_threshold_secs: Option<Duration>,
     /// Automatically create the table on startup
     pub auto_create_table: bool,
     /// Table name (default `kv`; use `kv_test` for tests)
@@ -167,6 +169,7 @@ impl Default for PgConfig {
             idle_timeout: None,
             max_lifetime: None,
             slow_acquire_threshold_secs: None,
+            slow_statements_threshold_secs: None,
             auto_create_table: true,
             table_name: "kv".to_string(),
             isolation_level: PgIsolation::default(),
@@ -474,6 +477,15 @@ impl PgConfig {
                             }
                             Err(_) => tracing::warn!(
                                 "slow_acquire_threshold_secs='{value}' is not a valid number, ignoring"
+                            ),
+                        },
+                        "slow_statements_threshold_secs" => match value.parse::<u64>() {
+                            Ok(secs) => {
+                                self.slow_statements_threshold_secs =
+                                    Some(Duration::from_secs(secs))
+                            }
+                            Err(_) => tracing::warn!(
+                                "slow_statements_threshold_secs='{value}' is not a valid number, ignoring"
                             ),
                         },
                         _ => {}
