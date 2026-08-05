@@ -75,8 +75,6 @@ pub struct PgConfig {
     pub table_name: String,
     /// Default transaction isolation level
     pub isolation_level: PgIsolation,
-    /// Use `BEGIN READ ONLY` for read-only transactions
-    pub read_only_optimization: bool,
     /// Persistent prepared statement policy (default: auto-detect pgbouncer)
     pub persistent_statements: PersistentStatements,
 }
@@ -169,7 +167,6 @@ impl Default for PgConfig {
             auto_create_table: true,
             table_name: "kv".to_string(),
             isolation_level: PgIsolation::default(),
-            read_only_optimization: false,
             persistent_statements: PersistentStatements::Auto,
         }
     }
@@ -356,7 +353,7 @@ impl PgConfig {
     /// `connect_timeout` (seconds), `idle_timeout` (seconds),
     /// `max_lifetime` (seconds), `auto_create_table` (bool),
     /// `table_name` (identifier), `isolation_level`,
-    /// `read_only_optimization` (bool), `persistent_statements`.
+    /// `persistent_statements`.
     ///
     /// Returns `Err` if the `table_name` parameter contains invalid characters,
     /// allowing the caller to fail gracefully instead of panicking.
@@ -376,7 +373,6 @@ impl PgConfig {
                 "persistent_statements",
                 "connect_timeout",
                 "idle_timeout",
-                "read_only_optimization",
             ];
             for pair in query.split('&') {
                 if let Some((key, value)) = pair.split_once('=') {
@@ -466,12 +462,6 @@ impl PgConfig {
                             Ok(secs) => self.idle_timeout = Some(Duration::from_secs(secs)),
                             Err(_) => tracing::warn!(
                                 "idle_timeout='{value}' is not a valid number, ignoring"
-                            ),
-                        },
-                        "read_only_optimization" => match value.parse::<bool>() {
-                            Ok(v) => self.read_only_optimization = v,
-                            Err(_) => tracing::warn!(
-                                "read_only_optimization='{value}' is not a valid bool, ignoring"
                             ),
                         },
                         _ => {}

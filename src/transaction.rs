@@ -896,8 +896,9 @@ impl Drop for PgTransaction {
         // commit()/cancel() — this is by design for internal housekeeping
         // paths (node registration, cluster events, etc.). PG will
         // auto-rollback the transaction when the PoolConnection is returned
-        // to the pool, so there is no data integrity concern. The unconditional
-        // ROLLBACK in begin() also cleans up any leaked state on the next use.
+        // to the pool, so there is no data integrity concern. The optimistic
+        // begin() path detects leaked failed transactions (25P02 error) and
+        // recovers via ROLLBACK + retry on the next use.
         // Logged at debug level to avoid log spam.
         if !self.closed {
             debug!("PgTransaction dropped without explicit commit/cancel; PG will auto-rollback");

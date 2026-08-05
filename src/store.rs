@@ -40,10 +40,11 @@ pub struct PgStore {
     /// Maximum pool connections (from config), used by metrics reporting.
     /// sqlx 0.8 `PgPool` doesn't expose `max_connections()`, so we store it.
     pool_max: u32,
-    /// Pre-built BEGIN SQL for write transactions (isolation level fixed at construction).
-    begin_write_sql: Arc<str>,
-    /// Pre-built BEGIN SQL for read transactions (isolation level + optional READ ONLY).
-    begin_read_sql: Arc<str>,
+    /// Pre-built BEGIN SQL (isolation level fixed at construction).
+    /// Used for both read and write transactions — all SurrealDB transactions
+    /// use the same BEGIN since read-only enforcement is handled at the
+    /// application layer via `check_writable()`.
+    begin_sql: Arc<str>,
     /// Pre-built VACUUM SQL string. VACUUM doesn't support parameterised
     /// binding (PG limitation), but `table_name` is validated by
     /// `validate_identifier`, so this is safe.
@@ -102,12 +103,10 @@ impl PgStore {
 
         let sql: Arc<Sql> = Arc::new(Sql::new(&config.table_name));
 
-        // Pre-build BEGIN SQL — isolation_level and read_only_optimization are
-        // immutable after construction, so we build both variants once here
-        // and avoid a format!() allocation on every begin() call.
-        let begin_write_sql: Arc<str> =
+        // Pre-build BEGIN SQL — isolation_level is immutable after construction,
+        // so we build it once here and avoid a format!() allocation on every begin() call.
+        let begin_sql: Arc<str> =
             format!("BEGIN ISOLATION LEVEL {}", config.isolation_level.as_sql()).into();
-        // begin_read_sql is built after persistent resolution (see F3 below).
 
         // F5: Guard against zero max_connections — sqlx panics with pool_max=0.
         assert!(pool_max > 0, "max_connections must be > 0, got {pool_max}");
@@ -202,40 +201,6 @@ impl PgStore {
             }
         };
 
-        // F3: pgbouncer transaction mode does not support BEGIN READ ONLY —
-        // the pooler routes each statement to an arbitrary backend, and
-        // READ ONLY is a transaction property that must persist across all
-        // statements. When persistent=false (pgbouncer detected), disable
-        // read_only_optimization to avoid runtime errors.
-        //
-        // Additionally, read_only_optimization defaults to false because
-        // SurrealDB's engine sometimes issues write operations (e.g. node
-        // registration, event processing) inside transactions it requested
-        // as read-only. PG's READ ONLY is a hard constraint (unlike RocksDB
-        // backends that tolerate incidental writes), which would cause
-        // 25006 errors.
-        let read_only_optimization = if !persistent {
-            info!(
-                "pgbouncer/pooler detected: disabling read_only_optimization \
-                 (BEGIN READ ONLY is unsupported in transaction-pooling mode)"
-            );
-            false
-        } else {
-            config.read_only_optimization
-        };
-        let begin_read_sql: Arc<str> = if read_only_optimization {
-            format!(
-                "BEGIN ISOLATION LEVEL {} READ ONLY",
-                config.isolation_level.as_sql()
-            )
-            .into()
-        } else {
-            // Without READ ONLY, read and write transactions use the same
-            // BEGIN SQL (same isolation level). Share the Arc to avoid
-            // storing the same string twice.
-            Arc::clone(&begin_write_sql)
-        };
-
         info!(
             max_conn = pool_max,
             min_conn = pool_min,
@@ -252,8 +217,7 @@ impl PgStore {
             persistent,
             canceller,
             pool_max,
-            begin_write_sql,
-            begin_read_sql,
+            begin_sql,
             vacuum_sql,
             sql,
             // F8: Initialize transaction metric counters.
@@ -267,9 +231,14 @@ impl PgStore {
 
     /// Begin a new transaction.
     ///
-    /// If `write` is true, starts a read-write transaction with the configured
-    /// isolation level. If `write` is false, starts a read-only transaction
-    /// (or a regular transaction if `read_only_optimization` is disabled).
+    /// Both read and write transactions use the same `BEGIN ISOLATION LEVEL`
+    /// SQL. Read-only enforcement is handled at the application layer via
+    /// `check_writable()` — SurrealDB's `Transactable` trait distinguishes
+    /// read/write transactions, and our write methods reject writes on
+    /// non-writable transactions. This avoids PG's hard `READ ONLY` constraint
+    /// which conflicts with SurrealDB's internal write operations (node
+    /// registration, event processing) that may occur inside transactions
+    /// requested as read-only.
     pub async fn begin(&self, write: bool) -> Result<PgTransaction> {
         // Check cancellation before acquiring a connection from the pool.
         // This prevents new transactions from starting during shutdown.
@@ -285,36 +254,51 @@ impl PgStore {
 
         // BEGIN SQL is pre-built at construction time (immutable config).
         // Zero allocation on the hot path.
-        let begin_sql = if write {
-            &*self.begin_write_sql
-        } else {
-            &*self.begin_read_sql
-        };
+        let begin_sql: &str = &self.begin_sql;
 
-        // Clean up any leaked transaction state before opening a new one.
+        // Attempt BEGIN directly. On the normal path (no leaked transaction),
+        // this saves a network round-trip compared to always doing ROLLBACK first.
         //
-        // SurrealDB's engine does not always call commit()/cancel() before
-        // dropping a PgTx — e.g. internal housekeeping transactions (node
-        // registration, cluster events) may be silently dropped. When this
-        // happens, the underlying PoolConnection is returned to the pool
-        // with an active PG transaction still open. The next begin() would
-        // execute BEGIN on top of that, producing PG WARNING "there is
-        // already a transaction in progress" (sqlx escalates PG NOTICE to
-        // WARN log level).
+        // Recovery: if BEGIN fails with 25P02 (in_failed_sql_transaction), the
+        // connection has a leaked failed transaction — we ROLLBACK and retry.
         //
-        // To guarantee a clean connection, we unconditionally send ROLLBACK
-        // before BEGIN. If no transaction is active, ROLLBACK is a no-op
-        // (PG emits a WARNING notice which sqlx logs at debug level, not an
-        // error). The cost is one extra network round-trip per begin(),
-        // which is negligible compared to the cost of acquiring a connection
-        // from the pool.
-        let _ = Executor::execute(&mut *conn, sqlx::raw_sql("ROLLBACK"))
-            .await
-            .inspect_err(|e| debug!("pre-BEGIN ROLLBACK failed (may be harmless if no tx active): {e}"));
-
-        Executor::execute(&mut *conn, sqlx::raw_sql(begin_sql))
-            .await
-            .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
+        // Note: 25P01 (no_active_sql_transaction) is intentionally NOT checked
+        // because BEGIN never produces it — BEGIN's purpose is to *start* a
+        // transaction. A non-failed leaked active transaction would only
+        // produce a WARNING (not an error), so it cannot be detected here;
+        // that is a known limitation of the optimistic approach. The Drop
+        // impl for PgTransaction logs at debug level when a transaction is
+        // dropped without explicit commit/cancel, and PG auto-rollbacks the
+        // transaction when the connection is returned to the pool.
+        let result = Executor::execute(&mut *conn, sqlx::raw_sql(begin_sql)).await;
+        match result {
+            Ok(_) => {}
+            Err(e) => {
+                // Use SQLSTATE codes instead of string matching for
+                // cross-version reliability.
+                // 25P02 = in_failed_sql_transaction
+                let is_failed_tx = matches!(&e, sqlx::Error::Database(db)
+                    if matches!(db.code().as_deref(), Some("25P02")));
+                if is_failed_tx {
+                    // Leaked transaction detected — clean up and retry.
+                    //
+                    // P3: No need to re-execute session SET statements after ROLLBACK.
+                    // PostgreSQL session-level SET (e.g. work_mem, timezone) persists
+                    // across ROLLBACK — only transaction-local SET LOCAL is undone.
+                    // Our after_connect hook uses SET (not SET LOCAL), so the settings
+                    // survive the ROLLBACK and the subsequent BEGIN.
+                    let _ = Executor::execute(&mut *conn, sqlx::raw_sql("ROLLBACK"))
+                        .await
+                        .inspect_err(|e| debug!("ROLLBACK of leaked transaction failed: {e}"));
+                    Executor::execute(&mut *conn, sqlx::raw_sql(begin_sql))
+                        .await
+                        .map_err(|e2| PgStoreError::from_sqlx(None, &e2))?;
+                    debug!("cleaned up leaked transaction from pool connection");
+                } else {
+                    return Err(PgStoreError::from_sqlx(None, &e));
+                }
+            }
+        }
 
         // F8: Increment started-transaction counter.
         self.tx_started.fetch_add(1, AtomicOrdering::Relaxed);

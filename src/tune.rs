@@ -215,7 +215,7 @@ impl PgTuneConfig {
         crate::config::PgConfig::validate_identifier(table)
             .expect("table name must be a valid SQL identifier");
         format!(
-                r#"
+            r#"
 -- Table storage tuning
 ALTER TABLE {table} SET (
     fillfactor = {fillfactor},
