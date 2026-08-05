@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: 'e4c157ac-43a3-403c-8973-eb557f349dd3'
-  PropagateID: 'e4c157ac-43a3-403c-8973-eb557f349dd3'
-  ReservedCode1: '18c3131c-258d-42a5-a1f4-253d569fb325'
-  ReservedCode2: '18c3131c-258d-42a5-a1f4-253d569fb325'
+  ProduceID: '995288f3-a2a9-4ee2-b6b2-b138d47cef64'
+  PropagateID: '995288f3-a2a9-4ee2-b6b2-b138d47cef64'
+  ReservedCode1: '2e47857e-5728-426d-b87a-c379ec836f7e'
+  ReservedCode2: '2e47857e-5728-426d-b87a-c379ec836f7e'
 ---
 
 # surreal-pg
@@ -204,7 +204,7 @@ cargo build --release
 
 ### 使用 GraphQL
 
-GraphQL 已内置，无需 experimental flag。通过 `DEFINE CONFIG GRAPHQL AUTO` 启用后即可查询：
+GraphQL 已内置，无需 experimental flag。通过 `DEFINE CONFIG GRAPHQL AUTO` 启用后即可使用：
 
 ```bash
 # 在 SurrealQL 中定义 schema 并开启 GraphQL
@@ -213,17 +213,23 @@ GraphQL 已内置，无需 experimental flag。通过 `DEFINE CONFIG GRAPHQL AUT
 > DEFINE TABLE person SCHEMAFULL;
 > DEFINE FIELD name ON TABLE person TYPE string;
 > DEFINE FIELD age ON TABLE person TYPE int;
-> CREATE person SET name = 'Alice', age = 30;
 > DEFINE CONFIG GRAPHQL AUTO;
 
-# 先查询全部记录（复数形式）
+# 新增记录（mutation）
+curl -X POST -u "root:secret" \
+  -H "Surreal-NS: myapp" -H "Surreal-DB: myapp" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "mutation { create_person(data: { name: \"Alice\", age: 30 }) { id name age } }"}' \
+  http://localhost:8000/graphql
+
+# 查询全部记录（复数形式）
 curl -X POST -u "root:secret" \
   -H "Surreal-NS: myapp" -H "Surreal-DB: myapp" \
   -H "Content-Type: application/json" \
   -d '{"query": "{ persons { id name age } }"}' \
   http://localhost:8000/graphql
 
-# 再根据 id 查询单条记录
+# 根据 id 查询单条记录
 curl -X POST -u "root:secret" \
   -H "Surreal-NS: myapp" -H "Surreal-DB: myapp" \
   -H "Content-Type: application/json" \
