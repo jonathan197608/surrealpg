@@ -219,7 +219,7 @@ GraphQL 已内置，无需 experimental flag。通过 `DEFINE CONFIG GRAPHQL AUT
 curl -X POST -u "root:secret" \
   -H "Surreal-NS: myapp" -H "Surreal-DB: myapp" \
   -H "Content-Type: application/json" \
-  -d '{"query": "mutation { create_person(data: { name: \"Alice\", age: 30 }) { id name age } }"}' \
+  -d '{"query": "mutation { createPerson(data: { name: \"Bob\", age: 10 }) { id name age } }"}' \
   http://localhost:8000/graphql
 
 # 查询全部记录（复数形式）

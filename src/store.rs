@@ -65,6 +65,57 @@ pub struct PgStore {
     pool_warned: Arc<AtomicBool>,
 }
 
+// ─── URL sanitization ─────────────────────────────────
+
+/// Custom query parameters that we parse ourselves and must not be
+/// passed to sqlx (which would emit "ignoring unrecognized connect parameter"
+/// warnings). These are all consumed by [`PgConfig::merge_url_params`].
+const CUSTOM_PARAMS: &[&str] = &[
+    "max_connections",
+    "min_connections",
+    "max_lifetime",
+    "auto_create_table",
+    "table_name",
+    "isolation_level",
+    "persistent_statements",
+    "connect_timeout",
+    "idle_timeout",
+];
+
+/// Strip our custom query parameters from a PostgreSQL URL so that sqlx's
+/// `PgConnectOptions` parser won't emit "ignoring unrecognized connect
+/// parameter" warnings.
+///
+/// Only removes keys listed in [`CUSTOM_PARAMS`]; all other query parameters
+/// (e.g. `sslmode`, `application_name`) are preserved for sqlx to handle.
+fn strip_custom_params(url: &str) -> String {
+    let Some(qmark) = url.find('?') else {
+        return url.to_string();
+    };
+    let base = &url[..=qmark]; // includes '?'
+    let query = &url[qmark + 1..];
+    let fragment_start = query.find('#');
+    let (query_part, fragment) = match fragment_start {
+        Some(i) => (&query[..i], &query[i..]), // includes '#'
+        None => (query, ""),
+    };
+
+    let filtered: String = query_part
+        .split('&')
+        .filter(|pair| {
+            let key = pair.split_once('=').map(|(k, _)| k).unwrap_or(pair);
+            !CUSTOM_PARAMS.contains(&key)
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+
+    if filtered.is_empty() {
+        format!("{base}{fragment}")
+    } else {
+        format!("{base}{filtered}{fragment}")
+    }
+}
+
 impl PgStore {
     /// Create a new `PgStore` from a PostgreSQL connection URL.
     ///
@@ -111,7 +162,7 @@ impl PgStore {
         // F5: Guard against zero max_connections — sqlx panics with pool_max=0.
         assert!(pool_max > 0, "max_connections must be > 0, got {pool_max}");
 
-        let opts: PgConnectOptions = url
+        let opts: PgConnectOptions = strip_custom_params(url)
             .parse()
             .map_err(|e: sqlx::Error| PgStoreError::Postgres(format!("invalid URL: {e}")))?;
 
@@ -518,5 +569,52 @@ impl PgStore {
                 false
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod test_strip {
+    use super::*;
+
+    #[test]
+    fn no_query() {
+        assert_eq!(
+            strip_custom_params("postgresql://u:p@h/db"),
+            "postgresql://u:p@h/db"
+        );
+    }
+
+    #[test]
+    fn strip_all_custom() {
+        assert_eq!(
+            strip_custom_params("postgresql://u:p@h/db?min_connections=0&max_connections=20"),
+            "postgresql://u:p@h/db?"
+        );
+    }
+
+    #[test]
+    fn preserve_sqlx_params() {
+        assert_eq!(
+            strip_custom_params("postgresql://u:p@h/db?sslmode=require&min_connections=0"),
+            "postgresql://u:p@h/db?sslmode=require"
+        );
+    }
+
+    #[test]
+    fn mixed_params() {
+        assert_eq!(
+            strip_custom_params(
+                "postgresql://u:p@h/db?sslmode=require&min_connections=0&application_name=test"
+            ),
+            "postgresql://u:p@h/db?sslmode=require&application_name=test"
+        );
+    }
+
+    #[test]
+    fn with_fragment() {
+        assert_eq!(
+            strip_custom_params("postgresql://u:p@h/db?min_connections=0#frag"),
+            "postgresql://u:p@h/db?#frag"
+        );
     }
 }
