@@ -149,6 +149,12 @@ impl PgStore {
         // URL params override tuning env vars for pool sizing (URL is more specific)
         let pool_max = config.max_connections.unwrap_or(tune.pool_max);
         let pool_min = config.min_connections.unwrap_or(tune.pool_min);
+        // H1: Final cross-validation after resolving pool_max/pool_min from
+        // both URL and tuning env. The earlier check only fires when both
+        // values come from URL. Here we catch the mixed case (e.g. URL
+        // min_connections > tune pool_max, or URL max_connections < tune
+        // pool_min).
+        let pool_min = pool_min.min(pool_max);
         let acquire_timeout = config.connect_timeout.unwrap_or(tune.pool_acquire_timeout);
         let idle_timeout = config.idle_timeout.or(Some(tune.pool_idle_timeout));
         let max_lifetime = config.max_lifetime.or(Some(tune.pool_max_lifetime));
@@ -163,7 +169,21 @@ impl PgStore {
             format!("BEGIN ISOLATION LEVEL {}", config.isolation_level.as_sql()).into();
 
         // F5: Guard against zero max_connections — sqlx panics with pool_max=0.
-        assert!(pool_max > 0, "max_connections must be > 0, got {pool_max}");
+        // from_env() already clamps env vars, but direct config construction
+        // could still produce 0. Return an error instead of panicking so the
+        // caller can handle it gracefully.
+        if pool_max == 0 {
+            return Err(PgStoreError::Other(
+                "max_connections must be > 0".to_string(),
+            ));
+        }
+        if pool_min > pool_max {
+            warn!(
+                min_connections = pool_min,
+                max_connections = pool_max,
+                "pool_min > pool_max after resolution, clamping"
+            );
+        }
 
         let slow_acquire = config.slow_acquire_threshold_secs;
         let slow_stmts = config.slow_statements_threshold_secs;

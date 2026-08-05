@@ -6,44 +6,58 @@ use std::time::Duration;
 ///
 /// Handles `%XX` sequences (e.g. `%20` → space, `%2F` → `/`) and
 /// `+` → space (for `application/x-www-form-urlencoded` compatibility).
-/// Returns the decoded string on success, or the original string
-/// if decoding fails (graceful degradation for malformed input).
+/// Returns the decoded string, using lossy conversion for invalid UTF-8
+/// (malformed byte sequences are replaced with U+FFFD).
 fn percent_decode(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
-    let mut bytes = input.bytes();
-    while let Some(b) = bytes.next() {
-        if b == b'+' {
-            // B2: Handle + → space (application/x-www-form-urlencoded)
-            result.push(' ');
-        } else if b == b'%' {
-            let hi = bytes.next();
-            let lo = bytes.next();
-            match (hi, lo) {
-                (Some(h), Some(l)) => {
-                    let hi_val = hex_digit(h);
-                    let lo_val = hex_digit(l);
-                    if let (Some(hv), Some(lv)) = (hi_val, lo_val) {
-                        result.push(char::from(hv * 16 + lv));
-                    } else {
-                        // Invalid hex sequence — keep as-is
-                        result.push('%');
-                        result.push(char::from(h));
-                        result.push(char::from(l));
+    // M-1: Use Vec<u8> as a byte buffer, then convert to String at the end.
+    // The previous implementation used char::from(b) which treated each byte
+    // as a Latin-1 character, corrupting multi-byte UTF-8 sequences (e.g.
+    // a UTF-8 encoded "é" = 0xC3 0xA9 would become "Ã©" instead of "é").
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                // B2: Handle + → space (application/x-www-form-urlencoded)
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hi = hex_digit(bytes[i + 1]);
+                let lo = hex_digit(bytes[i + 2]);
+                match (hi, lo) {
+                    (Some(hv), Some(lv)) => {
+                        out.push(hv * 16 + lv);
+                        i += 3;
                     }
-                }
-                _ => {
-                    // Incomplete %XX — keep as-is
-                    result.push('%');
-                    if let Some(h) = hi {
-                        result.push(char::from(h));
+                    _ => {
+                        // Invalid hex sequence — keep as-is
+                        out.push(b'%');
+                        out.push(bytes[i + 1]);
+                        out.push(bytes[i + 2]);
+                        i += 3;
                     }
                 }
             }
-        } else {
-            result.push(char::from(b));
+            b'%' if i + 1 < bytes.len() => {
+                // Incomplete %XX (one digit after %) — keep as-is
+                out.push(b'%');
+                out.push(bytes[i + 1]);
+                i += 2;
+            }
+            b'%' => {
+                // Trailing % — keep as-is
+                out.push(b'%');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
         }
     }
-    result
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Convert a hex byte to its numeric value (0–15), or None if not a hex digit.
@@ -117,12 +131,12 @@ impl PersistentStatements {
     }
 
     /// Parse from a URL query parameter value.
-    /// Accepts `true`/`false` (case-insensitive) and `auto`.
+    /// Accepts `true`/`false`/`enabled`/`disabled` (case-insensitive) and `auto`.
     /// Returns `None` for unrecognized values (caller keeps default).
     fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => Some(Self::Enabled),
-            "false" | "0" | "no" | "off" => Some(Self::Disabled),
+            "true" | "1" | "yes" | "on" | "enabled" => Some(Self::Enabled),
+            "false" | "0" | "no" | "off" | "disabled" => Some(Self::Disabled),
             "auto" => Some(Self::Auto),
             _ => None,
         }
@@ -366,6 +380,9 @@ impl PgConfig {
     pub fn merge_url_params(&mut self, url: &str) -> Result<(), String> {
         // Parse the query string manually to avoid adding a URL-parsing dep.
         if let Some(query) = url.split('?').nth(1) {
+            // M-2: Strip URL fragment (#...) from the query string.
+            // Without this, `?table_name=kv#frag` would set table_name to "kv#frag".
+            let query = query.split('#').next().unwrap_or(query);
             // B6: Track seen parameter names to detect duplicates.
             let mut seen = std::collections::HashSet::<&str>::new();
             // Known parameter names that we actually process.
@@ -380,6 +397,7 @@ impl PgConfig {
                 "connect_timeout",
                 "idle_timeout",
                 "slow_acquire_threshold_secs",
+                "slow_statements_threshold_secs",
             ];
             for pair in query.split('&') {
                 if let Some((key, value)) = pair.split_once('=') {
@@ -623,5 +641,68 @@ mod tests {
         assert_eq!(hex_digit(b'F'), Some(15));
         assert_eq!(hex_digit(b'g'), None);
         assert_eq!(hex_digit(b' '), None);
+    }
+
+    // M-1: Multi-byte UTF-8 percent-decoding. The old implementation used
+    // char::from(b) which treated each byte as Latin-1, corrupting UTF-8.
+    #[test]
+    fn test_percent_decode_multibyte_utf8() {
+        // "é" = U+00E9 = UTF-8: 0xC3 0xA9 = %C3%A9
+        assert_eq!(percent_decode("caf%C3%A9"), "café");
+        // "日本" = U+65E5 U+672C = UTF-8: %E6%97%A5%E6%9C%AC
+        assert_eq!(percent_decode("%E6%97%A5%E6%9C%AC"), "日本");
+        // Mixed ASCII + multi-byte
+        assert_eq!(percent_decode("hello%20world%21"), "hello world!");
+        // '€' = U+20AC = UTF-8: %E2%82%AC
+        assert_eq!(percent_decode("100%E2%82%AC"), "100€");
+    }
+
+    // M-3: PersistentStatements::parse accepts "enabled"/"disabled" synonyms
+    #[test]
+    fn test_persistent_statements_parse_synonyms() {
+        assert_eq!(
+            PersistentStatements::parse("enabled"),
+            Some(PersistentStatements::Enabled)
+        );
+        assert_eq!(
+            PersistentStatements::parse("disabled"),
+            Some(PersistentStatements::Disabled)
+        );
+        assert_eq!(
+            PersistentStatements::parse("ENABLED"),
+            Some(PersistentStatements::Enabled)
+        );
+        assert_eq!(
+            PersistentStatements::parse("Disabled"),
+            Some(PersistentStatements::Disabled)
+        );
+        // Still accepts old values
+        assert_eq!(
+            PersistentStatements::parse("true"),
+            Some(PersistentStatements::Enabled)
+        );
+        assert_eq!(
+            PersistentStatements::parse("auto"),
+            Some(PersistentStatements::Auto)
+        );
+        assert_eq!(PersistentStatements::parse("bogus"), None);
+    }
+
+    // M-2: merge_url_params should strip URL fragments
+    #[test]
+    fn test_merge_url_params_fragment() {
+        let mut config = PgConfig::default();
+        config
+            .merge_url_params("postgresql://u:p@h/db?table_name=kv#fragment")
+            .unwrap();
+        assert_eq!(config.table_name, "kv");
+
+        // Fragment after multiple params
+        let mut config2 = PgConfig::default();
+        config2
+            .merge_url_params("postgresql://u:p@h/db?min_connections=3&table_name=my_table#x")
+            .unwrap();
+        assert_eq!(config2.table_name, "my_table");
+        assert_eq!(config2.min_connections, Some(3));
     }
 }

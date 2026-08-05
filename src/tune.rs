@@ -103,16 +103,63 @@ impl PgTuneConfig {
     /// after this struct is created.
     #[must_use]
     pub fn from_env() -> Self {
+        // M-5: pool_max=0 would cause a panic in store.rs's assert. Clamp to
+        // at least 1 and warn the user.
+        let pool_max = {
+            let v = env_u32("PG_TUNED_POOL_MAX_CONNECTIONS", 20);
+            if v == 0 {
+                warn!(
+                    env = "PG_TUNED_POOL_MAX_CONNECTIONS",
+                    "pool_max=0 is invalid, using default 20"
+                );
+                20
+            } else {
+                v
+            }
+        };
+
+        // M-5: pool_min must not exceed pool_max (checked here for env-only
+        // path; store.rs handles the URL+env cross-validation).
+        let pool_min = {
+            let v = env_u32("PG_TUNED_POOL_MIN_CONNECTIONS", 5);
+            if v > pool_max {
+                warn!(
+                    env = "PG_TUNED_POOL_MIN_CONNECTIONS",
+                    value = v,
+                    pool_max,
+                    "pool_min > pool_max, clamping to pool_max"
+                );
+                pool_max
+            } else {
+                v
+            }
+        };
+
+        // M-4: fillfactor must be in [1, 100] (PG requirement).
+        let fillfactor = {
+            let v = env_i32("PG_TUNED_TABLE_FILLFACTOR", 90);
+            if !(1..=100).contains(&v) {
+                warn!(
+                    env = "PG_TUNED_TABLE_FILLFACTOR",
+                    value = v,
+                    "out of range [1, 100], using default 90"
+                );
+                90
+            } else {
+                v
+            }
+        };
+
         Self {
             // Pool
-            pool_max: env_u32("PG_TUNED_POOL_MAX_CONNECTIONS", 20),
-            pool_min: env_u32("PG_TUNED_POOL_MIN_CONNECTIONS", 5),
+            pool_max,
+            pool_min,
             pool_acquire_timeout: env_duration("PG_TUNED_POOL_ACQUIRE_TIMEOUT", 10),
             pool_idle_timeout: env_duration("PG_TUNED_POOL_IDLE_TIMEOUT", 600),
             pool_max_lifetime: env_duration("PG_TUNED_POOL_MAX_LIFETIME", 1800),
 
             // Table
-            fillfactor: env_i32("PG_TUNED_TABLE_FILLFACTOR", 90),
+            fillfactor,
             toast_storage: env_str_validated(
                 "PG_TUNED_TABLE_TOAST_STORAGE",
                 "external",
@@ -209,11 +256,29 @@ impl PgTuneConfig {
     ///
     /// # Panics
     ///
-    /// Panics if `table` is not a valid SQL identifier (only `[a-zA-Z0-9_]`).
+    /// Panics if `table` is not a valid SQL identifier (only `[a-zA-Z0-9_]`),
+    /// or if `toast_storage` / `fillfactor` fail defense-in-depth validation
+    /// (these are validated in `from_env()`, but direct struct construction
+    /// with malicious values is possible since all fields are `pub`).
     #[must_use]
     pub fn tune_table_sql(&self, table: &str) -> String {
         crate::config::PgConfig::validate_identifier(table)
             .expect("table name must be a valid SQL identifier");
+        // H-1: Defense-in-depth — validate toast_storage and fillfactor
+        // here, not just in from_env(). PgTuneConfig fields are all pub,
+        // so a caller could construct it directly with malicious values.
+        // session_sql() already does this for memory-size strings; we do
+        // the same for toast_storage and fillfactor here.
+        assert!(
+            validate_toast_storage(&self.toast_storage),
+            "toast_storage failed validation: {}",
+            self.toast_storage
+        );
+        assert!(
+            (1..=100).contains(&self.fillfactor),
+            "fillfactor must be in [1, 100], got {}",
+            self.fillfactor
+        );
         format!(
             r#"
 -- Table storage tuning
@@ -599,5 +664,79 @@ mod tests {
         assert_eq!(c.server_checkpoint_target, 1.0);
 
         unsafe { std::env::remove_var("PG_TUNED_SERVER_CHECKPOINT_TARGET") };
+    }
+
+    // M-5: pool_max=0 is invalid and should fall back to default
+    #[test]
+    fn test_pool_max_zero_fallback() {
+        unsafe { std::env::set_var("PG_TUNED_POOL_MAX_CONNECTIONS", "0") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.pool_max, 20, "pool_max=0 should fall back to 20");
+        unsafe { std::env::remove_var("PG_TUNED_POOL_MAX_CONNECTIONS") };
+    }
+
+    // M-5: pool_min > pool_max should be clamped
+    #[test]
+    fn test_pool_min_exceeds_max_clamped() {
+        unsafe { std::env::set_var("PG_TUNED_POOL_MAX_CONNECTIONS", "5") };
+        unsafe { std::env::set_var("PG_TUNED_POOL_MIN_CONNECTIONS", "10") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.pool_max, 5);
+        assert_eq!(c.pool_min, 5, "pool_min should be clamped to pool_max");
+        unsafe { std::env::remove_var("PG_TUNED_POOL_MAX_CONNECTIONS") };
+        unsafe { std::env::remove_var("PG_TUNED_POOL_MIN_CONNECTIONS") };
+    }
+
+    // M-4: fillfactor out of range should fall back to default
+    #[test]
+    fn test_fillfactor_out_of_range() {
+        unsafe { std::env::set_var("PG_TUNED_TABLE_FILLFACTOR", "0") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.fillfactor, 90, "fillfactor=0 should fall back to 90");
+
+        unsafe { std::env::set_var("PG_TUNED_TABLE_FILLFACTOR", "101") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.fillfactor, 90, "fillfactor=101 should fall back to 90");
+
+        unsafe { std::env::set_var("PG_TUNED_TABLE_FILLFACTOR", "-5") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.fillfactor, 90, "fillfactor=-5 should fall back to 90");
+
+        // Valid range
+        unsafe { std::env::set_var("PG_TUNED_TABLE_FILLFACTOR", "50") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.fillfactor, 50, "fillfactor=50 should pass through");
+
+        // Boundaries
+        unsafe { std::env::set_var("PG_TUNED_TABLE_FILLFACTOR", "1") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.fillfactor, 1);
+
+        unsafe { std::env::set_var("PG_TUNED_TABLE_FILLFACTOR", "100") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.fillfactor, 100);
+
+        unsafe { std::env::remove_var("PG_TUNED_TABLE_FILLFACTOR") };
+    }
+
+    // H-1: tune_table_sql defense-in-depth validation
+    #[test]
+    #[should_panic(expected = "toast_storage failed validation")]
+    fn test_tune_table_sql_rejects_bad_toast() {
+        let c = PgTuneConfig {
+            toast_storage: "evil'; DROP TABLE kv; --".to_string(),
+            ..PgTuneConfig::default()
+        };
+        let _ = c.tune_table_sql("kv");
+    }
+
+    #[test]
+    #[should_panic(expected = "fillfactor must be in")]
+    fn test_tune_table_sql_rejects_bad_fillfactor() {
+        let c = PgTuneConfig {
+            fillfactor: 0,
+            ..PgTuneConfig::default()
+        };
+        let _ = c.tune_table_sql("kv");
     }
 }

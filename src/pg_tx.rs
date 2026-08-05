@@ -128,8 +128,8 @@ impl Transactable for PgTx {
             if let Some(tx) = guard.as_mut()
                 && let Err(e) = tx.cancel().await
             {
-                // Release the connection even on error — PG will auto-rollback
-                // when the PoolConnection is dropped and returned to the pool.
+                // Release the connection even on error — sqlx's Transaction
+                // Drop will auto-rollback and return the connection to the pool.
                 *guard = None;
                 self.tx_rolled_back.fetch_add(1, Ordering::Relaxed);
                 return Err(kvs::Error::from(e));
