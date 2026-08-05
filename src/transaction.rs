@@ -6,6 +6,7 @@
 use std::ops::DerefMut;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use sqlx::Transaction;
 use sqlx::{Executor, Row};
@@ -175,6 +176,11 @@ pub struct PgTransaction {
     /// On the hot path, methods borrow `&self.sql.field` directly alongside
     /// `&mut self.conn` — Rust allows this because they are different fields.
     sql: Arc<Sql>,
+    /// Shared active-transaction counter (from PgStore). Decremented
+    /// when the connection is released (commit/cancel/drop). Used for
+    /// diagnostics: pool acquire failures log `tx_active` to show how
+    /// many connections are held by in-flight transactions.
+    tx_active: Arc<AtomicU64>,
 }
 
 impl PgTransaction {
@@ -190,6 +196,7 @@ impl PgTransaction {
         isolation: PgIsolation,
         persistent: bool,
         sql: Arc<Sql>,
+        tx_active: Arc<AtomicU64>,
     ) -> Self {
         Self {
             conn: Some(conn),
@@ -199,10 +206,17 @@ impl PgTransaction {
             isolation,
             persistent,
             sql,
+            tx_active,
         }
     }
 
     // ─── Internal helpers ────────────────────────────────
+
+    /// Decrement the active-transaction counter. Called when the connection
+    /// is released back to the pool (commit/cancel/drop).
+    fn release_active(&self) {
+        self.tx_active.fetch_sub(1, AtomicOrdering::Relaxed);
+    }
 
     /// Get a mutable reference to the inner `PgConnection`.
     ///
@@ -295,6 +309,7 @@ impl PgTransaction {
         // return TxClosed.
         let tx = self.conn.take().ok_or(PgStoreError::TxClosed)?;
         self.savepoints.clear();
+        self.release_active();
         let result = tx.commit().await;
         if let Err(e) = &result {
             debug!("COMMIT failed (PG will auto-rollback): {e}");
@@ -315,6 +330,7 @@ impl PgTransaction {
         // return TxClosed.
         let tx = self.conn.take().ok_or(PgStoreError::TxClosed)?;
         self.savepoints.clear();
+        self.release_active();
         let result = tx.rollback().await;
         if let Err(e) = &result {
             debug!("ROLLBACK failed: {e}");
@@ -867,8 +883,10 @@ impl Drop for PgTransaction {
         // state, preventing the "there is already a transaction in progress"
         // WARNING on the next `begin()` call.
         //
-        // Logged at debug level to avoid log spam.
+        // Decrement the active-transaction counter so that pool diagnostics
+        // can accurately report how many connections are held by transactions.
         if self.conn.is_some() {
+            self.release_active();
             debug!("PgTransaction dropped without explicit commit/cancel; sqlx will auto-rollback");
         }
     }

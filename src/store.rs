@@ -61,6 +61,11 @@ pub struct PgStore {
     tx_committed: Arc<AtomicU64>,
     /// Total number of transactions rolled back / cancelled.
     tx_rolled_back: Arc<AtomicU64>,
+    /// Number of currently active transactions (connections checked out from pool).
+    /// Incremented on begin(), decremented on commit/cancel/drop. Used for
+    /// diagnostics: when pool acquire times out, this tells us how many
+    /// connections are held by active transactions vs. how many are idle.
+    tx_active: Arc<AtomicU64>,
     /// O3: One-shot flag for pool utilization warning. Prevents log spam
     /// when the pool hovers at high utilization. Reset only on restart.
     pool_warned: Arc<AtomicBool>,
@@ -313,6 +318,7 @@ impl PgStore {
             tx_started: Arc::new(AtomicU64::new(0)),
             tx_committed: Arc::new(AtomicU64::new(0)),
             tx_rolled_back: Arc::new(AtomicU64::new(0)),
+            tx_active: Arc::new(AtomicU64::new(0)),
             // O3: Initialize pool utilization warning flag.
             pool_warned: Arc::new(AtomicBool::new(false)),
         }))
@@ -343,28 +349,76 @@ impl PgStore {
     /// transaction from being created, causing "Couldn't update a finished
     /// transaction" errors. Connection pool closure (`pool.close()`) already
     /// prevents new transactions after shutdown completes.
+    ///
+    /// # Retry behavior
+    ///
+    /// When the connection pool is temporarily exhausted (e.g. due to a brief
+    /// spike in concurrent tasks), a single `begin_with()` attempt may time
+    /// out even though the pool would recover within seconds. We retry up to
+    /// `BEGIN_MAX_RETRIES` times with exponential backoff, logging pool
+    /// diagnostics on each failure to help distinguish between:
+    ///
+    /// - **Pool exhausted**: all connections are in use (size == max).
+    ///   Indicates long-running transactions holding connections.
+    /// - **Pool depleted**: few connections exist (size << max).
+    ///   Indicates connection establishment failures (e.g. PG server down,
+    ///   network issues, Pooler rejecting connections).
     pub async fn begin(&self, write: bool) -> Result<PgTransaction> {
-        // Use sqlx's Transaction API: begin_with() executes the custom
-        // BEGIN SQL (with isolation level), increments sqlx's internal
-        // transaction_depth counter, and returns a Transaction that
-        // auto-rollbacks on Drop. This eliminates the need for manual
-        // 25P02 (in_failed_sql_transaction) error recovery.
-        let tx = self
-            .pool
-            .begin_with(String::from(&*self.begin_sql))
-            .await
-            .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
+        use tracing::warn;
 
-        // F8: Increment started-transaction counter.
-        self.tx_started.fetch_add(1, AtomicOrdering::Relaxed);
+        const BEGIN_MAX_RETRIES: u32 = 2;
+        const BASE_DELAY_MS: u64 = 200;
+        const MAX_DELAY_MS: u64 = 2000;
 
-        Ok(PgTransaction::new_with_sql(
-            tx,
-            write,
-            self.config.isolation_level,
-            self.persistent,
-            Arc::clone(&self.sql),
-        ))
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+
+            match self.pool.begin_with(String::from(&*self.begin_sql)).await {
+                Ok(tx) => {
+                    self.tx_started.fetch_add(1, AtomicOrdering::Relaxed);
+                    self.tx_active.fetch_add(1, AtomicOrdering::Relaxed);
+                    return Ok(PgTransaction::new_with_sql(
+                        tx,
+                        write,
+                        self.config.isolation_level,
+                        self.persistent,
+                        Arc::clone(&self.sql),
+                        Arc::clone(&self.tx_active),
+                    ));
+                }
+                Err(e) => {
+                    let pg_err = PgStoreError::from_sqlx(None, &e);
+
+                    // Log pool diagnostics on every failure to help identify
+                    // whether the pool is exhausted or depleted.
+                    let (size, idle) = self.pool_size();
+                    let active = self.tx_active.load(AtomicOrdering::Relaxed);
+                    warn!(
+                        attempt,
+                        max_retries = BEGIN_MAX_RETRIES,
+                        pool_size = size,
+                        pool_idle = idle,
+                        pool_max = self.pool_max,
+                        tx_active = active,
+                        write,
+                        error = %pg_err,
+                        "begin_with() failed — pool diagnostics logged"
+                    );
+
+                    // Only retry on pool timeout (transient); don't retry
+                    // on other errors (e.g. PoolClosed, connection auth failure).
+                    if !matches!(pg_err, PgStoreError::PoolTimeout) || attempt > BEGIN_MAX_RETRIES {
+                        return Err(pg_err);
+                    }
+
+                    // Exponential backoff: 200ms, 400ms, 800ms, … capped at 2s.
+                    let delay = BASE_DELAY_MS * 2u64.pow(attempt - 1);
+                    let delay = delay.min(MAX_DELAY_MS);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+            }
+        }
     }
 
     /// Shut down the connection pool gracefully.
@@ -463,13 +517,14 @@ impl PgStore {
 
     // ── F8: Transaction metric methods ──
 
-    /// Get transaction metric counters: (started, committed, rolled_back).
+    /// Get transaction metric counters: (started, committed, rolled_back, active).
     #[must_use]
-    pub fn tx_metrics(&self) -> (u64, u64, u64) {
+    pub fn tx_metrics(&self) -> (u64, u64, u64, u64) {
         (
             self.tx_started.load(AtomicOrdering::Relaxed),
             self.tx_committed.load(AtomicOrdering::Relaxed),
             self.tx_rolled_back.load(AtomicOrdering::Relaxed),
+            self.tx_active.load(AtomicOrdering::Relaxed),
         )
     }
 

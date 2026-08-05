@@ -84,6 +84,10 @@ impl TransactionBuilder for PgStore {
                     name: "pg_tx_rolled_back",
                     description: "Total number of transactions rolled back or cancelled",
                 },
+                Metric {
+                    name: "pg_tx_active",
+                    description: "Number of currently active transactions (connections checked out from pool)",
+                },
             ],
         })
     }
@@ -104,13 +108,14 @@ impl TransactionBuilder for PgStore {
             }
             "pg_pool_max" => Some(self.pool_max() as u64),
             // F8: Transaction metric counters.
-            // P1: Call tx_metrics() once for all three counters.
-            "pg_tx_started" | "pg_tx_committed" | "pg_tx_rolled_back" => {
-                let (started, committed, rolled_back) = self.tx_metrics();
+            // P1: Call tx_metrics() once for all four counters.
+            "pg_tx_started" | "pg_tx_committed" | "pg_tx_rolled_back" | "pg_tx_active" => {
+                let (started, committed, rolled_back, active) = self.tx_metrics();
                 match metric {
                     "pg_tx_started" => Some(started),
                     "pg_tx_committed" => Some(committed),
-                    _ => Some(rolled_back),
+                    "pg_tx_rolled_back" => Some(rolled_back),
+                    _ => Some(active),
                 }
             }
             _ => None,
