@@ -418,8 +418,14 @@ impl PgStore {
         const BEGIN_MAX_RETRIES: u32 = 2;
         const BASE_DELAY_MS: u64 = 200;
         const MAX_DELAY_MS: u64 = 2000;
+        // Zombie pool: connections are stuck in sqlx rebuild — they need
+        // much longer to recover than a normal transient pool exhaustion.
+        // Use 5s base delay to give sqlx time to rebuild dead connections.
+        const ZOMBIE_BASE_DELAY_MS: u64 = 5000;
+        const ZOMBIE_MAX_DELAY_MS: u64 = 15000;
 
         let mut attempt = 0;
+        let mut zombie_detected = false;
         loop {
             attempt += 1;
 
@@ -451,6 +457,7 @@ impl PgStore {
                     // after the server-side (Pooler) silently closed them.
                     // Output actionable guidance to help the operator recover.
                     if idle == 0 && active == 0 && size > 0 {
+                        zombie_detected = true;
                         warn!(
                             attempt,
                             max_retries = BEGIN_MAX_RETRIES,
@@ -489,9 +496,22 @@ impl PgStore {
                         return Err(pg_err);
                     }
 
-                    // Exponential backoff: 200ms, 400ms, 800ms, … capped at 2s.
-                    let delay = BASE_DELAY_MS * 2u64.pow(attempt - 1);
-                    let delay = delay.min(MAX_DELAY_MS);
+                    // Backoff strategy depends on pool state:
+                    // - Zombie pool: use longer delays (5s base) because sqlx
+                    //   needs time to rebuild dead connections. A short 200ms
+                    //   delay just wastes retries while connections are still
+                    //   being re-established (typically 2-3s per connection
+                    //   over cross-region Pooler).
+                    // - Normal pool exhaustion: use short exponential backoff
+                    //   (200ms base) — a transaction will likely finish and
+                    //   release its connection within a few hundred ms.
+                    let delay = if zombie_detected {
+                        let d = ZOMBIE_BASE_DELAY_MS * 2u64.pow(attempt - 1);
+                        d.min(ZOMBIE_MAX_DELAY_MS)
+                    } else {
+                        let d = BASE_DELAY_MS * 2u64.pow(attempt - 1);
+                        d.min(MAX_DELAY_MS)
+                    };
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 }
             }
