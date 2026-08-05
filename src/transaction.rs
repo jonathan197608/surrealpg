@@ -131,8 +131,9 @@ impl Sql {
 /// A transaction backed by a single PostgreSQL connection.
 ///
 /// Implements all KV operations that SurrealDB's `Transactable` trait requires.
-/// After `commit()` or `cancel()`, the transaction is closed and the connection
-/// is returned to the pool.
+/// After `commit()` or `cancel()`, the internal `Transaction` is consumed
+/// (sqlx's API takes `mut self`), setting `conn` to `None` — all subsequent
+/// operations return `TxClosed`.
 ///
 /// All SQL strings are pre-built at construction time to eliminate per-operation
 /// `format!()` heap allocations on the hot path.
@@ -144,11 +145,13 @@ pub struct PgTransaction {
     /// maintained and `Transaction::drop` automatically queues a ROLLBACK
     /// for any uncommitted transaction, preventing the "there is already
     /// a transaction in progress" WARNING when connections return to the pool.
+    ///
+    /// `None` after commit/cancel (Transaction is consumed by sqlx's API).
+    /// This replaces the former `closed: bool` field — the transaction's
+    /// open/closed state is fully derivable from `conn.is_some()`.
     conn: Option<Transaction<'static, sqlx::Postgres>>,
     /// Whether this is a write transaction
     writeable: bool,
-    /// Whether the transaction has been closed
-    closed: bool,
     /// Savepoint naming counter
     savepoint_counter: u32,
     /// Active savepoint name stack
@@ -184,7 +187,6 @@ impl PgTransaction {
         Self {
             conn: Some(conn),
             writeable,
-            closed: false,
             savepoint_counter: 0,
             savepoints: Vec::new(),
             isolation,
@@ -202,9 +204,6 @@ impl PgTransaction {
     /// use inline destructured borrows instead to avoid conflicts with
     /// `&self.sql` references.
     fn conn_mut(&mut self) -> Result<&mut sqlx::postgres::PgConnection> {
-        if self.closed {
-            return Err(PgStoreError::TxClosed);
-        }
         let tx = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         Ok(tx.deref_mut())
     }
@@ -330,16 +329,14 @@ impl PgTransaction {
     /// Uses sqlx's `Transaction::commit()` which sends `COMMIT` to PG
     /// and releases the connection back to the pool. On error (e.g.
     /// serialization conflict), the connection is still released — PG
-    /// auto-rollbacks. The transaction is marked closed regardless of
-    /// outcome to prevent further operations.
+    /// auto-rollbacks. After this call, `conn` is `None` so all
+    /// subsequent operations return `TxClosed`.
     pub async fn commit(&mut self) -> Result<()> {
-        if self.closed {
-            return Ok(());
-        }
         // Take ownership of the Transaction — sqlx's commit() consumes self.
         // On success, PG commits. On error, PG auto-rollbacks.
+        // conn.take() sets conn=None, making all subsequent operations
+        // return TxClosed.
         let tx = self.conn.take().ok_or(PgStoreError::TxClosed)?;
-        self.closed = true;
         self.savepoints.clear();
         let result = tx.commit().await;
         if let Err(e) = &result {
@@ -356,12 +353,10 @@ impl PgTransaction {
     /// and releases the connection back to the pool. On error, the
     /// connection is still released via sqlx's Drop handling.
     pub async fn cancel(&mut self) -> Result<()> {
-        if self.closed {
-            return Ok(());
-        }
         // Take ownership of the Transaction — sqlx's rollback() consumes self.
+        // conn.take() sets conn=None, making all subsequent operations
+        // return TxClosed.
         let tx = self.conn.take().ok_or(PgStoreError::TxClosed)?;
-        self.closed = true;
         self.savepoints.clear();
         let result = tx.rollback().await;
         if let Err(e) = &result {
@@ -375,7 +370,7 @@ impl PgTransaction {
     /// Whether the transaction is still open.
     #[must_use]
     pub fn is_open(&self) -> bool {
-        !self.closed
+        self.conn.is_some()
     }
 
     /// Whether this is a write transaction.
@@ -395,9 +390,6 @@ impl PgTransaction {
 
     /// Check whether a key exists.
     pub async fn exists(&mut self, key: Key) -> Result<bool> {
-        if self.closed {
-            return Err(PgStoreError::TxClosed);
-        }
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let row = Self::build_query(persistent, &self.sql.exists)
@@ -410,9 +402,6 @@ impl PgTransaction {
 
     /// Get the value for a key.
     pub async fn get(&mut self, key: Key) -> Result<Option<Val>> {
-        if self.closed {
-            return Err(PgStoreError::TxClosed);
-        }
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let row = Self::build_query(persistent, &self.sql.get)
@@ -425,7 +414,7 @@ impl PgTransaction {
 
     /// Batch-get multiple keys.
     pub async fn getm(&mut self, keys: Vec<Key>) -> Result<Vec<Option<Val>>> {
-        if self.closed {
+        if self.conn.is_none() {
             return Err(PgStoreError::TxClosed);
         }
         if keys.is_empty() {
@@ -475,7 +464,7 @@ impl PgTransaction {
 
     /// Set a key to a value (insert or update).
     pub async fn set(&mut self, key: Key, val: Val) -> Result<()> {
-        if self.closed {
+        if self.conn.is_none() {
             return Err(PgStoreError::TxClosed);
         }
         self.check_writable()?;
@@ -506,7 +495,7 @@ impl PgTransaction {
     /// chunked into multiple sequential executions. Each chunk is atomic
     /// within the encompassing transaction.
     pub async fn setm(&mut self, pairs: Vec<(Key, Val)>) -> Result<()> {
-        if self.closed {
+        if self.conn.is_none() {
             return Err(PgStoreError::TxClosed);
         }
         self.check_writable()?;
@@ -562,7 +551,7 @@ impl PgTransaction {
     /// Set a key only if it does not already exist (insert-if-absent).
     /// Returns `KeyAlreadyExists` if the key exists.
     pub async fn put(&mut self, key: Key, val: Val) -> Result<()> {
-        if self.closed {
+        if self.conn.is_none() {
             return Err(PgStoreError::TxClosed);
         }
         self.check_writable()?;
@@ -584,7 +573,7 @@ impl PgTransaction {
     /// `chk = None` means "only if key does not exist" (delegates to `put`).
     /// `chk = Some(v)` means "only if current value equals v".
     pub async fn putc(&mut self, key: Key, val: Val, chk: Option<Val>) -> Result<()> {
-        if self.closed {
+        if self.conn.is_none() {
             return Err(PgStoreError::TxClosed);
         }
         self.check_writable()?;
@@ -612,7 +601,7 @@ impl PgTransaction {
 
     /// Delete a key.
     pub async fn del(&mut self, key: Key) -> Result<()> {
-        if self.closed {
+        if self.conn.is_none() {
             return Err(PgStoreError::TxClosed);
         }
         self.check_writable()?;
@@ -631,7 +620,7 @@ impl PgTransaction {
     /// `chk = None` → unconditional delete (delegates to `del`).
     /// `chk = Some(v)` → key must exist and value must equal v.
     pub async fn delc(&mut self, key: Key, chk: Option<Val>) -> Result<()> {
-        if self.closed {
+        if self.conn.is_none() {
             return Err(PgStoreError::TxClosed);
         }
         self.check_writable()?;
@@ -656,7 +645,7 @@ impl PgTransaction {
 
     /// Delete all keys in a range (inclusive start, exclusive end).
     pub async fn delr(&mut self, rng: Range<Key>) -> Result<()> {
-        if self.closed {
+        if self.conn.is_none() {
             return Err(PgStoreError::TxClosed);
         }
         self.check_writable()?;
@@ -736,9 +725,6 @@ impl PgTransaction {
 
     /// Scan keys in a range (ascending).
     pub async fn keys(&mut self, rng: Range<Key>, limit: u32, skip: u32) -> Result<Vec<Key>> {
-        if self.closed {
-            return Err(PgStoreError::TxClosed);
-        }
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let rows = Self::range_query_offset(
@@ -755,9 +741,6 @@ impl PgTransaction {
 
     /// Scan keys in a range (descending).
     pub async fn keysr(&mut self, rng: Range<Key>, limit: u32, skip: u32) -> Result<Vec<Key>> {
-        if self.closed {
-            return Err(PgStoreError::TxClosed);
-        }
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let rows = Self::range_query_offset(
@@ -779,9 +762,6 @@ impl PgTransaction {
         limit: u32,
         skip: u32,
     ) -> Result<Vec<(Key, Val)>> {
-        if self.closed {
-            return Err(PgStoreError::TxClosed);
-        }
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let rows = Self::range_query_offset(
@@ -803,9 +783,6 @@ impl PgTransaction {
         limit: u32,
         skip: u32,
     ) -> Result<Vec<(Key, Val)>> {
-        if self.closed {
-            return Err(PgStoreError::TxClosed);
-        }
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let rows = Self::range_query_offset(
@@ -822,8 +799,8 @@ impl PgTransaction {
 
     /// Count keys in a range.
     pub async fn count(&mut self, rng: Range<Key>) -> Result<u64> {
-        // B1: Check closed first — consistency with all other methods.
-        if self.closed {
+        // B1: Check open first — consistency with all other methods.
+        if self.conn.is_none() {
             return Err(PgStoreError::TxClosed);
         }
         // Empty range — skip DB round-trip.
@@ -855,9 +832,6 @@ impl PgTransaction {
     ///
     /// **Note**: The estimate may be stale if `ANALYZE` hasn't run recently.
     pub async fn count_approx(&mut self) -> Result<Option<u64>> {
-        if self.closed {
-            return Err(PgStoreError::TxClosed);
-        }
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let row = Self::build_query(persistent, &self.sql.count_approx)
@@ -925,7 +899,7 @@ impl Drop for PgTransaction {
         // WARNING on the next `begin()` call.
         //
         // Logged at debug level to avoid log spam.
-        if !self.closed {
+        if self.conn.is_some() {
             debug!("PgTransaction dropped without explicit commit/cancel; sqlx will auto-rollback");
         }
     }
