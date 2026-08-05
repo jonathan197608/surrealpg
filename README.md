@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: '71f87fbc-af8a-41af-a23f-1b25742d068a'
-  PropagateID: '71f87fbc-af8a-41af-a23f-1b25742d068a'
-  ReservedCode1: '34ba2ac8-4379-4a81-9a5d-8314d7901a08'
-  ReservedCode2: '34ba2ac8-4379-4a81-9a5d-8314d7901a08'
+  ProduceID: '51771223-cd8e-406f-b23a-96ee38e70c10'
+  PropagateID: '51771223-cd8e-406f-b23a-96ee38e70c10'
+  ReservedCode1: '86d7430e-57c7-4bc5-8751-a0787ab891c8'
+  ReservedCode2: '86d7430e-57c7-4bc5-8751-a0787ab891c8'
 ---
 
 # surreal-pg
@@ -55,11 +55,12 @@ SurrealDB 的事务语义 1:1 映射到 PostgreSQL 的 `BEGIN` / `COMMIT` / `ROL
 
 连接池初始化时自动探测服务器是否在 pgbouncer / Supavisor 之后，动态切换 prepared statement 策略：直连 PG 使用 named prepared statement 获得最佳性能；检测到 transaction-mode pooler 时自动降级为 unnamed statement 保证兼容性。也可通过环境变量手动覆盖。探测策略采用双连接 named prepared statement 冲突检测——两个连接分别创建同名 prepared statement，若发生 `42P05`（duplicate_prepared_statement）则判定为 pooler。小连接池（≤ 2）跳过探测默认关闭，避免池耗尽。
 
-### 5 层 26 参数精细化调优
+### 5 层 29 参数精细化调优
 
 内置分层调优系统，全部参数有合理默认值（零配置可用），也可通过 `PG_TUNED_*` 环境变量按需调整：
 
 - **连接池层**：连接数、超时、生命周期
+- **TCP keepalive 层**：空闲探测、探测间隔、失败计数
 - **表存储层**：fillfactor、TOAST 策略、UNLOGGED 模式
 - **Autovacuum 层**：死元组触发阈值、VACUUM 限流
 - **查询运行时层**：超时防护、锁等待、统计精度
@@ -292,7 +293,7 @@ curl -X POST -u "root:secret" \
 - **pool 参数**（max/min_connections、timeouts）：URL 参数 > `PG_TUNED_*` 调优默认值
 - **其他 URL 参数**：URL 参数 > 默认值；不识别的值打印 `warn` 并用默认值
 
-### 调优配置（26 个参数，5 层）
+### 调优配置（29 个参数，6 层）
 
 所有调优参数通过 `PG_TUNED_*` 环境变量配置，全部有合理默认值，开箱即用。
 
@@ -320,6 +321,18 @@ curl -X POST -u "root:secret" \
 | `PG_TUNED_POOL_ACQUIRE_TIMEOUT` | `10s` | 获取连接超时 |
 | `PG_TUNED_POOL_IDLE_TIMEOUT` | `600s` | 空闲连接回收时间 |
 | `PG_TUNED_POOL_MAX_LIFETIME` | `1800s` | 连接最大生存时间 |
+
+#### TCP keepalive 级（3 个参数）
+
+通过 `after_connect` 的 session `SET` 语句生效。TCP keepalive 让操作系统在连接空闲时主动发送探测包，及时发现被 Pooler/服务器静默断开的连接，避免"僵尸连接"导致池耗尽。
+
+| 环境变量 | 默认值 | 说明 |
+|---------|--------|------|
+| `PG_TUNED_KEEPALIVE_IDLE` | `60s` | 空闲多久后开始探测（Supabase Pooler 通常 ~60s 回收空闲连接） |
+| `PG_TUNED_KEEPALIVE_INTERVAL` | `10s` | 探测间隔 |
+| `PG_TUNED_KEEPALIVE_COUNT` | `5` | 连续探测失败次数，达到后判定连接死亡。总检测时间 = idle + interval × count |
+
+默认配置下，死亡连接在 60 + 10×5 = 110s 内被检测到。托管 PG（如 Supabase）可能忽略这些设置，但设置它们是安全的，对直连 PG 场景特别有效。
 
 #### KV 表存储级（4 个参数）
 
@@ -428,6 +441,19 @@ sqlx::query: elapsed=1.36s slow_threshold=1s
 - 必须加大 `acquire_timeout`（推荐 30s）
 - 同时加大 `min_connections` 减少冷启动建连频率
 
+**告警 4：`ZOMBIE POOL detected`**
+
+```
+pool_size=20 pool_idle=0 pool_max=20 tx_active=0 error=connection pool timeout
+```
+
+含义：连接池中有 N 个连接（`pool_size=N`），但 0 个空闲（`pool_idle=0`），同时代码中 0 个活跃事务（`tx_active=0`）。这是一个矛盾——如果没有代码持有连接，连接应该回到池中成为 idle。说明所有连接被 sqlx 内部持有（正在重建/健康检查中），不是代码泄漏。
+
+- **根因**：Supabase Pooler 在服务器端静默回收了空闲连接，sqlx 不知道连接已死，等到要用时才发现，然后所有连接同时进入重建状态
+- **防御 1**：TCP keepalive（已内置，默认 idle=60s/interval=10s/count=5），让 OS 主动检测断开
+- **防御 2**：`before_acquire` 条件式 ping（已内置），空闲超过 60s 的连接获取前先 ping
+- **应急**：若池完全卡死，重启进程；加大 `min_connections=5` 保持更多热连接
+
 #### 必须调整的参数
 
 | 参数 | 推荐值 | 原因 |
@@ -443,12 +469,14 @@ sqlx::query: elapsed=1.36s slow_threshold=1s
 | `connect_timeout`（URL 参数） | `30` | 与 acquire_timeout 对齐，避免 URL 层的连接超时先于池超时 |
 | `slow_acquire_threshold_secs`（URL 参数） | `10` | 跨 region 正常建连 2-3s，默认 2s 阈值会频繁误报 |
 | `slow_statements_threshold_secs`（URL 参数） | `5` | 含连接获取耗时的 SQL 执行时间不可控，默认 1s 阈值对跨 region 场景过低 |
+| `PG_TUNED_POOL_IDLE_TIMEOUT` | `300s` | 减少空闲回收时间，加速僵尸连接的淘汰（默认 600s 偏保守） |
 
 #### 完整启动命令
 
 ```bash
 PG_TUNED_POOL_ACQUIRE_TIMEOUT=30s \
 PG_TUNED_POOL_MIN_CONNECTIONS=5 \
+PG_TUNED_POOL_IDLE_TIMEOUT=300s \
 ./target/release/surreal-pg start \
     --user root --pass secret \
     --query-timeout 5m \
@@ -461,6 +489,9 @@ PG_TUNED_POOL_MIN_CONNECTIONS=5 \
 
 | 层次 | 超时 | 默认值 | 可调？ | 说明 |
 |------|------|--------|--------|------|
+| 0. TCP keepalive | 探测空闲 | 60s | `PG_TUNED_KEEPALIVE_IDLE` | OS 层面检测死连接 |
+| 0. TCP keepalive | 探测间隔 | 10s | `PG_TUNED_KEEPALIVE_INTERVAL` | 两次探测的时间间隔 |
+| 0. TCP keepalive | 失败判定 | 5 次 | `PG_TUNED_KEEPALIVE_COUNT` | 连续失败次数，总检测时间 = idle + interval × count |
 | 1. PG 服务器 | `statement_timeout` | 30s | `PG_TUNED_QUERY_STATEMENT_TIMEOUT` | 单条 SQL 执行上限 |
 | 2. PG 服务器 | `lock_timeout` | 10s | `PG_TUNED_QUERY_LOCK_TIMEOUT` | 等锁超时 |
 | 3. 连接池 | `acquire_timeout` | 10s | `PG_TUNED_POOL_ACQUIRE_TIMEOUT` | **推荐 30s** |
@@ -528,8 +559,13 @@ checkpoint_completion_target = 0.9
 | `pg_tx_started` | 累计启动的事务数 |
 | `pg_tx_committed` | 累计提交的事务数 |
 | `pg_tx_rolled_back` | 累计回滚/取消的事务数 |
+| `pg_tx_active` | 当前活跃事务数（连接被占用的数量） |
 
 指标恒等式：`tx_started = tx_committed + tx_rolled_back`（commit/cancel 失败也计入 rolled_back）。
+
+`pg_tx_active` 与 `pg_pool_size - pg_pool_idle` 的差值可以反映连接池状态：
+- **正常**：`tx_active ≈ pool_size - pool_idle`（所有非空闲连接都在事务中）
+- **僵尸池**：`tx_active = 0` 但 `pool_idle = 0`（所有连接被 sqlx 内部持有，非代码泄漏）
 
 连接池利用率超过 80% 时自动输出一次性 `warn` 日志，避免日志刷屏。
 
