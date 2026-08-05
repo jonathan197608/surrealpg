@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: 'f4f88452-4ce1-48c1-9b6e-7a9c259e651e'
-  PropagateID: 'f4f88452-4ce1-48c1-9b6e-7a9c259e651e'
-  ReservedCode1: 'b58e546d-9607-42ee-9ed2-0329caad5678'
-  ReservedCode2: 'b58e546d-9607-42ee-9ed2-0329caad5678'
+  ProduceID: '2ec749ff-1380-4f5a-9c41-b9507d669cf8'
+  PropagateID: '2ec749ff-1380-4f5a-9c41-b9507d669cf8'
+  ReservedCode1: '9a8da236-10ae-4ded-981e-d49c0db0bd4e'
+  ReservedCode2: '9a8da236-10ae-4ded-981e-d49c0db0bd4e'
 ---
 
 # surreal-pg
@@ -216,11 +216,18 @@ GraphQL 已内置，无需 experimental flag。通过 `DEFINE CONFIG GRAPHQL AUT
 > CREATE person SET name = 'Alice', age = 30;
 > DEFINE CONFIG GRAPHQL AUTO;
 
-# 通过 GraphQL 查询
+# 查询单条记录（需要 id 参数）
 curl -X POST -u "root:secret" \
   -H "Surreal-NS: myapp" -H "Surreal-DB: myapp" \
   -H "Content-Type: application/json" \
-  -d '{"query": "{ person { id name age } }"}' \
+  -d '{"query": "{ person(id: \"person:alice\") { id name age } }"}' \
+  http://localhost:8000/graphql
+
+# 查询全部记录（复数形式 persons）
+curl -X POST -u "root:secret" \
+  -H "Surreal-NS: myapp" -H "Surreal-DB: myapp" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "{ persons { id name age } }"}' \
   http://localhost:8000/graphql
 ```
 
