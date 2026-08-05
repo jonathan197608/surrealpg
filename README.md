@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: 'a776f1f9-a030-4a86-afb0-5a304dcc9557'
-  PropagateID: 'a776f1f9-a030-4a86-afb0-5a304dcc9557'
-  ReservedCode1: '446b5fa7-e197-41ca-b16e-a1b32f0f9e86'
-  ReservedCode2: '446b5fa7-e197-41ca-b16e-a1b32f0f9e86'
+  ProduceID: '71f87fbc-af8a-41af-a23f-1b25742d068a'
+  PropagateID: '71f87fbc-af8a-41af-a23f-1b25742d068a'
+  ReservedCode1: '34ba2ac8-4379-4a81-9a5d-8314d7901a08'
+  ReservedCode2: '34ba2ac8-4379-4a81-9a5d-8314d7901a08'
 ---
 
 # surreal-pg
@@ -381,7 +381,7 @@ PG_TUNED_POOL_ACQUIRE_TIMEOUT=30s \
 PG_TUNED_POOL_MIN_CONNECTIONS=5 \
 ./target/release/surreal-pg start --user root --pass secret \
     --query-timeout 5m \
-    postgresql://user:pass@host.pooler.supabase.com:6543/postgres?sslmode=require&min_connections=5&connect_timeout=30
+    postgresql://user:pass@host.pooler.supabase.com:6543/postgres?sslmode=require&min_connections=5&connect_timeout=30&slow_acquire_threshold_secs=10&slow_statements_threshold_secs=5
 ```
 
 ### Supabase / 云 Pooler 场景配置指南
@@ -396,6 +396,38 @@ Supabase Pooler（基于 PgBouncer/Supavisor）在 transaction 模式下，连�
 
 **根因**：连接池 `acquire_timeout`（默认 10s）在高并发下不够用，任务排队等不到连接，进而触发上层超时。节点注册的 60s 超时是 SurrealDB 硬编码的，不可配置，但如果连接池不超时，节点注册通常在毫秒级完成，远不会到 60s。
 
+#### 常见告警与应对
+
+**告警 1：`acquired connection, but time to acquire exceeded slow threshold`**
+
+```
+sqlx::pool::acquire: aquired_after_secs=6.4 slow_acquire_threshold_secs=2.0
+```
+
+含义：连接池获取连接耗时超过告警阈值（默认 2s），但最终获取成功。说明池子繁忙，新连接需要排队或冷启动建连。
+
+- 若偶尔出现：正常，跨 region 建连本身就慢
+- 若频繁出现：池容量不足，考虑加大 `max_connections` 或提高 `min_connections`
+- 若想调高告警阈值减少日志噪音：`slow_acquire_threshold_secs=10`（URL 参数）
+
+**告警 2：`slow statement: execution time exceeded alert threshold`**
+
+```
+sqlx::query: elapsed=1.36s slow_threshold=1s
+```
+
+含义：单条 SQL 执行耗时超过告警阈值（默认 1s）。对于简单的 KV 查询（如 `SELECT val FROM kv WHERE key = $1`），正常执行在毫秒级，1.36s 说明**不是 SQL 本身慢，而是等连接**——连接获取的耗时被计入 SQL 执行计时。
+
+- 根治：加大 `min_connections` 保持热连接，减少冷启动
+- 调高告警阈值减少日志噪音：`slow_statements_threshold_secs=5`（URL 参数）
+
+**告警 3：`connection pool timeout`**
+
+含义：连接池 `acquire_timeout` 内无法获取连接，事务直接失败。这是最严重的告警。
+
+- 必须加大 `acquire_timeout`（推荐 30s）
+- 同时加大 `min_connections` 减少冷启动建连频率
+
 #### 必须调整的参数
 
 | 参数 | 推荐值 | 原因 |
@@ -409,6 +441,8 @@ Supabase Pooler（基于 PgBouncer/Supavisor）在 transaction 模式下，连�
 |------|--------|------|
 | `--query-timeout`（SurrealDB CLI） | `5m` | 节点注册和内部操作可能因连接池排队耗时较长，1m 可能不够 |
 | `connect_timeout`（URL 参数） | `30` | 与 acquire_timeout 对齐，避免 URL 层的连接超时先于池超时 |
+| `slow_acquire_threshold_secs`（URL 参数） | `10` | 跨 region 正常建连 2-3s，默认 2s 阈值会频繁误报 |
+| `slow_statements_threshold_secs`（URL 参数） | `5` | 含连接获取耗时的 SQL 执行时间不可控，默认 1s 阈值对跨 region 场景过低 |
 
 #### 完整启动命令
 
@@ -418,7 +452,7 @@ PG_TUNED_POOL_MIN_CONNECTIONS=5 \
 ./target/release/surreal-pg start \
     --user root --pass secret \
     --query-timeout 5m \
-    postgresql://user:pass@host.pooler.supabase.com:6543/postgres?sslmode=require&min_connections=5&connect_timeout=30
+    postgresql://user:pass@host.pooler.supabase.com:6543/postgres?sslmode=require&min_connections=5&connect_timeout=30&slow_acquire_threshold_secs=10&slow_statements_threshold_secs=5
 ```
 
 #### 超时层次对照表
@@ -435,6 +469,15 @@ PG_TUNED_POOL_MIN_CONNECTIONS=5 \
 | 6. SurrealDB | 事务超时 | 无限制 | `--transaction-timeout` / `SURREAL_TRANSACTION_TIMEOUT` | 事务总执行上限 |
 
 推荐关系：`lock_timeout ≤ statement_timeout < acquire_timeout ≤ query-timeout`
+
+#### 告警阈值对照表
+
+告警阈值不影响功能，只控制日志输出。阈值过高会漏报真正的性能问题，过低则产生大量误报警报噪音。跨 region 场景下正常延迟基线更高，需适当调高。
+
+| 告警 | 阈值参数 | 默认值 | 跨 region 推荐值 | 说明 |
+|------|---------|--------|-----------------|------|
+| 连接获取慢 | `slow_acquire_threshold_secs` | 2s | 10s | 跨 region 建连 2-3s 属正常 |
+| SQL 执行慢 | `slow_statements_threshold_secs` | 1s | 5s | 含连接获取耗时，1s 阈值对跨 region过低 |
 
 ---
 
