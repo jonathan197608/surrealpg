@@ -2,3 +2,6 @@
 
 # Agent temp directory
 .temp/
+
+# CLI history files
+history.txt
