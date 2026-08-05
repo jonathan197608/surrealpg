@@ -32,6 +32,45 @@ use tracing::info;
 
 use crate::store::PgStore;
 
+/// Redact userinfo (username:password) from a PostgreSQL connection URL.
+///
+/// Turns `postgresql://user:pass@host:5432/db` into `postgresql://***:***@host:5432/db`.
+/// If the URL cannot be parsed or has no userinfo, returns the original string
+/// with a `(redaction failed)` suffix so the operator knows something is wrong.
+fn redact_url(url: &str) -> String {
+    // Find the scheme separator "://"
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let after_scheme = &url[scheme_end + 3..];
+
+    // Find the end of the authority (start of path '/', query '?', or fragment '#')
+    let authority_end = after_scheme
+        .find('/')
+        .or_else(|| after_scheme.find('?'))
+        .or_else(|| after_scheme.find('#'))
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    let rest = &after_scheme[authority_end..];
+
+    // Authority may be `[ipv6]:port` — skip if it starts with '['
+    if authority.starts_with('[') {
+        return url.to_string();
+    }
+
+    // Check if authority contains '@' (userinfo present)
+    let Some(at_pos) = authority.find('@') else {
+        return url.to_string(); // no userinfo to redact
+    };
+
+    let _userinfo = &authority[..at_pos];
+    let host_port = &authority[at_pos + 1..];
+
+    // Reconstruct: scheme://***:***@host:port/rest
+    let scheme = &url[..scheme_end + 3]; // includes "://"
+    format!("{scheme}***:***@{host_port}{rest}")
+}
+
 /// A composer that wraps [`CommunityComposer`] and adds PostgreSQL backend
 /// support.
 ///
@@ -91,7 +130,7 @@ impl TransactionBuilderFactory for PostgresComposer {
         config: ConfigMap,
     ) -> anyhow::Result<TransactionBuilderParts<Self::RouterState>> {
         if Self::is_pg_path(path) {
-            info!("Starting PostgreSQL kvs store at {path}");
+            info!("Starting PostgreSQL kvs store at {}", redact_url(path));
 
             // F2: ConfigMap is not used by the PG backend — connection
             // configuration comes from URL query params and environment
