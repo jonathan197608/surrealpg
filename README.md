@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: '55a6e57a-507c-40f1-bc6c-c36c0c467fdb'
-  PropagateID: '55a6e57a-507c-40f1-bc6c-c36c0c467fdb'
-  ReservedCode1: '2f124ab7-989e-4a39-a4cc-5219c02aa115'
-  ReservedCode2: '2f124ab7-989e-4a39-a4cc-5219c02aa115'
+  ProduceID: 'e4c157ac-43a3-403c-8973-eb557f349dd3'
+  PropagateID: 'e4c157ac-43a3-403c-8973-eb557f349dd3'
+  ReservedCode1: '18c3131c-258d-42a5-a1f4-253d569fb325'
+  ReservedCode2: '18c3131c-258d-42a5-a1f4-253d569fb325'
 ---
 
 # surreal-pg
@@ -227,7 +227,7 @@ curl -X POST -u "root:secret" \
 curl -X POST -u "root:secret" \
   -H "Surreal-NS: myapp" -H "Surreal-DB: myapp" \
   -H "Content-Type: application/json" \
-  -d '{"query": "{ person(id: \"person:8ifuxq45p74ngnx27qny\") { id name age } }"}' \
+  -d '{"query": "{ person(id: \"8ifuxq45p74ngnx27qny\") { id name age } }"}' \
   http://localhost:8000/graphql
 ```
 
