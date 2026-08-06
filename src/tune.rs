@@ -179,7 +179,19 @@ impl PgTuneConfig {
             // TCP keepalive
             keepalive_idle: env_duration("PG_TUNED_KEEPALIVE_IDLE", 60),
             keepalive_interval: env_duration("PG_TUNED_KEEPALIVE_INTERVAL", 10),
-            keepalive_count: env_u32("PG_TUNED_KEEPALIVE_COUNT", 5),
+            keepalive_count: {
+                let v = env_u32("PG_TUNED_KEEPALIVE_COUNT", 5);
+                if v > 100 {
+                    warn!(
+                        env = "PG_TUNED_KEEPALIVE_COUNT",
+                        value = v,
+                        "unreasonably high keepalive count (>100), using default 5"
+                    );
+                    5
+                } else {
+                    v
+                }
+            },
 
             // Table
             fillfactor,
@@ -209,6 +221,13 @@ impl PgTuneConfig {
                 if !v.is_finite() {
                     warn!(env = "PG_TUNED_AUTOVAC_VACUUM_SCALE", value = %v, "NaN/Infinity not allowed, using default 0.05");
                     0.05
+                } else if !(0.0..=1.0).contains(&v) {
+                    warn!(
+                        env = "PG_TUNED_AUTOVAC_VACUUM_SCALE",
+                        value = v,
+                        "out of range [0.0, 1.0], using default 0.05"
+                    );
+                    0.05
                 } else {
                     v
                 }
@@ -230,6 +249,13 @@ impl PgTuneConfig {
                 let v = env_f64("PG_TUNED_AUTOVAC_ANALYZE_SCALE", 0.02);
                 if !v.is_finite() {
                     warn!(env = "PG_TUNED_AUTOVAC_ANALYZE_SCALE", value = %v, "NaN/Infinity not allowed, using default 0.02");
+                    0.02
+                } else if !(0.0..=1.0).contains(&v) {
+                    warn!(
+                        env = "PG_TUNED_AUTOVAC_ANALYZE_SCALE",
+                        value = v,
+                        "out of range [0.0, 1.0], using default 0.02"
+                    );
                     0.02
                 } else {
                     v
@@ -395,6 +421,23 @@ impl PgTuneConfig {
             self.autovac_analyze_scale.is_finite(),
             "autovac_analyze_scale must be finite, got {}",
             self.autovac_analyze_scale
+        );
+        // Defense-in-depth: autovac cost_limit/cost_delay must be non-negative.
+        // These are validated in from_env(), but pub fields allow direct construction.
+        assert!(
+            self.autovac_vacuum_cost_limit >= 0,
+            "autovac_vacuum_cost_limit must be >= 0, got {}",
+            self.autovac_vacuum_cost_limit
+        );
+        assert!(
+            self.autovac_vacuum_cost_delay >= 0,
+            "autovac_vacuum_cost_delay must be >= 0, got {}",
+            self.autovac_vacuum_cost_delay
+        );
+        assert!(
+            self.autovac_vacuum_threshold >= 0,
+            "autovac_vacuum_threshold must be >= 0, got {}",
+            self.autovac_vacuum_threshold
         );
         format!(
             r#"
@@ -1061,6 +1104,96 @@ mod tests {
     fn test_tune_table_sql_rejects_nan_analyze_scale() {
         let c = PgTuneConfig {
             autovac_analyze_scale: f64::NAN,
+            ..PgTuneConfig::default()
+        };
+        let _ = c.tune_table_sql("kv");
+    }
+
+    // R6: autovac scale factors should be in [0.0, 1.0]
+    #[test]
+    fn test_autovac_scale_range_validation() {
+        // vacuum_scale > 1.0 → default
+        unsafe { std::env::set_var("PG_TUNED_AUTOVAC_VACUUM_SCALE", "1.5") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.autovac_vacuum_scale, 0.05, "1.5 should fall back to 0.05");
+
+        // vacuum_scale < 0.0 → default
+        unsafe { std::env::set_var("PG_TUNED_AUTOVAC_VACUUM_SCALE", "-0.1") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.autovac_vacuum_scale, 0.05,
+            "-0.1 should fall back to 0.05"
+        );
+
+        // analyze_scale > 1.0 → default
+        unsafe { std::env::set_var("PG_TUNED_AUTOVAC_ANALYZE_SCALE", "2.0") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.autovac_analyze_scale, 0.02,
+            "2.0 should fall back to 0.02"
+        );
+
+        // Boundaries: 0.0 and 1.0 are valid
+        unsafe { std::env::set_var("PG_TUNED_AUTOVAC_VACUUM_SCALE", "0.0") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.autovac_vacuum_scale, 0.0, "0.0 should pass through");
+
+        unsafe { std::env::set_var("PG_TUNED_AUTOVAC_VACUUM_SCALE", "1.0") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.autovac_vacuum_scale, 1.0, "1.0 should pass through");
+
+        unsafe {
+            std::env::remove_var("PG_TUNED_AUTOVAC_VACUUM_SCALE");
+            std::env::remove_var("PG_TUNED_AUTOVAC_ANALYZE_SCALE");
+        }
+    }
+
+    // R6: keepalive_count > 100 is unreasonable
+    #[test]
+    fn test_keepalive_count_upper_bound() {
+        unsafe { std::env::set_var("PG_TUNED_KEEPALIVE_COUNT", "200") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.keepalive_count, 5, "200 should fall back to 5");
+
+        // Normal value
+        unsafe { std::env::set_var("PG_TUNED_KEEPALIVE_COUNT", "10") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.keepalive_count, 10, "10 should pass through");
+
+        // Boundary: 100 is valid
+        unsafe { std::env::set_var("PG_TUNED_KEEPALIVE_COUNT", "100") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.keepalive_count, 100, "100 should pass through");
+
+        unsafe { std::env::remove_var("PG_TUNED_KEEPALIVE_COUNT") };
+    }
+
+    // R6: tune_table_sql defense-in-depth for autovac non-negative
+    #[test]
+    #[should_panic(expected = "autovac_vacuum_cost_limit must be >= 0")]
+    fn test_tune_table_sql_rejects_negative_cost_limit() {
+        let c = PgTuneConfig {
+            autovac_vacuum_cost_limit: -1,
+            ..PgTuneConfig::default()
+        };
+        let _ = c.tune_table_sql("kv");
+    }
+
+    #[test]
+    #[should_panic(expected = "autovac_vacuum_cost_delay must be >= 0")]
+    fn test_tune_table_sql_rejects_negative_cost_delay() {
+        let c = PgTuneConfig {
+            autovac_vacuum_cost_delay: -1,
+            ..PgTuneConfig::default()
+        };
+        let _ = c.tune_table_sql("kv");
+    }
+
+    #[test]
+    #[should_panic(expected = "autovac_vacuum_threshold must be >= 0")]
+    fn test_tune_table_sql_rejects_negative_vacuum_threshold() {
+        let c = PgTuneConfig {
+            autovac_vacuum_threshold: -1,
             ..PgTuneConfig::default()
         };
         let _ = c.tune_table_sql("kv");

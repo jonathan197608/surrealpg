@@ -182,12 +182,19 @@ impl PgStore {
         // use that; otherwise use a longer default (30s) since direct-mode
         // TCP connect across regions can be slow. Pool acquire_timeout
         // defaults to 10s which is too short for cross-region connect.
-        let connect_timeout = config.connect_timeout.unwrap_or_else(|| {
-            std::cmp::max(
-                tune.pool_acquire_timeout,
-                std::time::Duration::from_secs(30),
-            )
-        });
+        // In pool mode this is unused (Duration::ZERO placeholder).
+        let connect_timeout = if config.pooler {
+            config.connect_timeout.unwrap_or_else(|| {
+                std::cmp::max(
+                    tune.pool_acquire_timeout,
+                    std::time::Duration::from_secs(30),
+                )
+            })
+        } else {
+            // Pool mode: connect_timeout is not used — acquire_timeout
+            // governs connection acquisition (including establishment).
+            std::time::Duration::ZERO
+        };
 
         let vacuum_sql: Arc<str> = format!("VACUUM ANALYZE {}", config.table_name).into();
         let sql: Arc<Sql> = Arc::new(Sql::new(&config.table_name));
@@ -229,7 +236,9 @@ impl PgStore {
         let mode = if config.pooler {
             info!(
                 "pooler=true: using DIRECT connection mode (bypassing sqlx pool). \
-                 Each transaction creates a fresh TCP connection."
+                 Each transaction creates a fresh TCP connection. \
+                 connect_timeout={:?}",
+                connect_timeout
             );
             ConnectionMode::Direct(Box::new(opts))
         } else {
@@ -277,14 +286,8 @@ impl PgStore {
 
             info!(
                 "connection pool created: max={}, min={}, acquire_timeout={:?}, \
-                 connect_timeout={:?}, idle_timeout={:?}, max_lifetime={:?}, slow_acquire_threshold={:?}",
-                pool_max,
-                pool_min,
-                acquire_timeout,
-                connect_timeout,
-                idle_timeout,
-                max_lifetime,
-                slow_acquire
+                 idle_timeout={:?}, max_lifetime={:?}, slow_acquire_threshold={:?}",
+                pool_max, pool_min, acquire_timeout, idle_timeout, max_lifetime, slow_acquire
             );
             ConnectionMode::Pooled(pool)
         };
@@ -651,7 +654,15 @@ impl PgStore {
                         Err(_) => return Err(PgStoreError::ConnectTimeout(self.connect_timeout)),
                     };
                 let _ = Executor::execute(&mut conn, sqlx::raw_sql(&self.keepalive_sql)).await;
-                let _ = Executor::execute(&mut conn, sqlx::raw_sql(&self.session_sql)).await;
+                if let Err(e) = Executor::execute(&mut conn, sqlx::raw_sql(&self.session_sql)).await
+                {
+                    warn!(
+                        error = %e,
+                        "session SQL failed on VACUUM connection (non-fatal, but \
+                         statement_timeout/lock_timeout will not be set — VACUUM \
+                         may run longer than expected)"
+                    );
+                }
                 Executor::execute(&mut conn, sqlx::raw_sql(&self.vacuum_sql))
                     .await
                     .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
@@ -681,7 +692,13 @@ impl PgStore {
                     };
                 // Apply keepalive + session SQL for consistency with begin_direct/vacuum.
                 let _ = Executor::execute(&mut conn, sqlx::raw_sql(&self.keepalive_sql)).await;
-                let _ = Executor::execute(&mut conn, sqlx::raw_sql(&self.session_sql)).await;
+                if let Err(e) = Executor::execute(&mut conn, sqlx::raw_sql(&self.session_sql)).await
+                {
+                    warn!(
+                        error = %e,
+                        "session SQL failed on health-check connection (non-fatal)"
+                    );
+                }
                 Executor::execute(&mut conn, sqlx::raw_sql("SELECT 1"))
                     .await
                     .map_err(|e| PgStoreError::from_sqlx(None, &e))?;

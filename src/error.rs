@@ -63,6 +63,8 @@ impl PgStoreError {
     /// Whether this error is likely transient and worth retrying.
     ///
     /// - `PoolTimeout`: pool exhausted, may recover when connections are returned.
+    /// - `ConnectTimeout`: TCP connect timed out — may be transient (network
+    ///   blip, DNS hiccup, server temporarily refusing connections).
     /// - `Postgres` errors with `connection error [08`: the pooler/PG server
     ///   may have dropped the connection; retrying with a fresh connection
     ///   typically succeeds.
@@ -71,7 +73,7 @@ impl PgStoreError {
     #[must_use]
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::PoolTimeout => true,
+            Self::PoolTimeout | Self::ConnectTimeout(_) => true,
             Self::Postgres(msg) => msg.starts_with("connection error [08"),
             Self::Deadlock(_) | Self::SerializationFailure(_) => true,
             _ => false,
@@ -154,5 +156,37 @@ impl From<PgStoreError> for surrealdb_core::kvs::Error {
             PgStoreError::Postgres(msg) => Self::Transaction(msg),
             PgStoreError::Other(msg) => Self::Transaction(msg),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_is_transient() {
+        // PoolTimeout is transient
+        assert!(PgStoreError::PoolTimeout.is_transient());
+        // ConnectTimeout is transient
+        assert!(PgStoreError::ConnectTimeout(Duration::from_secs(30)).is_transient());
+        // Deadlock is transient
+        assert!(PgStoreError::Deadlock("test".to_string()).is_transient());
+        // SerializationFailure is transient
+        assert!(PgStoreError::SerializationFailure("test".to_string()).is_transient());
+        // Connection error (08xxx) is transient
+        assert!(
+            PgStoreError::Postgres("connection error [08006]: test".to_string()).is_transient()
+        );
+        // Non-connection Postgres error is NOT transient
+        assert!(!PgStoreError::Postgres("[23505]: unique violation".to_string()).is_transient());
+        // TxClosed is NOT transient
+        assert!(!PgStoreError::TxClosed.is_transient());
+        // TxReadOnly is NOT transient
+        assert!(!PgStoreError::TxReadOnly.is_transient());
+        // KeyAlreadyExists is NOT transient
+        assert!(!PgStoreError::KeyAlreadyExists(b"k".to_vec().into_boxed_slice()).is_transient());
+        // PoolClosed is NOT transient
+        assert!(!PgStoreError::PoolClosed.is_transient());
     }
 }

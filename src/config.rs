@@ -463,6 +463,11 @@ impl PgConfig {
                             ),
                         },
                         "max_lifetime" => match value.parse::<u64>() {
+                            Ok(0) => {
+                                tracing::warn!(
+                                    "max_lifetime=0 is invalid (connections would be immediately recycled), ignoring"
+                                );
+                            }
                             Ok(secs) => self.max_lifetime = Some(Duration::from_secs(secs)),
                             Err(_) => tracing::warn!(
                                 "max_lifetime='{value}' is not a valid number, ignoring"
@@ -500,12 +505,22 @@ impl PgConfig {
                             ),
                         },
                         "connect_timeout" => match value.parse::<u64>() {
+                            Ok(0) => {
+                                tracing::warn!(
+                                    "connect_timeout=0 is invalid (would cause immediate timeout), ignoring"
+                                );
+                            }
                             Ok(secs) => self.connect_timeout = Some(Duration::from_secs(secs)),
                             Err(_) => tracing::warn!(
                                 "connect_timeout='{value}' is not a valid number, ignoring"
                             ),
                         },
                         "idle_timeout" => match value.parse::<u64>() {
+                            Ok(0) => {
+                                tracing::warn!(
+                                    "idle_timeout=0 is invalid (would cause immediate timeout), ignoring"
+                                );
+                            }
                             Ok(secs) => self.idle_timeout = Some(Duration::from_secs(secs)),
                             Err(_) => tracing::warn!(
                                 "idle_timeout='{value}' is not a valid number, ignoring"
@@ -806,5 +821,36 @@ mod tests {
         assert_eq!(config.max_connections, Some(10));
         // The actual capping happens in store.rs; this test verifies that
         // the values are stored correctly for later validation.
+    }
+
+    // R6: timeout=0 should be rejected (would cause immediate timeout)
+    #[test]
+    fn test_timeout_zero_rejected() {
+        let mut config = PgConfig::default();
+        config
+            .merge_url_params("postgresql://u:p@h/db?connect_timeout=0")
+            .unwrap();
+        assert_eq!(
+            config.connect_timeout, None,
+            "connect_timeout=0 should be ignored"
+        );
+
+        let mut config2 = PgConfig::default();
+        config2
+            .merge_url_params("postgresql://u:p@h/db?idle_timeout=0")
+            .unwrap();
+        assert_eq!(
+            config2.idle_timeout, None,
+            "idle_timeout=0 should be ignored"
+        );
+
+        let mut config3 = PgConfig::default();
+        config3
+            .merge_url_params("postgresql://u:p@h/db?max_lifetime=0")
+            .unwrap();
+        assert_eq!(
+            config3.max_lifetime, None,
+            "max_lifetime=0 should be ignored"
+        );
     }
 }
