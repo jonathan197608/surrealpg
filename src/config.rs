@@ -70,6 +70,19 @@ fn hex_digit(b: u8) -> Option<u8> {
     }
 }
 
+/// Parse a boolean-like URL parameter value.
+///
+/// Accepts the same synonyms as [`PersistentStatements::parse`]:
+/// `true`/`1`/`yes`/`on`/`false`/`0`/`no`/`off` (case-insensitive).
+/// Returns `None` for unrecognized values.
+fn parse_bool_param(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 /// PostgreSQL storage engine configuration
 #[derive(Clone, Debug)]
 pub struct PgConfig {
@@ -455,10 +468,10 @@ impl PgConfig {
                                 "max_lifetime='{value}' is not a valid number, ignoring"
                             ),
                         },
-                        "auto_create_table" => match value.parse::<bool>() {
-                            Ok(v) => self.auto_create_table = v,
-                            Err(_) => tracing::warn!(
-                                "auto_create_table='{value}' is not a valid bool, ignoring"
+                        "auto_create_table" => match parse_bool_param(&value) {
+                            Some(v) => self.auto_create_table = v,
+                            None => tracing::warn!(
+                                "auto_create_table='{value}' is not a valid bool (expected true/false/yes/no/on/off/1/0), ignoring"
                             ),
                         },
                         "table_name" => {
@@ -515,11 +528,11 @@ impl PgConfig {
                                 "slow_statements_threshold_secs='{value}' is not a valid number, ignoring"
                             ),
                         },
-                        "pooler" => match value.parse::<bool>() {
-                            Ok(v) => self.pooler = v,
-                            Err(_) => {
-                                tracing::warn!("pooler='{value}' is not a valid bool, ignoring")
-                            }
+                        "pooler" => match parse_bool_param(&value) {
+                            Some(v) => self.pooler = v,
+                            None => tracing::warn!(
+                                "pooler='{value}' is not a valid bool (expected true/false/yes/no/on/off/1/0), ignoring"
+                            ),
                         },
                         _ => {}
                     }
@@ -719,5 +732,48 @@ mod tests {
             .unwrap();
         assert_eq!(config2.table_name, "my_table");
         assert_eq!(config2.min_connections, Some(3));
+    }
+
+    // Audit-3: parse_bool_param accepts same synonyms as PersistentStatements
+    #[test]
+    fn test_parse_bool_param_synonyms() {
+        assert_eq!(parse_bool_param("true"), Some(true));
+        assert_eq!(parse_bool_param("1"), Some(true));
+        assert_eq!(parse_bool_param("yes"), Some(true));
+        assert_eq!(parse_bool_param("on"), Some(true));
+        assert_eq!(parse_bool_param("false"), Some(false));
+        assert_eq!(parse_bool_param("0"), Some(false));
+        assert_eq!(parse_bool_param("no"), Some(false));
+        assert_eq!(parse_bool_param("off"), Some(false));
+        // Case-insensitive
+        assert_eq!(parse_bool_param("True"), Some(true));
+        assert_eq!(parse_bool_param("ON"), Some(true));
+        assert_eq!(parse_bool_param("No"), Some(false));
+        assert_eq!(parse_bool_param("OFF"), Some(false));
+        // Invalid
+        assert_eq!(parse_bool_param("maybe"), None);
+        assert_eq!(parse_bool_param("2"), None);
+    }
+
+    // Audit-3: merge_url_params should parse pooler with synonyms
+    #[test]
+    fn test_merge_url_params_pooler_synonyms() {
+        let mut config = PgConfig::default();
+        config
+            .merge_url_params("postgresql://u:p@h/db?pooler=on")
+            .unwrap();
+        assert!(config.pooler);
+
+        let mut config2 = PgConfig::default();
+        config2
+            .merge_url_params("postgresql://u:p@h/db?pooler=0")
+            .unwrap();
+        assert!(!config2.pooler);
+
+        let mut config3 = PgConfig::default();
+        config3
+            .merge_url_params("postgresql://u:p@h/db?pooler=yes")
+            .unwrap();
+        assert!(config3.pooler);
     }
 }

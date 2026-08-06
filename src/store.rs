@@ -76,7 +76,7 @@ pub struct PgStore {
     session_sql: Arc<str>,
     /// TCP keepalive SQL applied to every new connection (both modes).
     keepalive_sql: Arc<str>,
-    /// Connect timeout for direct-mode connections.
+    /// Connect timeout for direct-mode connections (TCP connect phase).
     connect_timeout: std::time::Duration,
 }
 
@@ -178,6 +178,16 @@ impl PgStore {
         let acquire_timeout = config.connect_timeout.unwrap_or(tune.pool_acquire_timeout);
         let idle_timeout = config.idle_timeout.or(Some(tune.pool_idle_timeout));
         let max_lifetime = config.max_lifetime.or(Some(tune.pool_max_lifetime));
+        // Connect timeout for direct mode: if user specified connect_timeout,
+        // use that; otherwise use a longer default (30s) since direct-mode
+        // TCP connect across regions can be slow. Pool acquire_timeout
+        // defaults to 10s which is too short for cross-region connect.
+        let connect_timeout = config.connect_timeout.unwrap_or_else(|| {
+            std::cmp::max(
+                tune.pool_acquire_timeout,
+                std::time::Duration::from_secs(30),
+            )
+        });
 
         let vacuum_sql: Arc<str> = format!("VACUUM ANALYZE {}", config.table_name).into();
         let sql: Arc<Sql> = Arc::new(Sql::new(&config.table_name));
@@ -266,8 +276,14 @@ impl PgStore {
 
             info!(
                 "connection pool created: max={}, min={}, acquire_timeout={:?}, \
-                 idle_timeout={:?}, max_lifetime={:?}, slow_acquire_threshold={:?}",
-                pool_max, pool_min, acquire_timeout, idle_timeout, max_lifetime, slow_acquire
+                 connect_timeout={:?}, idle_timeout={:?}, max_lifetime={:?}, slow_acquire_threshold={:?}",
+                pool_max,
+                pool_min,
+                acquire_timeout,
+                connect_timeout,
+                idle_timeout,
+                max_lifetime,
+                slow_acquire
             );
             ConnectionMode::Pooled(pool)
         };
@@ -294,10 +310,16 @@ impl PgStore {
                     }
                 }
                 ConnectionMode::Direct(conn_opts) => {
-                    let mut conn = conn_opts
-                        .connect()
-                        .await
-                        .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
+                    let mut conn =
+                        match tokio::time::timeout(connect_timeout, conn_opts.connect()).await {
+                            Ok(Ok(c)) => c,
+                            Ok(Err(e)) => {
+                                return Err(PgStoreError::from_sqlx(None, &e));
+                            }
+                            Err(_) => {
+                                return Err(PgStoreError::PoolTimeout);
+                            }
+                        };
                     // Apply session SQL + keepalive to this DDL connection too.
                     let _ = Executor::execute(&mut conn, sqlx::raw_sql(&keepalive_sql)).await;
                     let _ = Executor::execute(&mut conn, sqlx::raw_sql(&session_sql)).await;
@@ -373,7 +395,7 @@ impl PgStore {
             pool_warned: Arc::new(AtomicBool::new(false)),
             session_sql,
             keepalive_sql,
-            connect_timeout: acquire_timeout,
+            connect_timeout,
         }))
     }
 
@@ -571,10 +593,12 @@ impl PgStore {
                     .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
             }
             ConnectionMode::Direct(opts) => {
-                let mut conn = opts
-                    .connect()
-                    .await
-                    .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
+                let mut conn =
+                    match tokio::time::timeout(self.connect_timeout, opts.connect()).await {
+                        Ok(Ok(c)) => c,
+                        Ok(Err(e)) => return Err(PgStoreError::from_sqlx(None, &e)),
+                        Err(_) => return Err(PgStoreError::PoolTimeout),
+                    };
                 let _ = Executor::execute(&mut conn, sqlx::raw_sql(&self.keepalive_sql)).await;
                 let _ = Executor::execute(&mut conn, sqlx::raw_sql(&self.session_sql)).await;
                 Executor::execute(&mut conn, sqlx::raw_sql(&self.vacuum_sql))
@@ -598,10 +622,15 @@ impl PgStore {
                     .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
             }
             ConnectionMode::Direct(opts) => {
-                let mut conn = opts
-                    .connect()
-                    .await
-                    .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
+                let mut conn =
+                    match tokio::time::timeout(self.connect_timeout, opts.connect()).await {
+                        Ok(Ok(c)) => c,
+                        Ok(Err(e)) => return Err(PgStoreError::from_sqlx(None, &e)),
+                        Err(_) => return Err(PgStoreError::PoolTimeout),
+                    };
+                // Apply keepalive + session SQL for consistency with begin_direct/vacuum.
+                let _ = Executor::execute(&mut conn, sqlx::raw_sql(&self.keepalive_sql)).await;
+                let _ = Executor::execute(&mut conn, sqlx::raw_sql(&self.session_sql)).await;
                 Executor::execute(&mut conn, sqlx::raw_sql("SELECT 1"))
                     .await
                     .map_err(|e| PgStoreError::from_sqlx(None, &e))?;

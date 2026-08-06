@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: 'd78c0c8e-e8a7-482c-9f47-a38ec2b4150d'
-  PropagateID: 'd78c0c8e-e8a7-482c-9f47-a38ec2b4150d'
-  ReservedCode1: '93d6b653-7404-42dd-82f0-5f854a832083'
-  ReservedCode2: '93d6b653-7404-42dd-82f0-5f854a832083'
+  ProduceID: '09aaa6b2-0694-405a-96ec-e0d97a422ef4'
+  PropagateID: '09aaa6b2-0694-405a-96ec-e0d97a422ef4'
+  ReservedCode1: 'abb96e69-64e9-47c1-9046-cf0794eb9e19'
+  ReservedCode2: 'abb96e69-64e9-47c1-9046-cf0794eb9e19'
 ---
 
 # surreal-pg
@@ -287,7 +287,7 @@ curl -X POST -u "root:secret" \
 |------|--------|------|
 | `max_connections` | 20 | 连接池最大连接数（0 会被忽略） |
 | `min_connections` | 5 | 连接池最小保持连接数（若 > max_connections 则被忽略） |
-| `connect_timeout` | 10（秒） | 获取连接超时 |
+| `connect_timeout` | 10（池模式）/ 30（直连模式，秒） | 池模式：获取连接超时；直连模式：TCP 建连超时（跨 region 默认 30s） |
 | `idle_timeout` | 600（秒） | 空闲连接回收时间 |
 | `max_lifetime` | 1800（秒） | 连接最大生存时间 |
 | `slow_acquire_threshold_secs` | 2（秒） | 获取连接耗时超过此值时输出 WARN 日志（sqlx 默认 2s） |
@@ -513,7 +513,7 @@ pool_size=20 pool_idle=0 pool_max=20 tx_active=0 error=connection pool timeout
 | 参数 | 推荐值 | 原因 |
 |------|--------|------|
 | `--query-timeout`（SurrealDB CLI） | `5m` | 节点注册和内部操作可能因连接池排队耗时较长，1m 可能不够 |
-| `connect_timeout`（URL 参数） | `30` | 与 acquire_timeout 对齐，避免 URL 层的连接超时先于池超时 |
+| `connect_timeout`（URL 参数） | `30` | 池模式下与 acquire_timeout 对齐；直连模式下默认 30s，适合跨 region 建连 |
 | `slow_acquire_threshold_secs`（URL 参数） | `10` | 跨 region 正常建连 2-3s，默认 2s 阈值会频繁误报 |
 | `slow_statements_threshold_secs`（URL 参数） | `5` | 含连接获取耗时的 SQL 执行时间不可控，默认 1s 阈值对跨 region 场景过低 |
 | `PG_TUNED_POOL_IDLE_TIMEOUT` | `300s` | 减少空闲回收时间，加速僵尸连接的淘汰（默认 600s 偏保守） |
