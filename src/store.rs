@@ -537,20 +537,56 @@ impl PgStore {
 
     /// Shut down gracefully.
     ///
-    /// **Pool mode**: closes the sqlx connection pool.
-    /// **Direct mode**: no-op (no pool to close; active transactions will
-    /// close their connections on drop).
+    /// **Pool mode**: closes the sqlx connection pool (waits for all
+    /// connections to be returned, then closes them).
+    ///
+    /// **Direct mode**: waits for in-flight transactions to finish (up to
+    /// 30s), then logs completion. There is no pool to close — each
+    /// transaction owns its TCP connection, which is closed when the
+    /// transaction commits/cancels/drops.
     pub async fn shutdown(&self) {
         match &self.mode {
             ConnectionMode::Pooled(pool) => {
                 pool.close().await;
             }
             ConnectionMode::Direct(_) => {
-                // No pool to close. Active transactions will close their
-                // connections on drop.
+                let active = self.tx_active.load(AtomicOrdering::Relaxed);
+                if active > 0 {
+                    info!(
+                        tx_active = active,
+                        "shutdown: waiting for in-flight direct-mode transactions to complete"
+                    );
+                    // Wait for active transactions to drain. Each transaction
+                    // decrements tx_active on commit/cancel/drop.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    loop {
+                        let remaining = self.tx_active.load(AtomicOrdering::Relaxed);
+                        if remaining == 0 {
+                            break;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            warn!(
+                                tx_active = remaining,
+                                "shutdown: timed out waiting for direct-mode transactions \
+                                 to complete — proceeding with shutdown"
+                            );
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
             }
         }
-        info!("PgStore shut down");
+        let active = self.tx_active.load(AtomicOrdering::Relaxed);
+        if active > 0 {
+            warn!(
+                tx_active = active,
+                "PgStore shut down with in-flight transactions (they will be \
+                 rolled back on connection close/drop)"
+            );
+        } else {
+            info!("PgStore shut down (0 active transactions)");
+        }
     }
 
     /// Get a reference to the current config.
