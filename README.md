@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: '4af8ca76-e321-461b-9eba-fde0a3bef363'
-  PropagateID: '4af8ca76-e321-461b-9eba-fde0a3bef363'
-  ReservedCode1: '49d9413f-907f-4b0f-8aa7-bdd4fd27c79d'
-  ReservedCode2: '49d9413f-907f-4b0f-8aa7-bdd4fd27c79d'
+  ProduceID: 'ac167bf2-b4c6-4860-b042-6af2884fd692'
+  PropagateID: 'ac167bf2-b4c6-4860-b042-6af2884fd692'
+  ReservedCode1: 'eda4df66-7e31-463c-92f7-bcdbe22815f9'
+  ReservedCode2: 'eda4df66-7e31-463c-92f7-bcdbe22815f9'
 ---
 
 # surreal-pg
@@ -190,23 +190,22 @@ cargo build --release
 
 ### 启动
 
-首次启动和二次启动的命令区别在于 `auto_create_table` 参数——首次启动需要自动建表和表调优（默认行为），二次启动表已存在，可显式关闭以跳过 DDL 减少启动耗时。
+首次启动和二次启动的命令有三个区别：
+
+| 区别 | 首次启动 | 二次启动 |
+|------|---------|---------|
+| `--user` / `--pass` | **必须指定**，首次启动需要认证凭据来初始化 SurrealDB 的权限系统 | 可省略 — 凭据已持久化在 PG 中，SurrealDB 启动后自动加载 |
+| `auto_create_table` | 默认 `true`，执行建表 + 表调优 DDL | 设为 `false`，跳过 DDL，启动更快（约省 1-2 秒） |
+| 启动日志 | 含 `table 'kv' initialized` / `tuning applied` | 无 DDL 日志 |
 
 ```bash
-# ── 首次启动（建表 + 表调优）──
-# auto_create_table=true 是默认值，首次启动无需额外指定：
+# ── 首次启动（建表 + 表调优，必须指定 --user/--pass）──
 ./target/release/surreal-pg start \
     --user root --pass secret \
     postgresql://user:pass@localhost:5432/surrealdb
 
-# 启动日志中会出现：
-#   table 'kv' initialized
-#   table 'kv' tuning applied (fillfactor=90, toast=external, autovac tuned)
-
-# ── 二次启动（跳过建表）──
-# 表已存在时，关闭 auto_create_table 可跳过 DDL，启动更快：
+# ── 二次启动（跳过建表，凭据已持久化可省略 --user/--pass）──
 ./target/release/surreal-pg start \
-    --user root --pass secret \
     postgresql://user:pass@localhost:5432/surrealdb?auto_create_table=false
 
 # ── Supabase Pooler 首次启动（直连模式）──
@@ -214,20 +213,19 @@ cargo build --release
     --user root --pass secret \
     postgresql://user:pass@host.pooler.supabase.com:6543/postgres?sslmode=require&pooler=true
 
-# ── Supabase Pooler 二次启动（直连模式，跳过建表）──
+# ── Supabase Pooler 二次启动（直连模式，精简命令）──
 ./target/release/surreal-pg start \
-    --user root --pass secret \
     postgresql://user:pass@host.pooler.supabase.com:6543/postgres?sslmode=require&pooler=true&auto_create_table=false
 ```
 
-> **何时需要 `auto_create_table=true`**：首次部署、表被意外删除、或需要重新应用表调优参数（fillfactor/TOAST/autovac）时。其余情况均可设为 `false`，跳过 DDL 执行减少约 1-2 秒启动时间。
+> **何时需要 `auto_create_table=true`**：首次部署、表被意外删除、或需要重新应用表调优参数（fillfactor/TOAST/autovac）时。其余情况均可设为 `false`。
 
 ### 连接池模式启动（Supabase Pooler 备选）
 
 如果不使用 `pooler=true` 直连模式，需要配合调优参数：
 
 ```bash
-# ── 首次启动（连接池模式，需调参）──
+# ── 首次启动（连接池模式，需调参，必须指定 --user/--pass）──
 PG_TUNED_POOL_ACQUIRE_TIMEOUT=30s \
 PG_TUNED_POOL_MIN_CONNECTIONS=5 \
 PG_TUNED_POOL_IDLE_TIMEOUT=300s \
@@ -236,12 +234,11 @@ PG_TUNED_POOL_IDLE_TIMEOUT=300s \
     --query-timeout 5m \
     postgresql://user:pass@host.pooler.supabase.com:6543/postgres?sslmode=require&min_connections=5&connect_timeout=30&slow_acquire_threshold_secs=10&slow_statements_threshold_secs=5
 
-# ── 二次启动（连接池模式，跳过建表）──
+# ── 二次启动（连接池模式，精简命令）──
 PG_TUNED_POOL_ACQUIRE_TIMEOUT=30s \
 PG_TUNED_POOL_MIN_CONNECTIONS=5 \
 PG_TUNED_POOL_IDLE_TIMEOUT=300s \
 ./target/release/surreal-pg start \
-    --user root --pass secret \
     --query-timeout 5m \
     postgresql://user:pass@host.pooler.supabase.com:6543/postgres?sslmode=require&min_connections=5&connect_timeout=30&slow_acquire_threshold_secs=10&slow_statements_threshold_secs=5&auto_create_table=false
 ```
