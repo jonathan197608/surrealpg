@@ -433,7 +433,10 @@ impl PgTransaction {
 
     /// Check whether a key exists.
     pub async fn exists(&mut self, key: Key) -> Result<bool> {
-        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        if self.conn.is_none() {
+            return Err(PgStoreError::TxClosed);
+        }
+        let conn = self.conn.as_mut().unwrap();
         let persistent = self.persistent;
         let row = Self::build_query(persistent, &self.sql.exists)
             .bind(&key)
@@ -445,7 +448,10 @@ impl PgTransaction {
 
     /// Get the value for a key.
     pub async fn get(&mut self, key: Key) -> Result<Option<Val>> {
-        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        if self.conn.is_none() {
+            return Err(PgStoreError::TxClosed);
+        }
+        let conn = self.conn.as_mut().unwrap();
         let persistent = self.persistent;
         let row = Self::build_query(persistent, &self.sql.get)
             .bind(&key)
@@ -465,7 +471,7 @@ impl PgTransaction {
         }
 
         let keys_ref: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
-        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        let conn = self.conn.as_mut().unwrap();
         let persistent = self.persistent;
 
         let rows = Self::build_query(persistent, &self.sql.getm)
@@ -511,7 +517,7 @@ impl PgTransaction {
             return Err(PgStoreError::TxClosed);
         }
         self.check_writable()?;
-        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        let conn = self.conn.as_mut().unwrap();
         let persistent = self.persistent;
         Self::build_query(persistent, &self.sql.set)
             .bind(key.as_slice())
@@ -598,7 +604,7 @@ impl PgTransaction {
             return Err(PgStoreError::TxClosed);
         }
         self.check_writable()?;
-        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        let conn = self.conn.as_mut().unwrap();
         let persistent = self.persistent;
         let result = Self::build_query(persistent, &self.sql.put)
             .bind(key.as_slice())
@@ -624,7 +630,7 @@ impl PgTransaction {
             return self.put(key, val).await;
         };
 
-        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        let conn = self.conn.as_mut().unwrap();
         let persistent = self.persistent;
         let affected = Self::build_query(persistent, &self.sql.putc)
             .bind(key.as_slice())
@@ -648,7 +654,7 @@ impl PgTransaction {
             return Err(PgStoreError::TxClosed);
         }
         self.check_writable()?;
-        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        let conn = self.conn.as_mut().unwrap();
         let persistent = self.persistent;
         Self::build_query(persistent, &self.sql.del)
             .bind(key.as_slice())
@@ -671,7 +677,7 @@ impl PgTransaction {
             return self.del(key).await;
         };
 
-        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        let conn = self.conn.as_mut().unwrap();
         let persistent = self.persistent;
         let result = Self::build_query(persistent, &self.sql.delc)
             .bind(key.as_slice())
@@ -696,7 +702,7 @@ impl PgTransaction {
         if rng.start >= rng.end {
             return Ok(());
         }
-        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        let conn = self.conn.as_mut().unwrap();
         let persistent = self.persistent;
         let deleted = Self::build_query(persistent, &self.sql.delr)
             .bind(rng.start.as_slice())
@@ -768,7 +774,10 @@ impl PgTransaction {
 
     /// Scan keys in a range (ascending).
     pub async fn keys(&mut self, rng: Range<Key>, limit: u32, skip: u32) -> Result<Vec<Key>> {
-        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        if self.conn.is_none() {
+            return Err(PgStoreError::TxClosed);
+        }
+        let conn = self.conn.as_mut().unwrap();
         let persistent = self.persistent;
         let rows = Self::range_query_offset(
             conn.conn_mut(),
@@ -784,7 +793,10 @@ impl PgTransaction {
 
     /// Scan keys in a range (descending).
     pub async fn keysr(&mut self, rng: Range<Key>, limit: u32, skip: u32) -> Result<Vec<Key>> {
-        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        if self.conn.is_none() {
+            return Err(PgStoreError::TxClosed);
+        }
+        let conn = self.conn.as_mut().unwrap();
         let persistent = self.persistent;
         let rows = Self::range_query_offset(
             conn.conn_mut(),
@@ -805,7 +817,10 @@ impl PgTransaction {
         limit: u32,
         skip: u32,
     ) -> Result<Vec<(Key, Val)>> {
-        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        if self.conn.is_none() {
+            return Err(PgStoreError::TxClosed);
+        }
+        let conn = self.conn.as_mut().unwrap();
         let persistent = self.persistent;
         let rows = Self::range_query_offset(
             conn.conn_mut(),
@@ -826,7 +841,10 @@ impl PgTransaction {
         limit: u32,
         skip: u32,
     ) -> Result<Vec<(Key, Val)>> {
-        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        if self.conn.is_none() {
+            return Err(PgStoreError::TxClosed);
+        }
+        let conn = self.conn.as_mut().unwrap();
         let persistent = self.persistent;
         let rows = Self::range_query_offset(
             conn.conn_mut(),
@@ -850,7 +868,7 @@ impl PgTransaction {
         if rng.start >= rng.end {
             return Ok(0);
         }
-        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        let conn = self.conn.as_mut().unwrap();
         let persistent = self.persistent;
         let row = Self::build_query(persistent, &self.sql.count)
             .bind(rng.start.as_slice())
@@ -875,7 +893,10 @@ impl PgTransaction {
     ///
     /// **Note**: The estimate may be stale if `ANALYZE` hasn't run recently.
     pub async fn count_approx(&mut self) -> Result<Option<u64>> {
-        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        if self.conn.is_none() {
+            return Err(PgStoreError::TxClosed);
+        }
+        let conn = self.conn.as_mut().unwrap();
         let persistent = self.persistent;
         let row = Self::build_query(persistent, &self.sql.count_approx)
             .bind(&self.sql.table_name)

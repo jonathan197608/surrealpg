@@ -550,6 +550,12 @@ SET effective_cache_size = '{ecs}';"#,
 
     /// Log recommendations for PG server parameters that cannot be set via
     /// `SET` and require `postgresql.conf` changes (with restart).
+    ///
+    /// Note: `shared_buffers` and `wal_buffers` are only logged here as
+    /// recommendations — they are NOT embedded into SQL statements (unlike
+    /// `work_mem`/`maintenance_work_mem`/`effective_cache_size` which are
+    /// set via `session_sql()`), so they don't need defense-in-depth
+    /// validation in `session_sql()`.
     pub fn log_server_hints(&self) {
         info!(
             "PG server params (require postgresql.conf + restart): \
@@ -668,7 +674,7 @@ fn env_bool(key: &str, default: bool) -> bool {
     }
 }
 
-/// Like `env_duration_nonzero`, but rejects zero durations.
+/// Read a duration from an environment variable, rejecting zero durations.
 ///
 /// A zero timeout would cause immediate expiry (e.g. `acquire_timeout=0`
 /// means "fail instantly"), which is almost certainly a misconfiguration.
