@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use sqlx::Transaction;
+use sqlx::postgres::PgConnection;
 use sqlx::{Executor, Row};
 use tracing::{debug, trace, warn};
 
@@ -136,28 +137,47 @@ impl Sql {
 
 // ─── PgTransaction ──────────────────────────────────────
 
+/// Connection underlying a transaction, supporting both pool and direct modes.
+///
+/// - `Pooled`: sqlx `Transaction` manages the connection lifecycle (auto-RB on drop).
+/// - `Direct`:  a raw `PgConnection` with manual `BEGIN`. On commit/cancel we
+///   send `COMMIT`/`ROLLBACK` and then drop the connection (closing the TCP link).
+///   Direct mode is used behind poolers (Supabase Pooler / pgbouncer tx mode)
+///   to avoid the "zombie pool" problem where the pooler silently reclaims idle
+///   connections and sqlx's internal pool enters a stuck rebuild state.
+pub(crate) enum TxConn {
+    /// Pool mode: sqlx `Transaction` owns a pooled `PoolConnection`.
+    Pooled(Transaction<'static, sqlx::Postgres>),
+    /// Direct mode: raw connection, manually `BEGIN`-started.
+    /// `committed`/`rolled_back` are tracked via the surrounding `Option`.
+    Direct(PgConnection),
+}
+
+impl TxConn {
+    /// Get a mutable reference to the underlying `PgConnection`.
+    fn conn_mut(&mut self) -> &mut PgConnection {
+        match self {
+            Self::Pooled(tx) => tx.deref_mut(),
+            Self::Direct(conn) => conn,
+        }
+    }
+}
+
 /// A transaction backed by a single PostgreSQL connection.
 ///
 /// Implements all KV operations that SurrealDB's `Transactable` trait requires.
-/// After `commit()` or `cancel()`, the internal `Transaction` is consumed
-/// (sqlx's API takes `mut self`), setting `conn` to `None` — all subsequent
+/// After `commit()` or `cancel()`, the internal connection is consumed
+/// (taken from the `Option`), setting `conn` to `None` — all subsequent
 /// operations return `TxClosed`.
 ///
 /// All SQL strings are pre-built at construction time to eliminate per-operation
 /// `format!()` heap allocations on the hot path.
 pub struct PgTransaction {
-    /// The sqlx-managed PG transaction (auto-rollbacks on Drop).
+    /// The underlying connection/transaction (auto-rollbacks on Drop for pooled;
+    /// manual ROLLBACK on Drop for direct).
     ///
-    /// Using sqlx's `Transaction` API instead of raw `execute("BEGIN")` +
-    /// `PoolConnection` ensures that `transaction_depth` is correctly
-    /// maintained and `Transaction::drop` automatically queues a ROLLBACK
-    /// for any uncommitted transaction, preventing the "there is already
-    /// a transaction in progress" WARNING when connections return to the pool.
-    ///
-    /// `None` after commit/cancel (Transaction is consumed by sqlx's API).
-    /// This replaces the former `closed: bool` field — the transaction's
-    /// open/closed state is fully derivable from `conn.is_some()`.
-    conn: Option<Transaction<'static, sqlx::Postgres>>,
+    /// `None` after commit/cancel.
+    conn: Option<TxConn>,
     /// Whether this is a write transaction
     writeable: bool,
     /// Savepoint naming counter
@@ -184,13 +204,13 @@ pub struct PgTransaction {
 }
 
 impl PgTransaction {
-    /// Create a new transaction wrapping a sqlx `Transaction`.
+    /// Create a new transaction wrapping a sqlx `Transaction` (pool mode).
     ///
     /// The caller must have already started the transaction via
     /// `pool.begin_with()`. SQL strings are provided as a pre-built
     /// `Arc<Sql>`, shared from `PgStore` to avoid per-transaction
     /// `format!()` allocations.
-    pub(crate) fn new_with_sql(
+    pub(crate) fn new_pooled(
         conn: Transaction<'static, sqlx::Postgres>,
         writeable: bool,
         isolation: PgIsolation,
@@ -199,7 +219,32 @@ impl PgTransaction {
         tx_active: Arc<AtomicU64>,
     ) -> Self {
         Self {
-            conn: Some(conn),
+            conn: Some(TxConn::Pooled(conn)),
+            writeable,
+            savepoint_counter: 0,
+            savepoints: Vec::new(),
+            isolation,
+            persistent,
+            sql,
+            tx_active,
+        }
+    }
+
+    /// Create a new transaction wrapping a raw `PgConnection` (direct mode).
+    ///
+    /// The caller must have already connected and sent `BEGIN …` on the
+    /// connection. The connection is owned by this transaction and will be
+    /// closed (dropped) on commit/cancel/drop after sending `COMMIT`/`ROLLBACK`.
+    pub(crate) fn new_direct(
+        conn: PgConnection,
+        writeable: bool,
+        isolation: PgIsolation,
+        persistent: bool,
+        sql: Arc<Sql>,
+        tx_active: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            conn: Some(TxConn::Direct(conn)),
             writeable,
             savepoint_counter: 0,
             savepoints: Vec::new(),
@@ -225,8 +270,8 @@ impl PgTransaction {
     /// use inline destructured borrows instead to avoid conflicts with
     /// `&self.sql` references.
     fn conn_mut(&mut self) -> Result<&mut sqlx::postgres::PgConnection> {
-        let tx = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
-        Ok(tx.deref_mut())
+        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        Ok(conn.conn_mut())
     }
 
     fn check_writable(&self) -> Result<()> {
@@ -297,45 +342,70 @@ impl PgTransaction {
 
     /// Commit the transaction.
     ///
-    /// Uses sqlx's `Transaction::commit()` which sends `COMMIT` to PG
-    /// and releases the connection back to the pool. On error (e.g.
+    /// **Pool mode**: Uses sqlx's `Transaction::commit()` which sends `COMMIT`
+    /// to PG and releases the connection back to the pool. On error (e.g.
     /// serialization conflict), the connection is still released — PG
-    /// auto-rollbacks. After this call, `conn` is `None` so all
-    /// subsequent operations return `TxClosed`.
+    /// auto-rollbacks.
+    ///
+    /// **Direct mode**: Sends `COMMIT` via `raw_sql`, then drops the connection
+    /// (closing the TCP link). On error, PG auto-rollbacks; we still drop the
+    /// connection.
+    ///
+    /// After this call, `conn` is `None` so all subsequent operations return
+    /// `TxClosed`.
     pub async fn commit(&mut self) -> Result<()> {
-        // Take ownership of the Transaction — sqlx's commit() consumes self.
-        // On success, PG commits. On error, PG auto-rollbacks.
-        // conn.take() sets conn=None, making all subsequent operations
-        // return TxClosed.
-        let tx = self.conn.take().ok_or(PgStoreError::TxClosed)?;
+        let txconn = self.conn.take().ok_or(PgStoreError::TxClosed)?;
         self.savepoints.clear();
         self.release_active();
-        let result = tx.commit().await;
-        if let Err(e) = &result {
-            debug!("COMMIT failed (PG will auto-rollback): {e}");
+        match txconn {
+            TxConn::Pooled(tx) => {
+                let result = tx.commit().await;
+                if let Err(e) = &result {
+                    debug!("COMMIT failed (PG will auto-rollback): {e}");
+                }
+                result.map_err(|e| PgStoreError::from_sqlx(None, &e))?;
+            }
+            TxConn::Direct(mut conn) => {
+                // Send COMMIT. On failure, PG auto-rollbacks; the connection
+                // is about to be closed anyway.
+                if let Err(e) = Executor::execute(&mut conn, sqlx::raw_sql("COMMIT")).await {
+                    debug!("COMMIT failed (direct mode, PG auto-rollbacks): {e}");
+                    return Err(PgStoreError::from_sqlx(None, &e));
+                }
+                // Connection is dropped here — TCP connection closes.
+            }
         }
-        result.map_err(|e| PgStoreError::from_sqlx(None, &e))?;
         debug!("transaction committed");
         Ok(())
     }
 
     /// Rollback (cancel) the transaction.
     ///
-    /// Uses sqlx's `Transaction::rollback()` which sends `ROLLBACK` to PG
-    /// and releases the connection back to the pool. On error, the
-    /// connection is still released via sqlx's Drop handling.
+    /// **Pool mode**: Uses sqlx's `Transaction::rollback()` which sends
+    /// `ROLLBACK` to PG and releases the connection back to the pool.
+    ///
+    /// **Direct mode**: Sends `ROLLBACK` via `raw_sql`, then drops the
+    /// connection (closing the TCP link).
     pub async fn cancel(&mut self) -> Result<()> {
-        // Take ownership of the Transaction — sqlx's rollback() consumes self.
-        // conn.take() sets conn=None, making all subsequent operations
-        // return TxClosed.
-        let tx = self.conn.take().ok_or(PgStoreError::TxClosed)?;
+        let txconn = self.conn.take().ok_or(PgStoreError::TxClosed)?;
         self.savepoints.clear();
         self.release_active();
-        let result = tx.rollback().await;
-        if let Err(e) = &result {
-            debug!("ROLLBACK failed: {e}");
+        match txconn {
+            TxConn::Pooled(tx) => {
+                let result = tx.rollback().await;
+                if let Err(e) = &result {
+                    debug!("ROLLBACK failed: {e}");
+                }
+                result.map_err(|e| PgStoreError::from_sqlx(None, &e))?;
+            }
+            TxConn::Direct(mut conn) => {
+                if let Err(e) = Executor::execute(&mut conn, sqlx::raw_sql("ROLLBACK")).await {
+                    debug!("ROLLBACK failed (direct mode): {e}");
+                    return Err(PgStoreError::from_sqlx(None, &e));
+                }
+                // Connection is dropped here — TCP connection closes.
+            }
         }
-        result.map_err(|e| PgStoreError::from_sqlx(None, &e))?;
         debug!("transaction rolled back");
         Ok(())
     }
@@ -357,7 +427,7 @@ impl PgTransaction {
     // All KV operation methods use "destructured borrows": they access
     // `self.conn` (mutable) and `self.sql` (immutable) as **separate
     // fields** of `self`. Rust allows simultaneous borrows of different
-    // fields, so `&self.sql.field` and `conn.deref_mut()` coexist in the
+    // fields, so `&self.sql.field` and `conn.conn_mut()` coexist in the
     // same scope without `Arc::clone`. This eliminates per-operation
     // atomic refcount overhead on the hot path.
 
@@ -367,7 +437,7 @@ impl PgTransaction {
         let persistent = self.persistent;
         let row = Self::build_query(persistent, &self.sql.exists)
             .bind(&key)
-            .fetch_optional(conn.deref_mut())
+            .fetch_optional(conn.conn_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?;
         Ok(row.is_some())
@@ -379,7 +449,7 @@ impl PgTransaction {
         let persistent = self.persistent;
         let row = Self::build_query(persistent, &self.sql.get)
             .bind(&key)
-            .fetch_optional(conn.deref_mut())
+            .fetch_optional(conn.conn_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?;
         Ok(row.map(|r| r.get::<Vec<u8>, _>("val")))
@@ -400,7 +470,7 @@ impl PgTransaction {
 
         let rows = Self::build_query(persistent, &self.sql.getm)
             .bind(&keys_ref)
-            .fetch_all(conn.deref_mut())
+            .fetch_all(conn.conn_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
 
@@ -446,7 +516,7 @@ impl PgTransaction {
         Self::build_query(persistent, &self.sql.set)
             .bind(key.as_slice())
             .bind(val.as_slice())
-            .execute(conn.deref_mut())
+            .execute(conn.conn_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?;
         trace!(key_len = key.len(), "set");
@@ -513,7 +583,7 @@ impl PgTransaction {
         Self::build_query(persistent, &self.sql.setm)
             .bind(&keys)
             .bind(&vals)
-            .execute(conn.deref_mut())
+            .execute(conn.conn_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
 
@@ -533,7 +603,7 @@ impl PgTransaction {
         let result = Self::build_query(persistent, &self.sql.put)
             .bind(key.as_slice())
             .bind(val.as_slice())
-            .execute(conn.deref_mut())
+            .execute(conn.conn_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?;
         if result.rows_affected() == 0 {
@@ -560,7 +630,7 @@ impl PgTransaction {
             .bind(key.as_slice())
             .bind(val.as_slice())
             .bind(expected.as_slice())
-            .execute(conn.deref_mut())
+            .execute(conn.conn_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?
             .rows_affected();
@@ -582,7 +652,7 @@ impl PgTransaction {
         let persistent = self.persistent;
         Self::build_query(persistent, &self.sql.del)
             .bind(key.as_slice())
-            .execute(conn.deref_mut())
+            .execute(conn.conn_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?;
         trace!(key_len = key.len(), "del");
@@ -606,7 +676,7 @@ impl PgTransaction {
         let result = Self::build_query(persistent, &self.sql.delc)
             .bind(key.as_slice())
             .bind(expected.as_slice())
-            .execute(conn.deref_mut())
+            .execute(conn.conn_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(Some(&key), &e))?;
         if result.rows_affected() == 0 {
@@ -631,7 +701,7 @@ impl PgTransaction {
         let deleted = Self::build_query(persistent, &self.sql.delr)
             .bind(rng.start.as_slice())
             .bind(rng.end.as_slice())
-            .execute(conn.deref_mut())
+            .execute(conn.conn_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?
             .rows_affected();
@@ -701,7 +771,7 @@ impl PgTransaction {
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let rows = Self::range_query_offset(
-            conn.deref_mut(),
+            conn.conn_mut(),
             persistent,
             &self.sql.range_keys_asc,
             rng,
@@ -717,7 +787,7 @@ impl PgTransaction {
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let rows = Self::range_query_offset(
-            conn.deref_mut(),
+            conn.conn_mut(),
             persistent,
             &self.sql.range_keys_desc,
             rng,
@@ -738,7 +808,7 @@ impl PgTransaction {
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let rows = Self::range_query_offset(
-            conn.deref_mut(),
+            conn.conn_mut(),
             persistent,
             &self.sql.range_kv_asc,
             rng,
@@ -759,7 +829,7 @@ impl PgTransaction {
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let rows = Self::range_query_offset(
-            conn.deref_mut(),
+            conn.conn_mut(),
             persistent,
             &self.sql.range_kv_desc,
             rng,
@@ -785,7 +855,7 @@ impl PgTransaction {
         let row = Self::build_query(persistent, &self.sql.count)
             .bind(rng.start.as_slice())
             .bind(rng.end.as_slice())
-            .fetch_one(conn.deref_mut())
+            .fetch_one(conn.conn_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
         // COUNT(*) always returns ≥ 0; .max(0) is purely defensive —
@@ -809,7 +879,7 @@ impl PgTransaction {
         let persistent = self.persistent;
         let row = Self::build_query(persistent, &self.sql.count_approx)
             .bind(&self.sql.table_name)
-            .fetch_optional(conn.deref_mut())
+            .fetch_optional(conn.conn_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
         Ok(row.map(|r| r.get::<i64, _>("approx_cnt") as u64))
@@ -875,19 +945,24 @@ impl Drop for PgTransaction {
         // commit()/cancel() — this is by design for internal housekeeping
         // paths (node registration, cluster events, etc.).
         //
-        // sqlx's `Transaction::drop` automatically calls `start_rollback`,
-        // which synchronously queues a ROLLBACK command into the connection's
-        // write buffer (without flushing). The ROLLBACK is executed when the
-        // connection is next used or returned to the pool (via `ping()`).
-        // This ensures the connection always returns to the pool in Idle
-        // state, preventing the "there is already a transaction in progress"
-        // WARNING on the next `begin()` call.
+        // **Pool mode**: sqlx's `Transaction::drop` automatically calls
+        // `start_rollback`, which synchronously queues a ROLLBACK command
+        // into the connection's write buffer (without flushing). The
+        // ROLLBACK is executed when the connection is next used or returned
+        // to the pool (via `ping()`). This ensures the connection always
+        // returns to the pool in Idle state, preventing the "there is
+        // already a transaction in progress" WARNING on the next `begin()`.
         //
-        // Decrement the active-transaction counter so that pool diagnostics
+        // **Direct mode**: `PgConnection::drop` closes the TCP connection.
+        // PG will abort the transaction on disconnect. No ROLLBACK is sent
+        // (we can't `.await` in Drop), but closing the connection is
+        // equivalent to a rollback from PG's perspective.
+        //
+        // Decrement the active-transaction counter so that diagnostics
         // can accurately report how many connections are held by transactions.
         if self.conn.is_some() {
             self.release_active();
-            debug!("PgTransaction dropped without explicit commit/cancel; sqlx will auto-rollback");
+            debug!("PgTransaction dropped without explicit commit/cancel; auto-rollback");
         }
     }
 }

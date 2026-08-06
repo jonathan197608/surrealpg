@@ -95,6 +95,13 @@ pub struct PgConfig {
     pub isolation_level: PgIsolation,
     /// Persistent prepared statement policy (default: auto-detect pgbouncer)
     pub persistent_statements: PersistentStatements,
+    /// Whether the server is behind a connection pooler (e.g. Supabase Pooler,
+    /// pgbouncer in transaction mode). When `true`, the store uses direct
+    /// connections (bypassing sqlx's connection pool) to avoid the "zombie pool"
+    /// problem where the pooler silently reclaims idle connections.
+    ///
+    /// Set via the `pooler=true` URL query parameter.
+    pub pooler: bool,
 }
 
 /// Policy for persistent prepared statements.
@@ -188,6 +195,7 @@ impl Default for PgConfig {
             table_name: "kv".to_string(),
             isolation_level: PgIsolation::default(),
             persistent_statements: PersistentStatements::Auto,
+            pooler: false,
         }
     }
 }
@@ -398,6 +406,7 @@ impl PgConfig {
                 "idle_timeout",
                 "slow_acquire_threshold_secs",
                 "slow_statements_threshold_secs",
+                "pooler",
             ];
             for pair in query.split('&') {
                 if let Some((key, value)) = pair.split_once('=') {
@@ -505,6 +514,12 @@ impl PgConfig {
                             Err(_) => tracing::warn!(
                                 "slow_statements_threshold_secs='{value}' is not a valid number, ignoring"
                             ),
+                        },
+                        "pooler" => match value.parse::<bool>() {
+                            Ok(v) => self.pooler = v,
+                            Err(_) => {
+                                tracing::warn!("pooler='{value}' is not a valid bool, ignoring")
+                            }
                         },
                         _ => {}
                     }

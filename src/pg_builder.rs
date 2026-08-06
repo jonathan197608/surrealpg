@@ -61,11 +61,11 @@ impl TransactionBuilder for PgStore {
             u64_metrics: vec![
                 Metric {
                     name: "pg_pool_size",
-                    description: "Current number of connections in the pool",
+                    description: "Current number of connections in the pool (0 in direct mode)",
                 },
                 Metric {
                     name: "pg_pool_idle",
-                    description: "Number of idle connections in the pool",
+                    description: "Number of idle connections in the pool (0 in direct mode)",
                 },
                 Metric {
                     name: "pg_pool_max",
@@ -86,7 +86,12 @@ impl TransactionBuilder for PgStore {
                 },
                 Metric {
                     name: "pg_tx_active",
-                    description: "Number of currently active transactions (connections checked out from pool)",
+                    description: "Number of currently active transactions",
+                },
+                // Direct mode indicator: 1 = direct (pooler), 0 = pooled.
+                Metric {
+                    name: "pg_direct_mode",
+                    description: "1 if using direct connection mode (pooler), 0 if pooled",
                 },
             ],
         })
@@ -94,11 +99,8 @@ impl TransactionBuilder for PgStore {
 
     fn collect_u64_metric(&self, metric: &str) -> Option<u64> {
         match metric {
-            // P1: Call pool_size() once instead of twice to avoid
-            // redundant atomic reads on the pool internals.
             "pg_pool_size" | "pg_pool_idle" => {
                 let (size, idle) = self.pool_size();
-                // O3: Check pool utilization when metrics are queried.
                 self.check_pool_utilization();
                 if metric == "pg_pool_size" {
                     Some(size as u64)
@@ -107,8 +109,6 @@ impl TransactionBuilder for PgStore {
                 }
             }
             "pg_pool_max" => Some(self.pool_max() as u64),
-            // F8: Transaction metric counters.
-            // P1: Call tx_metrics() once for all four counters.
             "pg_tx_started" | "pg_tx_committed" | "pg_tx_rolled_back" | "pg_tx_active" => {
                 let (started, committed, rolled_back, active) = self.tx_metrics();
                 match metric {
@@ -118,6 +118,7 @@ impl TransactionBuilder for PgStore {
                     _ => Some(active),
                 }
             }
+            "pg_direct_mode" => Some(if self.is_direct_mode() { 1 } else { 0 }),
             _ => None,
         }
     }
