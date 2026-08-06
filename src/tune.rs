@@ -172,13 +172,13 @@ impl PgTuneConfig {
             // Pool
             pool_max,
             pool_min,
-            pool_acquire_timeout: env_duration("PG_TUNED_POOL_ACQUIRE_TIMEOUT", 10),
-            pool_idle_timeout: env_duration("PG_TUNED_POOL_IDLE_TIMEOUT", 600),
-            pool_max_lifetime: env_duration("PG_TUNED_POOL_MAX_LIFETIME", 1800),
+            pool_acquire_timeout: env_duration_nonzero("PG_TUNED_POOL_ACQUIRE_TIMEOUT", 10),
+            pool_idle_timeout: env_duration_nonzero("PG_TUNED_POOL_IDLE_TIMEOUT", 600),
+            pool_max_lifetime: env_duration_nonzero("PG_TUNED_POOL_MAX_LIFETIME", 1800),
 
             // TCP keepalive
-            keepalive_idle: env_duration("PG_TUNED_KEEPALIVE_IDLE", 60),
-            keepalive_interval: env_duration("PG_TUNED_KEEPALIVE_INTERVAL", 10),
+            keepalive_idle: env_duration_nonzero("PG_TUNED_KEEPALIVE_IDLE", 60),
+            keepalive_interval: env_duration_nonzero("PG_TUNED_KEEPALIVE_INTERVAL", 10),
             keepalive_count: {
                 let v = env_u32("PG_TUNED_KEEPALIVE_COUNT", 5);
                 if v > 100 {
@@ -289,9 +289,9 @@ impl PgTuneConfig {
             },
 
             // Query runtime
-            statement_timeout: env_duration("PG_TUNED_QUERY_STATEMENT_TIMEOUT", 30),
-            idle_txn_timeout: env_duration("PG_TUNED_QUERY_IDLE_TXN_TIMEOUT", 60),
-            lock_timeout: env_duration("PG_TUNED_QUERY_LOCK_TIMEOUT", 10),
+            statement_timeout: env_duration_nonzero("PG_TUNED_QUERY_STATEMENT_TIMEOUT", 30),
+            idle_txn_timeout: env_duration_nonzero("PG_TUNED_QUERY_IDLE_TXN_TIMEOUT", 60),
+            lock_timeout: env_duration_nonzero("PG_TUNED_QUERY_LOCK_TIMEOUT", 10),
             stats_target: {
                 let v = env_i32("PG_TUNED_QUERY_STATS_TARGET", 500);
                 if !(-1..=10000).contains(&v) {
@@ -327,7 +327,26 @@ impl PgTuneConfig {
                 "16MB",
                 validate_pg_memory_size,
             ),
-            server_max_connections: env_i32("PG_TUNED_SERVER_MAX_CONNECTIONS", 100),
+            server_max_connections: {
+                let v = env_i32("PG_TUNED_SERVER_MAX_CONNECTIONS", 100);
+                if v <= 0 {
+                    warn!(
+                        env = "PG_TUNED_SERVER_MAX_CONNECTIONS",
+                        value = v,
+                        "must be > 0, using default 100"
+                    );
+                    100
+                } else if v > 10_000 {
+                    warn!(
+                        env = "PG_TUNED_SERVER_MAX_CONNECTIONS",
+                        value = v,
+                        "unreasonably large (>10000), using default 100"
+                    );
+                    100
+                } else {
+                    v
+                }
+            },
             server_effective_cache_size: env_str_validated(
                 "PG_TUNED_SERVER_EFFECTIVE_CACHE_SIZE",
                 "1GB",
@@ -649,9 +668,23 @@ fn env_bool(key: &str, default: bool) -> bool {
     }
 }
 
-fn env_duration(key: &str, default_secs: u64) -> Duration {
+/// Like `env_duration_nonzero`, but rejects zero durations.
+///
+/// A zero timeout would cause immediate expiry (e.g. `acquire_timeout=0`
+/// means "fail instantly"), which is almost certainly a misconfiguration.
+/// Falls back to the default and warns.
+fn env_duration_nonzero(key: &str, default_secs: u64) -> Duration {
     match std::env::var(key) {
         Ok(ref v) => match parse_duration(v) {
+            Some(Duration::ZERO) => {
+                warn!(
+                    env = key,
+                    value = %v,
+                    "zero duration is invalid (would cause immediate timeout), \
+                     using default {default_secs}s"
+                );
+                Duration::from_secs(default_secs)
+            }
             Some(d) => d,
             None => {
                 warn!(env = key, value = %v, "failed to parse duration, using default {default_secs}s");
@@ -1166,6 +1199,102 @@ mod tests {
         assert_eq!(c.keepalive_count, 100, "100 should pass through");
 
         unsafe { std::env::remove_var("PG_TUNED_KEEPALIVE_COUNT") };
+    }
+
+    // R7: Duration=0 should be rejected for timeout/lifetime parameters
+    #[test]
+    fn test_duration_zero_rejected() {
+        // pool_acquire_timeout=0 → fallback to default 10s
+        unsafe { std::env::set_var("PG_TUNED_POOL_ACQUIRE_TIMEOUT", "0s") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.pool_acquire_timeout,
+            Duration::from_secs(10),
+            "pool_acquire_timeout=0s should fall back to 10s"
+        );
+
+        // pool_idle_timeout=0 → fallback to default 600s
+        unsafe { std::env::set_var("PG_TUNED_POOL_IDLE_TIMEOUT", "0") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.pool_idle_timeout,
+            Duration::from_secs(600),
+            "pool_idle_timeout=0 should fall back to 600s"
+        );
+
+        // statement_timeout=0 → fallback to default 30s
+        unsafe { std::env::set_var("PG_TUNED_QUERY_STATEMENT_TIMEOUT", "0s") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.statement_timeout,
+            Duration::from_secs(30),
+            "statement_timeout=0s should fall back to 30s"
+        );
+
+        // keepalive_idle=0 → fallback to default 60s
+        unsafe { std::env::set_var("PG_TUNED_KEEPALIVE_IDLE", "0") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.keepalive_idle,
+            Duration::from_secs(60),
+            "keepalive_idle=0 should fall back to 60s"
+        );
+
+        // Valid nonzero value should pass through
+        unsafe { std::env::set_var("PG_TUNED_POOL_ACQUIRE_TIMEOUT", "30s") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.pool_acquire_timeout,
+            Duration::from_secs(30),
+            "pool_acquire_timeout=30s should pass through"
+        );
+
+        unsafe {
+            std::env::remove_var("PG_TUNED_POOL_ACQUIRE_TIMEOUT");
+            std::env::remove_var("PG_TUNED_POOL_IDLE_TIMEOUT");
+            std::env::remove_var("PG_TUNED_QUERY_STATEMENT_TIMEOUT");
+            std::env::remove_var("PG_TUNED_KEEPALIVE_IDLE");
+        }
+    }
+
+    // R7: server_max_connections range validation
+    #[test]
+    fn test_server_max_connections_range() {
+        // Negative → default
+        unsafe { std::env::set_var("PG_TUNED_SERVER_MAX_CONNECTIONS", "-1") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.server_max_connections, 100,
+            "negative should fall back to 100"
+        );
+
+        // Zero → default
+        unsafe { std::env::set_var("PG_TUNED_SERVER_MAX_CONNECTIONS", "0") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.server_max_connections, 100,
+            "zero should fall back to 100"
+        );
+
+        // Unreasonably large → default
+        unsafe { std::env::set_var("PG_TUNED_SERVER_MAX_CONNECTIONS", "50000") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.server_max_connections, 100,
+            "50000 should fall back to 100"
+        );
+
+        // Valid value should pass through
+        unsafe { std::env::set_var("PG_TUNED_SERVER_MAX_CONNECTIONS", "200") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.server_max_connections, 200, "200 should pass through");
+
+        // Boundary: 10000 is valid
+        unsafe { std::env::set_var("PG_TUNED_SERVER_MAX_CONNECTIONS", "10000") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.server_max_connections, 10000, "10000 should pass through");
+
+        unsafe { std::env::remove_var("PG_TUNED_SERVER_MAX_CONNECTIONS") };
     }
 
     // R6: tune_table_sql defense-in-depth for autovac non-negative

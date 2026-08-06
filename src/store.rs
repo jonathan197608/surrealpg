@@ -202,6 +202,9 @@ impl PgStore {
             format!("BEGIN ISOLATION LEVEL {}", config.isolation_level.as_sql()).into();
 
         // pool_max == 0 is invalid only in pool mode (direct mode has no pool).
+        // Defense-in-depth: even though tune.from_env() and merge_url_params()
+        // both reject 0, we guard here too — PgPoolOptions::max_connections(0)
+        // would panic inside sqlx.
         if pool_max == 0 && !config.pooler {
             return Err(PgStoreError::Other(
                 "max_connections must be > 0 in pool mode".to_string(),

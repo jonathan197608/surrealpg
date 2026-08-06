@@ -527,6 +527,11 @@ impl PgConfig {
                             ),
                         },
                         "slow_acquire_threshold_secs" => match value.parse::<u64>() {
+                            Ok(0) => {
+                                tracing::warn!(
+                                    "slow_acquire_threshold_secs=0 is invalid (would trigger on every acquire), ignoring"
+                                );
+                            }
                             Ok(secs) => {
                                 self.slow_acquire_threshold_secs = Some(Duration::from_secs(secs))
                             }
@@ -535,6 +540,11 @@ impl PgConfig {
                             ),
                         },
                         "slow_statements_threshold_secs" => match value.parse::<u64>() {
+                            Ok(0) => {
+                                tracing::warn!(
+                                    "slow_statements_threshold_secs=0 is invalid (would trigger on every statement), ignoring"
+                                );
+                            }
                             Ok(secs) => {
                                 self.slow_statements_threshold_secs =
                                     Some(Duration::from_secs(secs))
@@ -851,6 +861,39 @@ mod tests {
         assert_eq!(
             config3.max_lifetime, None,
             "max_lifetime=0 should be ignored"
+        );
+    }
+
+    // R7: slow_threshold=0 should be rejected (would trigger on every operation)
+    #[test]
+    fn test_slow_threshold_zero_rejected() {
+        let mut config = PgConfig::default();
+        config
+            .merge_url_params("postgresql://u:p@h/db?slow_acquire_threshold_secs=0")
+            .unwrap();
+        assert_eq!(
+            config.slow_acquire_threshold_secs, None,
+            "slow_acquire_threshold_secs=0 should be ignored"
+        );
+
+        let mut config2 = PgConfig::default();
+        config2
+            .merge_url_params("postgresql://u:p@h/db?slow_statements_threshold_secs=0")
+            .unwrap();
+        assert_eq!(
+            config2.slow_statements_threshold_secs, None,
+            "slow_statements_threshold_secs=0 should be ignored"
+        );
+
+        // Valid nonzero value should pass through
+        let mut config3 = PgConfig::default();
+        config3
+            .merge_url_params("postgresql://u:p@h/db?slow_acquire_threshold_secs=5")
+            .unwrap();
+        assert_eq!(
+            config3.slow_acquire_threshold_secs,
+            Some(Duration::from_secs(5)),
+            "slow_acquire_threshold_secs=5 should pass through"
         );
     }
 }
