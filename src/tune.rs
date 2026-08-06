@@ -188,15 +188,67 @@ impl PgTuneConfig {
                 "external",
                 validate_toast_storage,
             ),
-            toast_threshold: env_i32("PG_TUNED_TABLE_TOAST_THRESHOLD", 2032),
+            toast_threshold: {
+                let v = env_i32("PG_TUNED_TABLE_TOAST_THRESHOLD", 2032);
+                if v < 128 {
+                    warn!(
+                        env = "PG_TUNED_TABLE_TOAST_THRESHOLD",
+                        value = v,
+                        "toast_tuple_target minimum is 128, using default 2032"
+                    );
+                    2032
+                } else {
+                    v
+                }
+            },
             use_unlogged: env_bool("PG_TUNED_TABLE_UNLOGGED", false),
 
             // Autovacuum
-            autovac_vacuum_scale: env_f64("PG_TUNED_AUTOVAC_VACUUM_SCALE", 0.05),
+            autovac_vacuum_scale: {
+                let v = env_f64("PG_TUNED_AUTOVAC_VACUUM_SCALE", 0.05);
+                if !v.is_finite() {
+                    warn!(env = "PG_TUNED_AUTOVAC_VACUUM_SCALE", value = %v, "NaN/Infinity not allowed, using default 0.05");
+                    0.05
+                } else {
+                    v
+                }
+            },
             autovac_vacuum_threshold: env_i32("PG_TUNED_AUTOVAC_VACUUM_THRESHOLD", 50),
-            autovac_analyze_scale: env_f64("PG_TUNED_AUTOVAC_ANALYZE_SCALE", 0.02),
-            autovac_vacuum_cost_limit: env_i32("PG_TUNED_AUTOVAC_VACUUM_COST_LIMIT", 2000),
-            autovac_vacuum_cost_delay: env_i32("PG_TUNED_AUTOVAC_VACUUM_COST_DELAY", 1),
+            autovac_analyze_scale: {
+                let v = env_f64("PG_TUNED_AUTOVAC_ANALYZE_SCALE", 0.02);
+                if !v.is_finite() {
+                    warn!(env = "PG_TUNED_AUTOVAC_ANALYZE_SCALE", value = %v, "NaN/Infinity not allowed, using default 0.02");
+                    0.02
+                } else {
+                    v
+                }
+            },
+            autovac_vacuum_cost_limit: {
+                let v = env_i32("PG_TUNED_AUTOVAC_VACUUM_COST_LIMIT", 2000);
+                if v < 0 {
+                    warn!(
+                        env = "PG_TUNED_AUTOVAC_VACUUM_COST_LIMIT",
+                        value = v,
+                        "must be >= 0, using default 2000"
+                    );
+                    2000
+                } else {
+                    v
+                }
+            },
+            autovac_vacuum_cost_delay: {
+                let v = env_i32("PG_TUNED_AUTOVAC_VACUUM_COST_DELAY", 1);
+                if v < 0 {
+                    warn!(
+                        env = "PG_TUNED_AUTOVAC_VACUUM_COST_DELAY",
+                        value = v,
+                        "must be >= 0, using default 1"
+                    );
+                    1
+                } else {
+                    v
+                }
+            },
 
             // Query runtime
             statement_timeout: env_duration("PG_TUNED_QUERY_STATEMENT_TIMEOUT", 30),
@@ -231,7 +283,15 @@ impl PgTuneConfig {
                 "1GB",
                 validate_pg_memory_size,
             ),
-            server_random_page_cost: env_f64("PG_TUNED_SERVER_RANDOM_PAGE_COST", 1.1),
+            server_random_page_cost: {
+                let v = env_f64("PG_TUNED_SERVER_RANDOM_PAGE_COST", 1.1);
+                if !v.is_finite() {
+                    warn!(env = "PG_TUNED_SERVER_RANDOM_PAGE_COST", value = %v, "NaN/Infinity not allowed, using default 1.1");
+                    1.1
+                } else {
+                    v
+                }
+            },
             server_checkpoint_target: {
                 let v = env_f64("PG_TUNED_SERVER_CHECKPOINT_TARGET", 0.9);
                 // B2: PG requires checkpoint_completion_target ∈ [0.0, 1.0].
@@ -769,5 +829,119 @@ mod tests {
             ..PgTuneConfig::default()
         };
         let _ = c.tune_table_sql("kv");
+    }
+
+    // R4: f64 NaN/Infinity should fall back to defaults
+    #[test]
+    fn test_f64_nan_infinity_fallback() {
+        // autovac_vacuum_scale: NaN → default
+        unsafe { std::env::set_var("PG_TUNED_AUTOVAC_VACUUM_SCALE", "nan") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.autovac_vacuum_scale, 0.05, "NaN should fall back to 0.05");
+
+        // autovac_vacuum_scale: inf → default
+        unsafe { std::env::set_var("PG_TUNED_AUTOVAC_VACUUM_SCALE", "inf") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.autovac_vacuum_scale, 0.05, "inf should fall back to 0.05");
+
+        // autovac_analyze_scale: NaN → default
+        unsafe { std::env::set_var("PG_TUNED_AUTOVAC_ANALYZE_SCALE", "nan") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.autovac_analyze_scale, 0.02,
+            "NaN should fall back to 0.02"
+        );
+
+        // server_random_page_cost: inf → default
+        unsafe { std::env::set_var("PG_TUNED_SERVER_RANDOM_PAGE_COST", "inf") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.server_random_page_cost, 1.1,
+            "inf should fall back to 1.1"
+        );
+
+        // Valid value should pass through
+        unsafe { std::env::set_var("PG_TUNED_AUTOVAC_VACUUM_SCALE", "0.1") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.autovac_vacuum_scale, 0.1);
+
+        unsafe {
+            std::env::remove_var("PG_TUNED_AUTOVAC_VACUUM_SCALE");
+            std::env::remove_var("PG_TUNED_AUTOVAC_ANALYZE_SCALE");
+            std::env::remove_var("PG_TUNED_SERVER_RANDOM_PAGE_COST");
+        }
+    }
+
+    // R4: toast_threshold < 128 should fall back to default
+    #[test]
+    fn test_toast_threshold_min_value() {
+        unsafe { std::env::set_var("PG_TUNED_TABLE_TOAST_THRESHOLD", "0") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.toast_threshold, 2032,
+            "toast_threshold=0 should fall back to 2032"
+        );
+
+        unsafe { std::env::set_var("PG_TUNED_TABLE_TOAST_THRESHOLD", "127") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.toast_threshold, 2032,
+            "toast_threshold=127 should fall back to 2032"
+        );
+
+        // Boundary: 128 is the minimum valid value
+        unsafe { std::env::set_var("PG_TUNED_TABLE_TOAST_THRESHOLD", "128") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.toast_threshold, 128,
+            "toast_threshold=128 should pass through"
+        );
+
+        // Normal value
+        unsafe { std::env::set_var("PG_TUNED_TABLE_TOAST_THRESHOLD", "2032") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.toast_threshold, 2032);
+
+        unsafe { std::env::remove_var("PG_TUNED_TABLE_TOAST_THRESHOLD") };
+    }
+
+    // R4: autovac cost_limit/cost_delay negative should fall back to defaults
+    #[test]
+    fn test_autovac_nonneg_validation() {
+        // cost_limit: negative → default
+        unsafe { std::env::set_var("PG_TUNED_AUTOVAC_VACUUM_COST_LIMIT", "-1") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.autovac_vacuum_cost_limit, 2000,
+            "negative cost_limit should fall back to 2000"
+        );
+
+        // cost_delay: negative → default
+        unsafe { std::env::set_var("PG_TUNED_AUTOVAC_VACUUM_COST_DELAY", "-5") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.autovac_vacuum_cost_delay, 1,
+            "negative cost_delay should fall back to 1"
+        );
+
+        // Zero is valid
+        unsafe { std::env::set_var("PG_TUNED_AUTOVAC_VACUUM_COST_LIMIT", "0") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.autovac_vacuum_cost_limit, 0,
+            "cost_limit=0 should pass through"
+        );
+
+        unsafe { std::env::set_var("PG_TUNED_AUTOVAC_VACUUM_COST_DELAY", "0") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.autovac_vacuum_cost_delay, 0,
+            "cost_delay=0 should pass through"
+        );
+
+        unsafe {
+            std::env::remove_var("PG_TUNED_AUTOVAC_VACUUM_COST_LIMIT");
+            std::env::remove_var("PG_TUNED_AUTOVAC_VACUUM_COST_DELAY");
+        }
     }
 }

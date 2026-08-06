@@ -42,6 +42,10 @@ pub enum PgStoreError {
     #[error("connection pool timeout")]
     PoolTimeout,
 
+    /// Direct-mode TCP connect timeout
+    #[error("connection timeout: failed to connect within {0:?}")]
+    ConnectTimeout(std::time::Duration),
+
     /// Connection pool closed
     #[error("connection pool closed")]
     PoolClosed,
@@ -123,6 +127,9 @@ impl From<PgStoreError> for surrealdb_core::kvs::Error {
             PgStoreError::PoolTimeout => {
                 Self::ConnectionFailed("connection pool timeout".to_string())
             }
+            PgStoreError::ConnectTimeout(d) => Self::ConnectionFailed(format!(
+                "connection timeout: failed to connect within {d:?}"
+            )),
             PgStoreError::PoolClosed => {
                 Self::ConnectionFailed("connection pool closed".to_string())
             }

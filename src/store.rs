@@ -194,9 +194,10 @@ impl PgStore {
         let begin_sql: Arc<str> =
             format!("BEGIN ISOLATION LEVEL {}", config.isolation_level.as_sql()).into();
 
-        if pool_max == 0 {
+        // pool_max == 0 is invalid only in pool mode (direct mode has no pool).
+        if pool_max == 0 && !config.pooler {
             return Err(PgStoreError::Other(
-                "max_connections must be > 0".to_string(),
+                "max_connections must be > 0 in pool mode".to_string(),
             ));
         }
 
@@ -317,7 +318,7 @@ impl PgStore {
                                 return Err(PgStoreError::from_sqlx(None, &e));
                             }
                             Err(_) => {
-                                return Err(PgStoreError::PoolTimeout);
+                                return Err(PgStoreError::ConnectTimeout(connect_timeout));
                             }
                         };
                     // Apply session SQL + keepalive to this DDL connection too.
@@ -433,7 +434,7 @@ impl PgStore {
         loop {
             attempt += 1;
 
-            match pool.begin_with(String::from(&*self.begin_sql)).await {
+            match pool.begin_with(self.begin_sql.to_string()).await {
                 Ok(tx) => {
                     self.tx_started.fetch_add(1, AtomicOrdering::Relaxed);
                     self.tx_active.fetch_add(1, AtomicOrdering::Relaxed);
@@ -502,7 +503,7 @@ impl PgStore {
         let mut conn = match tokio::time::timeout(self.connect_timeout, opts.connect()).await {
             Ok(Ok(conn)) => conn,
             Ok(Err(e)) => return Err(PgStoreError::from_sqlx(None, &e)),
-            Err(_) => return Err(PgStoreError::PoolTimeout),
+            Err(_) => return Err(PgStoreError::ConnectTimeout(self.connect_timeout)),
         };
 
         // Apply keepalive (non-fatal) + session SQL.
@@ -597,7 +598,7 @@ impl PgStore {
                     match tokio::time::timeout(self.connect_timeout, opts.connect()).await {
                         Ok(Ok(c)) => c,
                         Ok(Err(e)) => return Err(PgStoreError::from_sqlx(None, &e)),
-                        Err(_) => return Err(PgStoreError::PoolTimeout),
+                        Err(_) => return Err(PgStoreError::ConnectTimeout(self.connect_timeout)),
                     };
                 let _ = Executor::execute(&mut conn, sqlx::raw_sql(&self.keepalive_sql)).await;
                 let _ = Executor::execute(&mut conn, sqlx::raw_sql(&self.session_sql)).await;
@@ -626,7 +627,7 @@ impl PgStore {
                     match tokio::time::timeout(self.connect_timeout, opts.connect()).await {
                         Ok(Ok(c)) => c,
                         Ok(Err(e)) => return Err(PgStoreError::from_sqlx(None, &e)),
-                        Err(_) => return Err(PgStoreError::PoolTimeout),
+                        Err(_) => return Err(PgStoreError::ConnectTimeout(self.connect_timeout)),
                     };
                 // Apply keepalive + session SQL for consistency with begin_direct/vacuum.
                 let _ = Executor::execute(&mut conn, sqlx::raw_sql(&self.keepalive_sql)).await;
