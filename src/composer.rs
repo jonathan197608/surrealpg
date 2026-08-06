@@ -53,22 +53,15 @@ fn redact_url(url: &str) -> String {
     let authority = &after_scheme[..authority_end];
     let rest = &after_scheme[authority_end..];
 
-    // Authority may be `[ipv6]:port` — skip if it starts with '['
-    if authority.starts_with('[') {
-        return url.to_string();
+    // Authority may be `[ipv6]:port` — still needs userinfo redaction if
+    // it contains '@', e.g. `user:pass@[::1]:5432`.
+    if let Some(at_pos) = authority.find('@') {
+        let host_port = &authority[at_pos + 1..];
+        let scheme = &url[..scheme_end + 3]; // includes "://"
+        format!("{scheme}***:***@{host_port}{rest}")
+    } else {
+        url.to_string()
     }
-
-    // Check if authority contains '@' (userinfo present)
-    let Some(at_pos) = authority.find('@') else {
-        return url.to_string(); // no userinfo to redact
-    };
-
-    let _userinfo = &authority[..at_pos];
-    let host_port = &authority[at_pos + 1..];
-
-    // Reconstruct: scheme://***:***@host:port/rest
-    let scheme = &url[..scheme_end + 3]; // includes "://"
-    format!("{scheme}***:***@{host_port}{rest}")
 }
 
 /// A composer that wraps [`CommunityComposer`] and adds PostgreSQL backend
@@ -213,3 +206,65 @@ impl surrealdb_core::observe::ObservabilityProvider for PostgresComposer {
 
 // Server-side supertrait (all methods have defaults that delegate to core)
 impl ObservabilityProvider for PostgresComposer {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_redact_url_basic() {
+        assert_eq!(
+            redact_url("postgresql://user:pass@host:5432/db"),
+            "postgresql://***:***@host:5432/db"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_no_userinfo() {
+        // No userinfo → returned as-is
+        assert_eq!(
+            redact_url("postgresql://host:5432/db"),
+            "postgresql://host:5432/db"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_no_scheme() {
+        // No :// → returned as-is
+        assert_eq!(redact_url("just-a-string"), "just-a-string");
+    }
+
+    #[test]
+    fn test_redact_url_ipv6_with_userinfo() {
+        // R10-F1: IPv6 addresses with userinfo must be redacted
+        assert_eq!(
+            redact_url("postgresql://user:pass@[::1]:5432/db"),
+            "postgresql://***:***@[::1]:5432/db"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_ipv6_no_userinfo() {
+        // IPv6 without userinfo → returned as-is
+        assert_eq!(
+            redact_url("postgresql://[::1]:5432/db"),
+            "postgresql://[::1]:5432/db"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_with_query() {
+        assert_eq!(
+            redact_url("postgresql://user:pass@host:5432/db?sslmode=require"),
+            "postgresql://***:***@host:5432/db?sslmode=require"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_ipv6_with_query() {
+        assert_eq!(
+            redact_url("postgresql://user:pass@[2001:db8::1]:5432/db?sslmode=require"),
+            "postgresql://***:***@[2001:db8::1]:5432/db?sslmode=require"
+        );
+    }
+}

@@ -106,7 +106,8 @@ pub struct PgConfig {
     pub table_name: String,
     /// Default transaction isolation level
     pub isolation_level: PgIsolation,
-    /// Persistent prepared statement policy (default: auto-detect pgbouncer)
+    /// Persistent prepared statement policy (default: auto — resolved by
+    /// `pooler` parameter: disabled for pooler mode, enabled for direct PG).
     pub persistent_statements: PersistentStatements,
     /// Whether the server is behind a connection pooler (e.g. Supabase Pooler,
     /// pgbouncer in transaction mode). When `true`, the store uses direct
@@ -119,15 +120,17 @@ pub struct PgConfig {
 
 /// Policy for persistent prepared statements.
 ///
-/// - `Auto` (default): probe at startup to detect whether the server is
-///   behind pgbouncer/Supabase Pooler (transaction mode). If direct PG, enable
-///   persistent statements for performance; if pgbouncer, disable them.
+/// - `Auto` (default): resolved based on the `pooler` URL parameter. If
+///   `pooler=true`, persistent statements are disabled (pgbouncer
+///   transaction mode does not support named prepared statements);
+///   otherwise, they are enabled (direct PG supports them).
 /// - `Enabled`: force persistent prepared statements (best for direct PG).
 /// - `Disabled`: force non-persistent (unnamed) statements (required for
 ///   pgbouncer transaction mode without `max_prepared_statements`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PersistentStatements {
-    /// Automatically detect at startup via a probe query.
+    /// Automatically resolve based on `pooler` parameter.
+    /// `pooler=true` → disabled; `pooler=false` (default) → enabled.
     #[default]
     Auto,
     /// Force persistent prepared statements.
