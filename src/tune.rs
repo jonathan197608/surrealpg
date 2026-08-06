@@ -213,7 +213,19 @@ impl PgTuneConfig {
                     v
                 }
             },
-            autovac_vacuum_threshold: env_i32("PG_TUNED_AUTOVAC_VACUUM_THRESHOLD", 50),
+            autovac_vacuum_threshold: {
+                let v = env_i32("PG_TUNED_AUTOVAC_VACUUM_THRESHOLD", 50);
+                if v < 0 {
+                    warn!(
+                        env = "PG_TUNED_AUTOVAC_VACUUM_THRESHOLD",
+                        value = v,
+                        "must be >= 0, using default 50"
+                    );
+                    50
+                } else {
+                    v
+                }
+            },
             autovac_analyze_scale: {
                 let v = env_f64("PG_TUNED_AUTOVAC_ANALYZE_SCALE", 0.02);
                 if !v.is_finite() {
@@ -254,7 +266,19 @@ impl PgTuneConfig {
             statement_timeout: env_duration("PG_TUNED_QUERY_STATEMENT_TIMEOUT", 30),
             idle_txn_timeout: env_duration("PG_TUNED_QUERY_IDLE_TXN_TIMEOUT", 60),
             lock_timeout: env_duration("PG_TUNED_QUERY_LOCK_TIMEOUT", 10),
-            stats_target: env_i32("PG_TUNED_QUERY_STATS_TARGET", 500),
+            stats_target: {
+                let v = env_i32("PG_TUNED_QUERY_STATS_TARGET", 500);
+                if !(-1..=10000).contains(&v) {
+                    warn!(
+                        env = "PG_TUNED_QUERY_STATS_TARGET",
+                        value = v,
+                        "out of range [-1, 10000], using default 500"
+                    );
+                    500
+                } else {
+                    v
+                }
+            },
 
             // PG server
             server_shared_buffers: env_str_validated(
@@ -351,7 +375,7 @@ impl PgTuneConfig {
         // here, not just in from_env(). PgTuneConfig fields are all pub,
         // so a caller could construct it directly with malicious values.
         // session_sql() already does this for memory-size strings; we do
-        // the same for toast_storage and fillfactor here.
+        // the same for toast_storage, fillfactor, and f64 finiteness here.
         assert!(
             validate_toast_storage(&self.toast_storage),
             "toast_storage failed validation: {}",
@@ -361,6 +385,16 @@ impl PgTuneConfig {
             (1..=100).contains(&self.fillfactor),
             "fillfactor must be in [1, 100], got {}",
             self.fillfactor
+        );
+        assert!(
+            self.autovac_vacuum_scale.is_finite(),
+            "autovac_vacuum_scale must be finite, got {}",
+            self.autovac_vacuum_scale
+        );
+        assert!(
+            self.autovac_analyze_scale.is_finite(),
+            "autovac_analyze_scale must be finite, got {}",
+            self.autovac_analyze_scale
         );
         format!(
             r#"
@@ -943,5 +977,92 @@ mod tests {
             std::env::remove_var("PG_TUNED_AUTOVAC_VACUUM_COST_LIMIT");
             std::env::remove_var("PG_TUNED_AUTOVAC_VACUUM_COST_DELAY");
         }
+    }
+
+    // stats_target out of range should fall back to default
+    #[test]
+    fn test_stats_target_range_validation() {
+        // Below minimum (-2)
+        unsafe { std::env::set_var("PG_TUNED_QUERY_STATS_TARGET", "-2") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.stats_target, 500,
+            "stats_target=-2 should fall back to 500"
+        );
+
+        // Above maximum (10001)
+        unsafe { std::env::set_var("PG_TUNED_QUERY_STATS_TARGET", "10001") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.stats_target, 500,
+            "stats_target=10001 should fall back to 500"
+        );
+
+        // Boundary: -1 is valid (PG uses -1 to disable statistics collection)
+        unsafe { std::env::set_var("PG_TUNED_QUERY_STATS_TARGET", "-1") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.stats_target, -1, "stats_target=-1 should pass through");
+
+        // Boundary: 10000 is valid
+        unsafe { std::env::set_var("PG_TUNED_QUERY_STATS_TARGET", "10000") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.stats_target, 10000,
+            "stats_target=10000 should pass through"
+        );
+
+        // Normal value
+        unsafe { std::env::set_var("PG_TUNED_QUERY_STATS_TARGET", "500") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.stats_target, 500);
+
+        unsafe { std::env::remove_var("PG_TUNED_QUERY_STATS_TARGET") };
+    }
+
+    // autovac_vacuum_threshold negative should fall back to default
+    #[test]
+    fn test_autovac_vacuum_threshold_nonneg() {
+        unsafe { std::env::set_var("PG_TUNED_AUTOVAC_VACUUM_THRESHOLD", "-1") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.autovac_vacuum_threshold, 50,
+            "negative autovac_vacuum_threshold should fall back to 50"
+        );
+
+        // Zero is valid
+        unsafe { std::env::set_var("PG_TUNED_AUTOVAC_VACUUM_THRESHOLD", "0") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.autovac_vacuum_threshold, 0,
+            "autovac_vacuum_threshold=0 should pass through"
+        );
+
+        // Normal value
+        unsafe { std::env::set_var("PG_TUNED_AUTOVAC_VACUUM_THRESHOLD", "100") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.autovac_vacuum_threshold, 100);
+
+        unsafe { std::env::remove_var("PG_TUNED_AUTOVAC_VACUUM_THRESHOLD") };
+    }
+
+    // tune_table_sql defense-in-depth: f64 finiteness
+    #[test]
+    #[should_panic(expected = "autovac_vacuum_scale must be finite")]
+    fn test_tune_table_sql_rejects_nan_vacuum_scale() {
+        let c = PgTuneConfig {
+            autovac_vacuum_scale: f64::NAN,
+            ..PgTuneConfig::default()
+        };
+        let _ = c.tune_table_sql("kv");
+    }
+
+    #[test]
+    #[should_panic(expected = "autovac_analyze_scale must be finite")]
+    fn test_tune_table_sql_rejects_nan_analyze_scale() {
+        let c = PgTuneConfig {
+            autovac_analyze_scale: f64::NAN,
+            ..PgTuneConfig::default()
+        };
+        let _ = c.tune_table_sql("kv");
     }
 }

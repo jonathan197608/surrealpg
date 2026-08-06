@@ -322,8 +322,22 @@ impl PgStore {
                             }
                         };
                     // Apply session SQL + keepalive to this DDL connection too.
-                    let _ = Executor::execute(&mut conn, sqlx::raw_sql(&keepalive_sql)).await;
-                    let _ = Executor::execute(&mut conn, sqlx::raw_sql(&session_sql)).await;
+                    if let Err(e) =
+                        Executor::execute(&mut conn, sqlx::raw_sql(&keepalive_sql)).await
+                    {
+                        warn!(
+                            error = %e,
+                            "tcp_keepalive SET failed on DDL connection (non-fatal)"
+                        );
+                    }
+                    if let Err(e) = Executor::execute(&mut conn, sqlx::raw_sql(&session_sql)).await
+                    {
+                        warn!(
+                            error = %e,
+                            "session SQL failed on DDL connection (non-fatal, but \
+                             subsequent transactions may also fail)"
+                        );
+                    }
                     Executor::execute(&mut conn, sqlx::raw_sql(&create_sql))
                         .await
                         .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
@@ -480,7 +494,7 @@ impl PgStore {
                         );
                     }
 
-                    if !matches!(pg_err, PgStoreError::PoolTimeout) || attempt > BEGIN_MAX_RETRIES {
+                    if !pg_err.is_transient() || attempt > BEGIN_MAX_RETRIES {
                         return Err(pg_err);
                     }
 

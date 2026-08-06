@@ -110,6 +110,19 @@ impl fmt::Display for PgTx {
     }
 }
 
+impl Drop for PgTx {
+    fn drop(&mut self) {
+        // SurrealDB's engine routinely drops transactions without calling
+        // commit()/cancel() — these are "ghost" transactions from a metrics
+        // perspective. Record them as rollbacks so that
+        // tx_started == tx_committed + tx_rolled_back holds.
+        if !self.done.load(Ordering::Relaxed) {
+            self.tx_rolled_back.fetch_add(1, Ordering::Relaxed);
+            debug!("PgTx dropped without explicit commit/cancel — counted as rollback");
+        }
+    }
+}
+
 impl Transactable for PgTx {
     fn kind(&self) -> &'static str {
         "postgres"

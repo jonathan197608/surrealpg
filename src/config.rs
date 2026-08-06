@@ -539,6 +539,21 @@ impl PgConfig {
                 }
             }
         }
+        // Post-merge cross-validation: min_connections must not exceed
+        // max_connections. This catches the case where URL params are
+        // ordered as ?min_connections=50&max_connections=10 (min parsed
+        // first when max is still None).
+        if let (Some(min), Some(max)) = (self.min_connections, self.max_connections)
+            && min > max
+        {
+            tracing::warn!(
+                "min_connections={min} > max_connections={max} (detected in post-merge validation), \
+                 will be capped by the store layer"
+            );
+            // Note: we keep the value as-is here because store.rs performs
+            // the actual capping. The warn lets the operator know their
+            // configuration is inconsistent.
+        }
         Ok(())
     }
 }
@@ -775,5 +790,21 @@ mod tests {
             .merge_url_params("postgresql://u:p@h/db?pooler=yes")
             .unwrap();
         assert!(config3.pooler);
+    }
+
+    // min_connections parsed before max_connections: cross-validation
+    // should still warn in post-merge check (store.rs does actual capping).
+    #[test]
+    fn test_min_connections_before_max_cross_validation() {
+        let mut config = PgConfig::default();
+        // min=50 parsed first, max=10 parsed after — no error raised during
+        // parsing, but post-merge validation detects the inconsistency.
+        config
+            .merge_url_params("postgresql://u:p@h/db?min_connections=50&max_connections=10")
+            .unwrap();
+        assert_eq!(config.min_connections, Some(50));
+        assert_eq!(config.max_connections, Some(10));
+        // The actual capping happens in store.rs; this test verifies that
+        // the values are stored correctly for later validation.
     }
 }

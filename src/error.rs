@@ -60,6 +60,24 @@ pub enum PgStoreError {
 }
 
 impl PgStoreError {
+    /// Whether this error is likely transient and worth retrying.
+    ///
+    /// - `PoolTimeout`: pool exhausted, may recover when connections are returned.
+    /// - `Postgres` errors with `connection error [08`: the pooler/PG server
+    ///   may have dropped the connection; retrying with a fresh connection
+    ///   typically succeeds.
+    /// - `Deadlock` / `SerializationFailure`: PG may resolve on retry.
+    /// - All other errors are considered non-transient.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::PoolTimeout => true,
+            Self::Postgres(msg) => msg.starts_with("connection error [08"),
+            Self::Deadlock(_) | Self::SerializationFailure(_) => true,
+            _ => false,
+        }
+    }
+
     /// Map a sqlx::Error into our error type, preserving semantics for
     /// well-known PostgreSQL SQLSTATE codes.
     #[must_use]
