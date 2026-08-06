@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: '51771223-cd8e-406f-b23a-96ee38e70c10'
-  PropagateID: '51771223-cd8e-406f-b23a-96ee38e70c10'
-  ReservedCode1: '86d7430e-57c7-4bc5-8751-a0787ab891c8'
-  ReservedCode2: '86d7430e-57c7-4bc5-8751-a0787ab891c8'
+  ProduceID: 'd78c0c8e-e8a7-482c-9f47-a38ec2b4150d'
+  PropagateID: 'd78c0c8e-e8a7-482c-9f47-a38ec2b4150d'
+  ReservedCode1: '93d6b653-7404-42dd-82f0-5f854a832083'
+  ReservedCode2: '93d6b653-7404-42dd-82f0-5f854a832083'
 ---
 
 # surreal-pg
@@ -51,16 +51,25 @@ SurrealDB 的事务语义 1:1 映射到 PostgreSQL 的 `BEGIN` / `COMMIT` / `ROL
 
 拿到的是完整的 SurrealDB 服务器——SurrealQL 查询引擎、GraphQL 自动生成（需 `DEFINE CONFIG GRAPHQL AUTO`）、ISO GQL 图模式查询（实验性，需 `--allow-experimental gql`）、HTTP/WebSocket API、多模型支持（文档/图/向量/关系/时序）、权限系统、事件触发器——只是底层存储换成了 PostgreSQL。
 
-### Pooler 自动适配
+### 双模式连接：连接池模式与直连模式
 
-连接池初始化时自动探测服务器是否在 pgbouncer / Supavisor 之后，动态切换 prepared statement 策略：直连 PG 使用 named prepared statement 获得最佳性能；检测到 transaction-mode pooler 时自动降级为 unnamed statement 保证兼容性。也可通过环境变量手动覆盖。探测策略采用双连接 named prepared statement 冲突检测——两个连接分别创建同名 prepared statement，若发生 `42P05`（duplicate_prepared_statement）则判定为 pooler。小连接池（≤ 2）跳过探测默认关闭，避免池耗尽。
+`surreal-pg` 支持两种连接模式，通过 URL 参数 `pooler=true` 切换：
+
+- **连接池模式**（默认）：使用 sqlx 连接池管理连接，复用连接减少建连开销，适用于直连 PostgreSQL 主机的场景。连接池自动管理连接生命周期（创建、健康检查、回收），并支持 prepared statement 复用。
+- **直连模式**（`pooler=true`）：绕过 sqlx 连接池，每个事务独立建连、用完即弃。专为 PgBouncer / Supavisor 等 transaction-mode pooler 设计，从根本上避免连接池静默回收导致的“僵尸池”问题。直连模式下不再有连接池超时、连接健康检查等开销，每个事务拿到的是新鲜的 PG 连接，事务结束后 TCP 关闭即可。直连模式强制使用 unnamed prepared statement（兼容 transaction-mode pooler）。
+
+**如何选择**：
+- 直连 PostgreSQL 主机（无 pooler）→ 用默认连接池模式，性能最佳
+- 通过 PgBouncer / Supavisor / Supabase Pooler 连接 → 用 `pooler=true` 直连模式，避免僵尸池
+
+> **注**：连接池模式使用 named prepared statement 以获得最佳性能；直连模式使用 unnamed prepared statement 以兼容 transaction-mode pooler。直连模式下 `persistent_statements` 参数被忽略。
 
 ### 5 层 29 参数精细化调优
 
 内置分层调优系统，全部参数有合理默认值（零配置可用），也可通过 `PG_TUNED_*` 环境变量按需调整：
 
-- **连接池层**：连接数、超时、生命周期
-- **TCP keepalive 层**：空闲探测、探测间隔、失败计数
+- **连接池层**：连接数、超时、生命周期（仅连接池模式）
+- **TCP keepalive 层**：空闲探测、探测间隔、失败计数（两种模式均生效）
 - **表存储层**：fillfactor、TOAST 策略、UNLOGGED 模式
 - **Autovacuum 层**：死元组触发阈值、VACUUM 限流
 - **查询运行时层**：超时防护、锁等待、统计精度
@@ -93,7 +102,7 @@ PostgresComposer::new_transaction_builder(path)
 
 | 层 | 结构体 | 文件 | 职责 |
 |----|--------|------|------|
-| 工厂层 | `PgStore` | `store.rs` | 持有连接池，创建事务，管理生命周期指标 |
+| 工厂层 | `PgStore` | `store.rs` | 持有连接池（池模式）或直连配置（直连模式），创建事务，管理生命周期指标 |
 | 事务层 | `PgTransaction` | `transaction.rs` | 底层 PG 事务，实现全部 KV 操作的 SQL 映射 |
 | 适配层 | `PgTx` | `pg_tx.rs` | `Transactable` trait wrapper，用 `Mutex` 提供内部可变性 |
 
@@ -124,7 +133,7 @@ CREATE TABLE kv (key BYTEA PRIMARY KEY, val BYTEA NOT NULL);
 | `exists(k)` | `SELECT 1 WHERE key = $1` | 存在性检查 |
 | savepoint | `SAVEPOINT sp_N` / `ROLLBACK TO SAVEPOINT sp_N` / `RELEASE SAVEPOINT sp_N` | PG 原生 savepoint，名字栈式管理 |
 
-所有 SQL 在 `PgStore::new()` 时预构建为 `Arc<Sql>`，每个事务通过 `Arc::clone` 共享（1 次原子引用计数），操作时零 `format!()` 堆分配。热路径利用 Rust 的"不同字段可同时借用"规则：`&self.sql.field`（不可变）与 `conn.deref_mut()`（可变）并存于同一作用域。
+所有 SQL 在 `PgStore::new()` 时预构建为 `Arc<Sql>`，每个事务通过 `Arc::clone` 共享（1 次原子引用计数），操作时零 `format!()` 堆分配。热路径利用 Rust 的"不同字段可同时借用"规则：`&self.sql.field`（不可变）与 `conn.conn_mut()`（可变）并存于同一作用域。
 
 ### 错误映射
 
@@ -141,7 +150,9 @@ PostgreSQL SQLSTATE 语义错误自动映射到 SurrealDB 的 `kvs::Error`：
 
 ### 连接泄漏恢复
 
-从池中获取的连接可能残留前一个泄漏的事务状态。`begin()` 采用乐观策略——直接执行 `BEGIN`，仅在遇到 `25P02`（in_failed_sql_transaction）时才执行 `ROLLBACK` 清理并重试。这避免了正常路径的额外网络往返，同时安全处理异常情况。
+**连接池模式**：从池中获取的连接可能残留前一个泄漏的事务状态。`begin()` 采用乐观策略——直接执行 `BEGIN`，仅在遇到 `25P02`（in_failed_sql_transaction）时才执行 `ROLLBACK` 清理并重试。连接池耗尽时采用重试+退避策略（正常模式 200ms→400ms，僵尸池模式 5s→10s），并检测僵尸池状态。
+
+**直连模式**：每个事务独立建立新鲜连接，不存在连接复用和泄漏问题，无需恢复策略。事务结束后 TCP 关闭，PostgreSQL 自动 abort 未提交的事务。
 
 ---
 
@@ -157,7 +168,7 @@ SurrealDB 自带的 RocksDB 后端是嵌入式存储，无法跨节点共享。P
 
 ### Supabase / 云数据库上的 SurrealDB
 
-直接连接 Supabase Pooler 或其他托管 PostgreSQL 服务，自动适配 transaction-mode pooler。无需自建数据库服务器，几分钟内获得 SurrealDB + PostgreSQL 的组合能力。
+连接 Supabase Pooler 或其他托管 PostgreSQL 服务时，加上 `pooler=true` 参数即可启用直连模式，自动绕过 sqlx 连接池，从根本上避免 transaction-mode pooler 的僵尸池问题。无需自建数据库服务器，几分钟内获得 SurrealDB + PostgreSQL 的组合能力。
 
 ### 从 SurrealDB 原生后端平滑迁移
 
@@ -185,7 +196,13 @@ cargo build --release
     --user root --pass secret \
     postgresql://user:pass@localhost:5432/surrealdb
 
-# 连接到 Supabase Pooler（transaction mode 自动检测）
+# 连接到 Supabase Pooler（使用直连模式，推荐）
+./target/release/surreal-pg start \
+    --user root --pass secret \
+    postgresql://user:pass@host.pooler.supabase.com:6543/postgres?sslmode=require&pooler=true
+
+# 连接到 Supabase Pooler（使用连接池模式，需调参）
+# 如果不开 pooler=true，需配合 PG_TUNED_POOL_ACQUIRE_TIMEOUT=30s 等参数
 ./target/release/surreal-pg start \
     --user root --pass secret \
     postgresql://user:pass@host.pooler.supabase.com:6543/postgres?sslmode=require
@@ -278,9 +295,12 @@ curl -X POST -u "root:secret" \
 | `auto_create_table` | true | 启动时自动建表 + 表调优 |
 | `table_name` | `kv` | 表名（需符合 PG 标识符规则，拒绝 SQL 保留字） |
 | `isolation_level` | `read_committed` | 事务隔离级别（`read_committed` / `repeatable_read` / `serializable`） |
-| `persistent_statements` | `auto` | prepared statement 策略（`auto` / `true` / `false` / `on` / `off` / `yes` / `no` / `1` / `0`） |
+| `persistent_statements` | `auto` | prepared statement 策略（`auto` / `true` / `false` / `on` / `off` / `yes` / `no` / `1` / `0`）。直连模式下强制 `false`
+| `pooler` | `false` | 启用直连模式（`true`/`false`/`on`/`off`/`yes`/`no`/`1`/`0`）。绕过 sqlx 连接池，每个事务独立建连，适用于 PgBouncer/Supavisor 等 transaction-mode pooler |
 
 示例：`postgresql://user:pass@host:5432/db?max_connections=30&isolation_level=serializable`
+
+直连模式示例：`postgresql://user:pass@host:5432/db?pooler=true`
 
 ### 环境变量
 
@@ -289,8 +309,9 @@ curl -X POST -u "root:secret" \
 | `PG_PERSISTENT_STATEMENTS` | 覆盖 persistent statements 策略（`auto`/`true`/`false`/`on`/`off` 等） |
 
 优先级规则：
-- **persistent_statements**：`PG_PERSISTENT_STATEMENTS` 环境变量 > URL 参数 > 默认值 `auto`
-- **pool 参数**（max/min_connections、timeouts）：URL 参数 > `PG_TUNED_*` 调优默认值
+- **persistent_statements**：`PG_PERSISTENT_STATEMENTS` 环境变量 > URL 参数 > 默认值 `auto`。**直连模式下强制 `false`，此参数被忽略**
+- **pooler**：仅 URL 参数，无环境变量
+- **pool 参数**（max/min_connections、timeouts）：URL 参数 > `PG_TUNED_*` 调优默认值。**直连模式下被忽略**
 - **其他 URL 参数**：URL 参数 > 默认值；不识别的值打印 `warn` 并用默认值
 
 ### 调优配置（29 个参数，6 层）
@@ -314,6 +335,8 @@ curl -X POST -u "root:secret" \
 
 #### 连接池级（5 个参数）
 
+> 仅在连接池模式下生效。直连模式（`pooler=true`）下这些参数被忽略。
+
 | 环境变量 | 默认值 | 说明 |
 |---------|--------|------|
 | `PG_TUNED_POOL_MAX_CONNECTIONS` | `20` | 连接池最大连接数 |
@@ -324,7 +347,7 @@ curl -X POST -u "root:secret" \
 
 #### TCP keepalive 级（3 个参数）
 
-通过 `after_connect` 的 session `SET` 语句生效。TCP keepalive 让操作系统在连接空闲时主动发送探测包，及时发现被 Pooler/服务器静默断开的连接，避免"僵尸连接"导致池耗尽。
+通过 `after_connect` 的 session `SET` 语句生效。TCP keepalive 让操作系统在连接空闲时主动发送探测包，及时发现被 Pooler/服务器静默断开的连接，避免“僵尸连接”导致池耗尽。两种连接模式均生效（直连模式在每次建连时设置）。
 
 | 环境变量 | 默认值 | 说明 |
 |---------|--------|------|
@@ -332,7 +355,7 @@ curl -X POST -u "root:secret" \
 | `PG_TUNED_KEEPALIVE_INTERVAL` | `10s` | 探测间隔 |
 | `PG_TUNED_KEEPALIVE_COUNT` | `5` | 连续探测失败次数，达到后判定连接死亡。总检测时间 = idle + interval × count |
 
-默认配置下，死亡连接在 60 + 10×5 = 110s 内被检测到。托管 PG（如 Supabase）可能忽略这些设置，但设置它们是安全的，对直连 PG 场景特别有效。
+默认配置下，死亡连接在 60 + 10×5 = 110s 内被检测到。托管 PG（如 Supabase）可能忽略这些设置，但设置它们是安全的，对直连 PG 场景特别有效。使用 `pooler=true` 直连模式时，由于每个事务连接短暂，keepalive 主要在长事务期间发挥作用。
 
 #### KV 表存储级（4 个参数）
 
@@ -389,7 +412,12 @@ PG_TUNED_QUERY_STATEMENT_TIMEOUT=15s \
 ./target/release/surreal-pg start --user root --pass secret \
     postgresql://prod-pg:5432/surrealdb
 
-# Supabase / 云 Pooler（跨 region 部署）
+# Supabase / 云 Pooler——直连模式（推荐，无需调参）
+./target/release/surreal-pg start --user root --pass secret \
+    --query-timeout 5m \
+    postgresql://user:pass@host.pooler.supabase.com:6543/postgres?sslmode=require&pooler=true
+
+# Supabase / 云 Pooler——连接池模式（需调参，作为备选）
 PG_TUNED_POOL_ACQUIRE_TIMEOUT=30s \
 PG_TUNED_POOL_MIN_CONNECTIONS=5 \
 ./target/release/surreal-pg start --user root --pass secret \
@@ -399,7 +427,21 @@ PG_TUNED_POOL_MIN_CONNECTIONS=5 \
 
 ### Supabase / 云 Pooler 场景配置指南
 
-Supabase Pooler（基于 PgBouncer/Supavisor）在 transaction 模式下，连接不是 1:1 映射到后端 PG 进程，而是通过池复用。跨 region 部署时（例如应用在亚洲、Supabase 在美东），新建连接的延迟可达 2-3 秒。这会导致以下连锁告警：
+Supabase Pooler（基于 PgBouncer/Supavisor）在 transaction 模式下，连接不是 1:1 映射到后端 PG 进程，而是通过池复用。跨 region 部署时（例如应用在亚洲、Supabase 在美东），新建连接的延迟可达 2-3 秒。
+
+#### 首选方案：直连模式（`pooler=true`）
+
+在连接字符串中加上 `pooler=true` 即可启用直连模式，绕过 sqlx 连接池，每个事务独立建连、用完即弃，从根本上消除僵尸池、连接池超时等问题。直连模式无需配置任何 `PG_TUNED_POOL_*` 参数。
+
+```bash
+./target/release/surreal-pg start --user root --pass secret \
+    --query-timeout 5m \
+    postgresql://user:pass@host.pooler.supabase.com:6543/postgres?sslmode=require&pooler=true
+```
+
+#### 备选方案：连接池模式（需调参）
+
+如果不使用 `pooler=true`，则使用默认的连接池模式。此时 sqlx 连接池在 transaction-mode pooler 后面可能出现以下连锁告警：
 
 ```
 ① query exceeded the timeout: 1m
@@ -450,18 +492,23 @@ pool_size=20 pool_idle=0 pool_max=20 tx_active=0 error=connection pool timeout
 含义：连接池中有 N 个连接（`pool_size=N`），但 0 个空闲（`pool_idle=0`），同时代码中 0 个活跃事务（`tx_active=0`）。这是一个矛盾——如果没有代码持有连接，连接应该回到池中成为 idle。说明所有连接被 sqlx 内部持有（正在重建/健康检查中），不是代码泄漏。
 
 - **根因**：Supabase Pooler 在服务器端静默回收了空闲连接，sqlx 不知道连接已死，等到要用时才发现，然后所有连接同时进入重建状态
+- **根治**：启用 `pooler=true` 直连模式，从根本上避免连接池静默回收问题
 - **防御 1**：TCP keepalive（已内置，默认 idle=60s/interval=10s/count=5），让 OS 主动检测断开
 - **防御 2**：`before_acquire` 条件式 ping（已内置），空闲超过 60s 的连接获取前先 ping
 - **应急**：若池完全卡死，重启进程；加大 `min_connections=5` 保持更多热连接
 
-#### 必须调整的参数
+#### 必须调整的参数（仅连接池模式）
+
+> 以下参数仅在使用连接池模式（未启用 `pooler=true`）时需要调整。直连模式无需配置这些参数。
 
 | 参数 | 推荐值 | 原因 |
 |------|--------|------|
 | `PG_TUNED_POOL_ACQUIRE_TIMEOUT` | `30s` | 跨 region 连接建立慢（2-3s/连接），高并发时 10s 不够排队 |
 | `min_connections`（URL 或 `PG_TUNED_POOL_MIN_CONNECTIONS`） | `5` | 保持更多热连接，减少冷启动建连频率 |
 
-#### 建议调整的参数
+#### 建议调整的参数（仅连接池模式）
+
+> 以下参数仅在使用连接池模式（未启用 `pooler=true`）时需要调整。
 
 | 参数 | 推荐值 | 原因 |
 |------|--------|------|
@@ -472,6 +519,17 @@ pool_size=20 pool_idle=0 pool_max=20 tx_active=0 error=connection pool timeout
 | `PG_TUNED_POOL_IDLE_TIMEOUT` | `300s` | 减少空闲回收时间，加速僵尸连接的淘汰（默认 600s 偏保守） |
 
 #### 完整启动命令
+
+**直连模式（推荐）：**
+
+```bash
+./target/release/surreal-pg start \
+    --user root --pass secret \
+    --query-timeout 5m \
+    postgresql://user:pass@host.pooler.supabase.com:6543/postgres?sslmode=require&pooler=true
+```
+
+**连接池模式（备选，需调参）：**
 
 ```bash
 PG_TUNED_POOL_ACQUIRE_TIMEOUT=30s \
@@ -489,12 +547,12 @@ PG_TUNED_POOL_IDLE_TIMEOUT=300s \
 
 | 层次 | 超时 | 默认值 | 可调？ | 说明 |
 |------|------|--------|--------|------|
-| 0. TCP keepalive | 探测空闲 | 60s | `PG_TUNED_KEEPALIVE_IDLE` | OS 层面检测死连接 |
+| 0. TCP keepalive | 探测空闲 | 60s | `PG_TUNED_KEEPALIVE_IDLE` | OS 层面检测死连接（连接池模式防御僵尸连接） |
 | 0. TCP keepalive | 探测间隔 | 10s | `PG_TUNED_KEEPALIVE_INTERVAL` | 两次探测的时间间隔 |
 | 0. TCP keepalive | 失败判定 | 5 次 | `PG_TUNED_KEEPALIVE_COUNT` | 连续失败次数，总检测时间 = idle + interval × count |
 | 1. PG 服务器 | `statement_timeout` | 30s | `PG_TUNED_QUERY_STATEMENT_TIMEOUT` | 单条 SQL 执行上限 |
 | 2. PG 服务器 | `lock_timeout` | 10s | `PG_TUNED_QUERY_LOCK_TIMEOUT` | 等锁超时 |
-| 3. 连接池 | `acquire_timeout` | 10s | `PG_TUNED_POOL_ACQUIRE_TIMEOUT` | **推荐 30s** |
+| 3. 连接池 | `acquire_timeout` | 10s | `PG_TUNED_POOL_ACQUIRE_TIMEOUT` | **推荐 30s**。仅连接池模式；直连模式无此层 |
 | 4. SurrealDB | `query-timeout` | 无限制 | `--query-timeout` / `SURREAL_QUERY_TIMEOUT` | 查询总执行上限 |
 | 5. SurrealDB | 节点注册超时 | 60s | **不可配置** | 硬编码常量 |
 | 6. SurrealDB | 事务超时 | 无限制 | `--transaction-timeout` / `SURREAL_TRANSACTION_TIMEOUT` | 事务总执行上限 |
@@ -503,7 +561,7 @@ PG_TUNED_POOL_IDLE_TIMEOUT=300s \
 
 #### 告警阈值对照表
 
-告警阈值不影响功能，只控制日志输出。阈值过高会漏报真正的性能问题，过低则产生大量误报警报噪音。跨 region 场景下正常延迟基线更高，需适当调高。
+告警阈值不影响功能，只控制日志输出。阈值过高会漏报真正的性能问题，过低则产生大量误报警报噪音。跨 region 场景下正常延迟基线更高，需适当调高。仅连接池模式生效。
 
 | 告警 | 阈值参数 | 默认值 | 跨 region 推荐值 | 说明 |
 |------|---------|--------|-----------------|------|
@@ -553,9 +611,10 @@ checkpoint_completion_target = 0.9
 
 | 指标名 | 说明 |
 |--------|------|
-| `pg_pool_size` | 当前连接池总连接数（含空闲） |
-| `pg_pool_idle` | 空闲连接数 |
-| `pg_pool_max` | 连接池最大连接数 |
+| `pg_pool_size` | 当前连接池总连接数（含空闲）。直连模式下返回 0 |
+| `pg_pool_idle` | 空闲连接数。直连模式下返回 0 |
+| `pg_pool_max` | 连接池最大连接数。直连模式下返回 0 |
+| `pg_direct_mode` | 连接模式标识：1 = 直连模式（pooler=true），0 = 连接池模式 |
 | `pg_tx_started` | 累计启动的事务数 |
 | `pg_tx_committed` | 累计提交的事务数 |
 | `pg_tx_rolled_back` | 累计回滚/取消的事务数 |
@@ -563,11 +622,11 @@ checkpoint_completion_target = 0.9
 
 指标恒等式：`tx_started = tx_committed + tx_rolled_back`（commit/cancel 失败也计入 rolled_back）。
 
-`pg_tx_active` 与 `pg_pool_size - pg_pool_idle` 的差值可以反映连接池状态：
+`pg_tx_active` 与 `pg_pool_size - pg_pool_idle` 的差值可以反映连接池状态（仅连接池模式，直连模式下 pool 指标返回 0）：
 - **正常**：`tx_active ≈ pool_size - pool_idle`（所有非空闲连接都在事务中）
-- **僵尸池**：`tx_active = 0` 但 `pool_idle = 0`（所有连接被 sqlx 内部持有，非代码泄漏）
+- **僵尸池**：`tx_active = 0` 但 `pool_idle = 0`（所有连接被 sqlx 内部持有，非代码泄漏。使用 `pooler=true` 直连模式可彻底避免此问题）
 
-连接池利用率超过 80% 时自动输出一次性 `warn` 日志，避免日志刷屏。
+连接池利用率超过 80% 时自动输出一次性 `warn` 日志，避免日志刷屏（仅连接池模式）。
 
 ### 定期维护
 
