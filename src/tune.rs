@@ -202,11 +202,20 @@ impl PgTuneConfig {
             ),
             toast_threshold: {
                 let v = env_i32("PG_TUNED_TABLE_TOAST_THRESHOLD", 2032);
+                // PG's toast_tuple_target range is [128, 8160] for the
+                // default 8KB block size (TOAST_TUPLE_TARGET_MAX).
                 if v < 128 {
                     warn!(
                         env = "PG_TUNED_TABLE_TOAST_THRESHOLD",
                         value = v,
                         "toast_tuple_target minimum is 128, using default 2032"
+                    );
+                    2032
+                } else if v > 8160 {
+                    warn!(
+                        env = "PG_TUNED_TABLE_TOAST_THRESHOLD",
+                        value = v,
+                        "toast_tuple_target maximum is 8160 (8KB block), using default 2032"
                     );
                     2032
                 } else {
@@ -457,6 +466,11 @@ impl PgTuneConfig {
             self.autovac_vacuum_threshold >= 0,
             "autovac_vacuum_threshold must be >= 0, got {}",
             self.autovac_vacuum_threshold
+        );
+        assert!(
+            (128..=8160).contains(&self.toast_threshold),
+            "toast_threshold must be in [128, 8160], got {}",
+            self.toast_threshold
         );
         format!(
             r#"
@@ -1329,6 +1343,28 @@ mod tests {
     fn test_tune_table_sql_rejects_negative_vacuum_threshold() {
         let c = PgTuneConfig {
             autovac_vacuum_threshold: -1,
+            ..PgTuneConfig::default()
+        };
+        let _ = c.tune_table_sql("kv");
+    }
+
+    // R9: toast_threshold upper bound validation
+    #[test]
+    fn test_toast_threshold_upper_bound() {
+        unsafe { std::env::set_var("PG_TUNED_TABLE_TOAST_THRESHOLD", "8160") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.toast_threshold, 8160, "8160 should pass through");
+        unsafe { std::env::set_var("PG_TUNED_TABLE_TOAST_THRESHOLD", "8161") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.toast_threshold, 2032, "8161 should fall back to default");
+        unsafe { std::env::remove_var("PG_TUNED_TABLE_TOAST_THRESHOLD") };
+    }
+
+    #[test]
+    #[should_panic(expected = "toast_threshold must be in [128, 8160]")]
+    fn test_tune_table_sql_rejects_oversized_toast_threshold() {
+        let c = PgTuneConfig {
+            toast_threshold: 10000,
             ..PgTuneConfig::default()
         };
         let _ = c.tune_table_sql("kv");

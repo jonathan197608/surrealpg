@@ -72,6 +72,8 @@ pub struct PgStore {
     tx_active: Arc<AtomicU64>,
     /// O3: One-shot flag for pool utilization warning.
     pool_warned: Arc<AtomicBool>,
+    /// Barrier flag: set by `shutdown()` to prevent new `begin()` calls.
+    shutting_down: Arc<AtomicBool>,
     /// Session SQL applied to every new connection (both modes).
     session_sql: Arc<str>,
     /// TCP keepalive SQL applied to every new connection (both modes).
@@ -414,6 +416,7 @@ impl PgStore {
             tx_rolled_back: Arc::new(AtomicU64::new(0)),
             tx_active: Arc::new(AtomicU64::new(0)),
             pool_warned: Arc::new(AtomicBool::new(false)),
+            shutting_down: Arc::new(AtomicBool::new(false)),
             session_sql,
             keepalive_sql,
             connect_timeout,
@@ -433,6 +436,12 @@ impl PgStore {
     /// The connection is closed when the transaction is committed/cancelled/
     /// dropped. No retry logic is needed — there is no pool to exhaust.
     pub async fn begin(&self, write: bool) -> Result<PgTransaction> {
+        // Barrier: refuse new transactions after shutdown() has been called.
+        if self.shutting_down.load(AtomicOrdering::Relaxed) {
+            return Err(PgStoreError::Other(
+                "PgStore is shutting down — new transactions are refused".to_string(),
+            ));
+        }
         match &self.mode {
             ConnectionMode::Pooled(pool) => self.begin_pooled(pool, write).await,
             ConnectionMode::Direct(opts) => self.begin_direct(opts, write).await,
@@ -565,6 +574,8 @@ impl PgStore {
     /// transaction owns its TCP connection, which is closed when the
     /// transaction commits/cancels/drops.
     pub async fn shutdown(&self) {
+        // Set barrier to prevent new begin() calls.
+        self.shutting_down.store(true, AtomicOrdering::Relaxed);
         match &self.mode {
             ConnectionMode::Pooled(pool) => {
                 pool.close().await;

@@ -356,7 +356,14 @@ impl PgTransaction {
     pub async fn commit(&mut self) -> Result<()> {
         let txconn = self.conn.take().ok_or(PgStoreError::TxClosed)?;
         self.savepoints.clear();
+        // Note: release_active() is called after COMMIT/RB completes,
+        // so tx_active accurately reflects in-flight transactions.
+        let result = self.commit_inner(txconn).await;
         self.release_active();
+        result
+    }
+
+    async fn commit_inner(&self, txconn: TxConn) -> Result<()> {
         match txconn {
             TxConn::Pooled(tx) => {
                 let result = tx.commit().await;
@@ -389,7 +396,14 @@ impl PgTransaction {
     pub async fn cancel(&mut self) -> Result<()> {
         let txconn = self.conn.take().ok_or(PgStoreError::TxClosed)?;
         self.savepoints.clear();
+        // Note: release_active() is called after ROLLBACK completes,
+        // so tx_active accurately reflects in-flight transactions.
+        let result = self.cancel_inner(txconn).await;
         self.release_active();
+        result
+    }
+
+    async fn cancel_inner(&self, txconn: TxConn) -> Result<()> {
         match txconn {
             TxConn::Pooled(tx) => {
                 let result = tx.rollback().await;
@@ -505,7 +519,7 @@ impl PgTransaction {
             for (k, v) in Self::rows_to_pairs(rows) {
                 map.insert(k, v);
             }
-            Ok(keys.into_iter().map(|k| map.get(&k).cloned()).collect())
+            Ok(keys.into_iter().map(|k| map.remove(&k)).collect())
         }
     }
 
@@ -537,12 +551,21 @@ impl PgTransaction {
     ///
     /// If `pairs` is empty, returns immediately without hitting the DB.
     ///
+    /// **Duplicate keys**: If `pairs` contains duplicate keys, the **last**
+    /// value for each key wins (last-write-wins semantics). Duplicates are
+    /// resolved before being sent to PG, because PostgreSQL's
+    /// `ON CONFLICT DO UPDATE` rejects multiple operations on the same row
+    /// within a single command (cardinality violation error).
+    ///
     /// **O2: Parameter limit protection.** PostgreSQL limits each query to
     /// 65,535 parameters. `setm` uses 2 array parameters, but the total
     /// element count per array must stay below 32,767 to be safe. When
     /// `pairs` exceeds [`SETM_MAX_PAIRS`], the batch is automatically
     /// chunked into multiple sequential executions. Each chunk is atomic
-    /// within the encompassing transaction.
+    /// within the encompassing transaction. If a chunk fails midway,
+    /// previously successful chunks remain in the transaction buffer —
+    /// the caller can `commit()` (partial data) or `cancel()` (full
+    /// rollback) to decide the outcome.
     pub async fn setm(&mut self, pairs: Vec<(Key, Val)>) -> Result<()> {
         if self.conn.is_none() {
             return Err(PgStoreError::TxClosed);
@@ -551,6 +574,11 @@ impl PgTransaction {
         if pairs.is_empty() {
             return Ok(());
         }
+
+        // Deduplicate keys: last value wins. PG's ON CONFLICT DO UPDATE
+        // raises a cardinality violation if the same key appears twice in
+        // a single INSERT...SELECT FROM UNNEST statement.
+        let pairs = Self::dedup_pairs(pairs);
 
         // O2: Chunk if the batch exceeds PG's parameter limit.
         // Each pair becomes 2 array elements (key + val), and PG's
@@ -597,7 +625,45 @@ impl PgTransaction {
         Ok(())
     }
 
-    /// Set a key only if it does not already exist (insert-if-absent).
+    /// Deduplicate key-value pairs, keeping the **last** value for each key.
+    ///
+    /// PostgreSQL's `INSERT ... ON CONFLICT DO UPDATE` with `UNNEST` raises
+    /// a cardinality violation if the same key appears twice in the source
+    /// data. This function ensures each key appears exactly once.
+    ///
+    /// Uses a `HashMap` for O(n) deduplication. For small inputs (≤ 32
+    /// pairs), a linear scan is used to avoid HashMap overhead.
+    fn dedup_pairs(mut pairs: Vec<(Key, Val)>) -> Vec<(Key, Val)> {
+        // Fast path: if ≤ 1 pair, no duplicates possible.
+        if pairs.len() <= 1 {
+            return pairs;
+        }
+
+        // For small inputs, linear dedup is faster (no HashMap allocation).
+        if pairs.len() <= 32 {
+            let mut result: Vec<(Key, Val)> = Vec::with_capacity(pairs.len());
+            for (k, v) in pairs.drain(..) {
+                if let Some(existing) = result.iter_mut().find(|(ek, _)| ek == &k) {
+                    existing.1 = v;
+                } else {
+                    result.push((k, v));
+                }
+            }
+            return result;
+        }
+
+        // For larger inputs, use HashMap for O(1) lookup.
+        // `insert` returns the old value (which we discard), effectively
+        // keeping the last value for each key.
+        let mut map: std::collections::HashMap<Vec<u8>, Vec<u8>> =
+            std::collections::HashMap::with_capacity(pairs.len());
+        for (k, v) in pairs {
+            map.insert(k, v);
+        }
+        map.into_iter().collect()
+    }
+
+    /// set a key only if it does not already exist (insert-if-absent).
     /// Returns `KeyAlreadyExists` if the key exists.
     pub async fn put(&mut self, key: Key, val: Val) -> Result<()> {
         if self.conn.is_none() {
@@ -984,6 +1050,76 @@ impl Drop for PgTransaction {
         if self.conn.is_some() {
             self.release_active();
             debug!("PgTransaction dropped without explicit commit/cancel; auto-rollback");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // R9: dedup_pairs last-value-wins semantics
+    #[test]
+    fn test_dedup_pairs_last_wins() {
+        let pairs = vec![
+            (b"k1".to_vec(), b"v1".to_vec()),
+            (b"k2".to_vec(), b"v2".to_vec()),
+            (b"k1".to_vec(), b"v1b".to_vec()), // override k1
+        ];
+        let result = PgTransaction::dedup_pairs(pairs);
+        assert_eq!(result.len(), 2);
+        // k1 should have last value
+        let k1 = result.iter().find(|(k, _)| k == b"k1").unwrap();
+        assert_eq!(k1.1, b"v1b");
+        let k2 = result.iter().find(|(k, _)| k == b"k2").unwrap();
+        assert_eq!(k2.1, b"v2");
+    }
+
+    #[test]
+    fn test_dedup_pairs_no_duplicates() {
+        let pairs = vec![
+            (b"k1".to_vec(), b"v1".to_vec()),
+            (b"k2".to_vec(), b"v2".to_vec()),
+        ];
+        let result = PgTransaction::dedup_pairs(pairs);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_dedup_pairs_empty() {
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = vec![];
+        let result = PgTransaction::dedup_pairs(pairs);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_dedup_pairs_single() {
+        let pairs = vec![(b"k1".to_vec(), b"v1".to_vec())];
+        let result = PgTransaction::dedup_pairs(pairs);
+        assert_eq!(result.len(), 1);
+    }
+
+    // R9: dedup with many pairs (exercises HashMap path)
+    #[test]
+    fn test_dedup_pairs_large() {
+        let mut pairs = Vec::new();
+        for i in 0..100 {
+            pairs.push((format!("key{i:03}").into_bytes(), b"old".to_vec()));
+        }
+        // Override half of them
+        for i in 0..50 {
+            pairs.push((format!("key{i:03}").into_bytes(), b"new".to_vec()));
+        }
+        let result = PgTransaction::dedup_pairs(pairs);
+        assert_eq!(result.len(), 100);
+        for (k, v) in &result {
+            let key_str = String::from_utf8_lossy(k);
+            let num: usize = key_str.trim_start_matches("key").parse().unwrap();
+            if num < 50 {
+                assert_eq!(v, b"new", "key {num} should have 'new' value");
+            } else {
+                assert_eq!(v, b"old", "key {num} should have 'old' value");
+            }
         }
     }
 }

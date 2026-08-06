@@ -249,6 +249,14 @@ impl PgConfig {
         if Self::is_sql_reserved(name) {
             return Err(format!("invalid table name '{name}': SQL reserved word"));
         }
+        // PG's NAMEDATALEN (default 64) limits identifiers to 63 bytes.
+        // Longer names are silently truncated by PG, which can cause
+        // confusion in logs and diagnostics.
+        if name.len() > 63 {
+            return Err(format!(
+                "invalid table name '{name}': exceeds PG's 63-byte identifier limit (NAMEDATALEN)"
+            ));
+        }
         Ok(())
     }
 
@@ -629,6 +637,17 @@ mod tests {
         // SOME instead of before SELECT), causing binary_search to miss it.
         assert!(PgConfig::validate_identifier("SAVEPOINT").is_err());
         assert!(PgConfig::validate_identifier("savepoint").is_err());
+    }
+
+    // R9: identifier length check (PG NAMEDATALEN = 63 bytes)
+    #[test]
+    fn test_validate_identifier_too_long() {
+        // 63 chars should pass
+        let name63 = "a".repeat(63);
+        assert!(PgConfig::validate_identifier(&name63).is_ok());
+        // 64 chars should fail
+        let name64 = "a".repeat(64);
+        assert!(PgConfig::validate_identifier(&name64).is_err());
     }
 
     // P1: Verify is_sql_reserved works with mixed case (zero-alloc path).
