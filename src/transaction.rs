@@ -519,7 +519,7 @@ impl PgTransaction {
             for (k, v) in Self::rows_to_pairs(rows) {
                 map.insert(k, v);
             }
-            Ok(keys.into_iter().map(|k| map.remove(&k)).collect())
+            Ok(keys.into_iter().map(|k| map.get(&k).cloned()).collect())
         }
     }
 
@@ -1128,5 +1128,37 @@ mod tests {
                 assert_eq!(v, b"old", "key {num} should have 'old' value");
             }
         }
+    }
+
+    // R19: Verify getm HashMap path handles duplicate keys correctly.
+    // Previously map.remove(&k) was used which deleted the entry on first
+    // match, causing duplicate keys to get None on second lookup.
+    #[test]
+    fn test_getm_hashmap_path_duplicate_keys() {
+        // Simulate the HashMap used in getm's large-result path.
+        // Build a map from rows (like rows_to_pairs would produce).
+        let mut map = std::collections::HashMap::new();
+        map.insert(b"k1".to_vec(), b"v1".to_vec());
+        map.insert(b"k2".to_vec(), b"v2".to_vec());
+        map.insert(b"k3".to_vec(), b"v3".to_vec());
+
+        // keys with duplicates: [k1, k2, k1, k3, k2]
+        let keys: Vec<Vec<u8>> = vec![
+            b"k1".to_vec(),
+            b"k2".to_vec(),
+            b"k1".to_vec(),
+            b"k3".to_vec(),
+            b"k2".to_vec(),
+        ];
+
+        // Old behavior (map.remove): first k1 → Some(v1), second k1 → None ❌
+        // New behavior (map.get.cloned): both k1 → Some(v1) ✅
+        let results: Vec<Option<Vec<u8>>> = keys.iter().map(|k| map.get(k).cloned()).collect();
+
+        assert_eq!(results[0], Some(b"v1".to_vec()), "first k1");
+        assert_eq!(results[1], Some(b"v2".to_vec()), "k2");
+        assert_eq!(results[2], Some(b"v1".to_vec()), "second k1 (duplicate)");
+        assert_eq!(results[3], Some(b"v3".to_vec()), "k3");
+        assert_eq!(results[4], Some(b"v2".to_vec()), "second k2 (duplicate)");
     }
 }

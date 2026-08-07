@@ -566,7 +566,17 @@ impl PgStore {
         // transaction mode doesn't support named prepared statements.
         // In pooled mode, Auto resolves to true (direct PG supports them).
         let persistent = if config.pooler {
-            info!("pooler mode: persistent-statements forced to false");
+            if matches!(
+                config.persistent_statements,
+                crate::config::PersistentStatements::Enabled
+            ) {
+                warn!(
+                    "pooler mode: persistent-statements=Enabled is not compatible with \
+                     pgbouncer transaction mode — forced to false"
+                );
+            } else {
+                info!("pooler mode: persistent-statements forced to false");
+            }
             false
         } else {
             match config.persistent_statements {
@@ -662,6 +672,15 @@ impl PgStore {
         loop {
             attempt += 1;
 
+            // Re-check shutdown barrier on each retry attempt — if shutdown()
+            // was called during the backoff sleep, don't waste resources
+            // creating a new connection.
+            if self.shutting_down.load(AtomicOrdering::Relaxed) {
+                return Err(PgStoreError::Other(
+                    "PgStore is shutting down — new transactions are refused".to_string(),
+                ));
+            }
+
             // begin_with() requires Cow<'static, str> — we must own the
             // string, so to_string() is unavoidable here (Arc<str> → String).
             match pool.begin_with(self.begin_sql.to_string()).await {
@@ -743,6 +762,15 @@ impl PgStore {
         let mut attempt = 0;
         loop {
             attempt += 1;
+
+            // Re-check shutdown barrier on each retry attempt — if shutdown()
+            // was called during the backoff sleep, don't waste resources
+            // creating a new connection.
+            if self.shutting_down.load(AtomicOrdering::Relaxed) {
+                return Err(PgStoreError::Other(
+                    "PgStore is shutting down — new transactions are refused".to_string(),
+                ));
+            }
 
             match connect_direct(opts, self.connect_timeout).await {
                 Ok(mut conn) => {
