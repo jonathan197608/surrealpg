@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: 'ac167bf2-b4c6-4860-b042-6af2884fd692'
-  PropagateID: 'ac167bf2-b4c6-4860-b042-6af2884fd692'
-  ReservedCode1: 'eda4df66-7e31-463c-92f7-bcdbe22815f9'
-  ReservedCode2: 'eda4df66-7e31-463c-92f7-bcdbe22815f9'
+  ProduceID: 'a566f9cc-74dd-4284-ad54-f29735ea7a74'
+  PropagateID: 'a566f9cc-74dd-4284-ad54-f29735ea7a74'
+  ReservedCode1: 'c2c60658-22bb-4e9a-ac81-e5d1d7e6f694'
+  ReservedCode2: 'c2c60658-22bb-4e9a-ac81-e5d1d7e6f694'
 ---
 
 # surreal-pg
@@ -64,13 +64,13 @@ SurrealDB 的事务语义 1:1 映射到 PostgreSQL 的 `BEGIN` / `COMMIT` / `ROL
 
 > **注**：连接池模式使用 named prepared statement 以获得最佳性能；直连模式使用 unnamed prepared statement 以兼容 transaction-mode pooler。直连模式下 `persistent_statements` 参数被忽略。
 
-### 5 层 29 参数精细化调优
+### 6 层 30 参数精细化调优
 
 内置分层调优系统，全部参数有合理默认值（零配置可用），也可通过 `PG_TUNED_*` 环境变量按需调整：
 
 - **连接池层**：连接数、超时、生命周期（仅连接池模式）
 - **TCP keepalive 层**：空闲探测、探测间隔、失败计数（两种模式均生效）
-- **表存储层**：fillfactor、TOAST 策略、UNLOGGED 模式
+- **表存储层**：fillfactor、TOAST 策略、UNLOGGED 模式、**Hash 分区**
 - **Autovacuum 层**：死元组触发阈值、VACUUM 限流
 - **查询运行时层**：超时防护、锁等待、统计精度
 - **PG 服务器层**：work_mem、random_page_cost 等（session SET + postgresql.conf 建议）
@@ -113,11 +113,18 @@ PostgresComposer::new_transaction_builder(path)
 SurrealDB 的 KV 层将所有数据视为字节对 `(Vec<u8>, Vec<u8>)`，存储在单张 PG 表中：
 
 ```sql
+-- 单表模式（默认）
 CREATE TABLE kv (key BYTEA PRIMARY KEY, val BYTEA NOT NULL);
+
+-- Hash 分区模式（hash_partitions > 1）
+CREATE TABLE kv (key BYTEA PRIMARY KEY, val BYTEA NOT NULL) PARTITION BY HASH (key);
+CREATE TABLE kv_p0 PARTITION OF kv FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+CREATE TABLE kv_p1 PARTITION OF kv FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+CREATE TABLE kv_p2 PARTITION OF kv FOR VALUES WITH (MODULUS 4, REMAINDER 2);
+CREATE TABLE kv_p3 PARTITION OF kv FOR VALUES WITH (MODULUS 4, REMAINDER 3);
 ```
 
 | KV 操作 | SQL | 说明 |
-|---------|-----|------|
 | `set(k, v)` | `INSERT … ON CONFLICT DO UPDATE` | Upsert |
 | `setm(pairs)` | `INSERT … SELECT * FROM UNNEST(…)` | 批量 upsert，自动分块（≤ 32,000 对/批） |
 | `put(k, v)` | `INSERT … ON CONFLICT DO NOTHING` | Insert-if-absent，0 行受影响时返回 `KeyAlreadyExists` |
@@ -134,6 +141,16 @@ CREATE TABLE kv (key BYTEA PRIMARY KEY, val BYTEA NOT NULL);
 | savepoint | `SAVEPOINT sp_N` / `ROLLBACK TO SAVEPOINT sp_N` / `RELEASE SAVEPOINT sp_N` | PG 原生 savepoint，名字栈式管理 |
 
 所有 SQL 在 `PgStore::new()` 时预构建为 `Arc<Sql>`，每个事务通过 `Arc::clone` 共享（1 次原子引用计数），操作时零 `format!()` 堆分配。热路径利用 Rust 的"不同字段可同时借用"规则：`&self.sql.field`（不可变）与 `conn.conn_mut()`（可变）并存于同一作用域。
+
+### Hash 分区
+
+当 `hash_partitions > 1` 时，KV 表使用 PostgreSQL 的 `PARTITION BY HASH (key)` 创建多个子分区。Hash 分区将 key 的 hash 值对分区数取模，自动路由到对应子分区，可以：
+
+- **提升写入吞吐**：不同 key 范围的写入分散到不同分区，减少单索引 B-tree 竞争
+- **加速 VACUUM**：每个分区独立 VACUUM，锁范围更小
+- **并行查询**：PG 12+ 支持 partition-wise join/aggregate
+
+**限制**：分区数在建表后**不可变**（PG 不支持 `ALTER TABLE` 增减分区）。如果配置与实际分区数不匹配，启动时会报错并提示解决方案。
 
 ### 错误映射
 
@@ -332,6 +349,7 @@ curl -X POST -u "root:secret" \
 | `isolation_level` | `read_committed` | 事务隔离级别（`read_committed` / `repeatable_read` / `serializable`） |
 | `persistent_statements` | `auto` | prepared statement 策略（`auto` / `true` / `false` / `on` / `off` / `yes` / `no` / `1` / `0`）。直连模式下强制 `false`
 | `pooler` | `false` | 启用直连模式（`true`/`false`/`on`/`off`/`yes`/`no`/`1`/`0`）。绕过 sqlx 连接池，每个事务独立建连，适用于 PgBouncer/Supavisor 等 transaction-mode pooler |
+| `hash_partitions` | `1` | Hash 分区数。1 = 不分区（默认）；>1 = 按 key 做 hash 分区（如 `hash_partitions=4` 创建 4 个子分区）。**分区数不可变**——建表后修改需重建表 |
 
 示例：`postgresql://user:pass@host:5432/db?max_connections=30&isolation_level=serializable`
 
@@ -349,7 +367,7 @@ curl -X POST -u "root:secret" \
 - **pool 参数**（max/min_connections、timeouts）：URL 参数 > `PG_TUNED_*` 调优默认值。**直连模式下被忽略**
 - **其他 URL 参数**：URL 参数 > 默认值；不识别的值打印 `warn` 并用默认值
 
-### 调优配置（29 个参数，6 层）
+### 调优配置（30 个参数，6 层）
 
 所有调优参数通过 `PG_TUNED_*` 环境变量配置，全部有合理默认值，开箱即用。
 
@@ -392,16 +410,17 @@ curl -X POST -u "root:secret" \
 
 默认配置下，死亡连接在 60 + 10×5 = 110s 内被检测到。托管 PG（如 Supabase）可能忽略这些设置，但设置它们是安全的，对直连 PG 场景特别有效。使用 `pooler=true` 直连模式时，由于每个事务连接短暂，keepalive 主要在长事务期间发挥作用。
 
-#### KV 表存储级（4 个参数）
+#### KV 表存储级（5 个参数）
 
-通过 DDL `ALTER TABLE` 在建表时执行。
+通过 DDL 在建表时执行。`fillfactor`/`TOAST`/`autovacuum` 通过 `ALTER TABLE` 应用；`hash_partitions` 通过 `CREATE TABLE ... PARTITION BY HASH` 应用。
 
 | 环境变量 | 默认值 | 说明 |
 |---------|--------|------|
 | `PG_TUNED_TABLE_FILLFACTOR` | `90` | 页填充率，留 10% 给 HOT update |
 | `PG_TUNED_TABLE_TOAST_STORAGE` | `external` | 大值存储策略（external/extended/main/plain） |
-| `PG_TUNED_TABLE_TOAST_THRESHOLD` | `2032` | TOAST 触发阈值（字节） |
+| `PG_TUNED_TABLE_TOAST_THRESHOLD` | `2032` | TOAST 触发阈值（字节），范围 [128, 8160] |
 | `PG_TUNED_TABLE_UNLOGGED` | `false` | 是否使用 UNLOGGED 表（跳过 WAL，崩溃丢数据） |
+| `PG_TUNED_TABLE_HASH_PARTITIONS` | `1` | Hash 分区数。1 = 不分区；>1 = 按 key 做 N 路 hash 分区（上限 1024）。**分区数不可变**——建表后修改需 drop + 重建。也可通过 URL 参数 `hash_partitions=N` 覆盖 |
 
 #### Autovacuum 级（5 个参数）
 
