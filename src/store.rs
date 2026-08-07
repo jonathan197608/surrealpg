@@ -713,46 +713,110 @@ impl PgStore {
     }
 
     /// Direct-mode begin: connect, apply session SQL, send BEGIN.
+    ///
+    /// Unlike the initial implementation, this now includes retry logic
+    /// with exponential backoff for transient connection failures. This
+    /// mirrors the retry strategy in `begin_pooled()` — behind a pooler
+    /// (Supabase Pooler / pgbouncer), transient TCP connect failures are
+    /// common (pooler connection limit reached, brief network blips,
+    /// pooler restarting, etc.) and retrying typically succeeds.
     async fn begin_direct(&self, opts: &PgConnectOptions, write: bool) -> Result<PgTransaction> {
-        let mut conn = connect_direct(opts, self.connect_timeout).await?;
+        const MAX_RETRIES: u32 = 2;
+        const BASE_DELAY_MS: u64 = 500;
+        const MAX_DELAY_MS: u64 = 5000;
 
-        // Apply keepalive (non-fatal).
-        if let Err(e) = Executor::execute(&mut conn, sqlx::raw_sql(&self.keepalive_sql)).await {
-            warn!(
-                error = %e,
-                "tcp_keepalive SET failed (non-fatal, may not be supported by this PG)"
-            );
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+
+            match connect_direct(opts, self.connect_timeout).await {
+                Ok(mut conn) => {
+                    // Apply keepalive (non-fatal).
+                    if let Err(e) =
+                        Executor::execute(&mut conn, sqlx::raw_sql(&self.keepalive_sql)).await
+                    {
+                        warn!(
+                            error = %e,
+                            "tcp_keepalive SET failed (non-fatal, may not be supported by this PG)"
+                        );
+                    }
+                    // Apply session SQL — fatal on failure (unlike vacuum/health_check
+                    // which tolerate missing timeouts). begin_direct is on the hot path;
+                    // if session SQL fails, subsequent transactions will also fail.
+                    if let Err(e) =
+                        Executor::execute(&mut conn, sqlx::raw_sql(&self.session_sql)).await
+                    {
+                        warn!(
+                            error = %e,
+                            "session SQL failed on direct-mode connection — \
+                             statement_timeout/lock_timeout will not be set for this transaction"
+                        );
+                        let pg_err = PgStoreError::from_sqlx(None, &e);
+                        if pg_err.is_transient() && attempt <= MAX_RETRIES {
+                            let delay = (BASE_DELAY_MS * 2u64.pow(attempt - 1)).min(MAX_DELAY_MS);
+                            warn!(
+                                attempt,
+                                max_retries = MAX_RETRIES,
+                                delay_ms = delay,
+                                "session SQL failed (transient) — retrying"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                            continue;
+                        }
+                        return Err(pg_err);
+                    }
+
+                    // Send BEGIN.
+                    match Executor::execute(&mut conn, sqlx::raw_sql(&self.begin_sql)).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            let pg_err = PgStoreError::from_sqlx(None, &e);
+                            if pg_err.is_transient() && attempt <= MAX_RETRIES {
+                                let delay =
+                                    (BASE_DELAY_MS * 2u64.pow(attempt - 1)).min(MAX_DELAY_MS);
+                                warn!(
+                                    attempt,
+                                    max_retries = MAX_RETRIES,
+                                    delay_ms = delay,
+                                    error = %pg_err,
+                                    "BEGIN failed (transient) — retrying"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                                continue;
+                            }
+                            return Err(pg_err);
+                        }
+                    }
+
+                    self.tx_started.fetch_add(1, AtomicOrdering::Relaxed);
+                    self.tx_active.fetch_add(1, AtomicOrdering::Relaxed);
+
+                    return Ok(PgTransaction::new_direct(
+                        conn,
+                        write,
+                        self.config.isolation_level,
+                        self.persistent,
+                        Arc::clone(&self.sql),
+                        Arc::clone(&self.tx_active),
+                    ));
+                }
+                Err(e) => {
+                    if e.is_transient() && attempt <= MAX_RETRIES {
+                        let delay = (BASE_DELAY_MS * 2u64.pow(attempt - 1)).min(MAX_DELAY_MS);
+                        warn!(
+                            attempt,
+                            max_retries = MAX_RETRIES,
+                            delay_ms = delay,
+                            error = %e,
+                            "direct-mode TCP connect failed (transient) — retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
         }
-        // Apply session SQL — fatal on failure (unlike vacuum/health_check
-        // which tolerate missing timeouts). begin_direct is on the hot path;
-        // if session SQL fails, subsequent transactions will also fail.
-        // The warn below is for operator visibility — the error is returned
-        // to the caller so SurrealDB can take corrective action.
-        if let Err(e) = Executor::execute(&mut conn, sqlx::raw_sql(&self.session_sql)).await {
-            warn!(
-                error = %e,
-                "session SQL failed on direct-mode connection — statement_timeout/lock_timeout \
-                 will not be set for this transaction"
-            );
-            return Err(PgStoreError::from_sqlx(None, &e));
-        }
-
-        // Send BEGIN.
-        Executor::execute(&mut conn, sqlx::raw_sql(&self.begin_sql))
-            .await
-            .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
-
-        self.tx_started.fetch_add(1, AtomicOrdering::Relaxed);
-        self.tx_active.fetch_add(1, AtomicOrdering::Relaxed);
-
-        Ok(PgTransaction::new_direct(
-            conn,
-            write,
-            self.config.isolation_level,
-            self.persistent,
-            Arc::clone(&self.sql),
-            Arc::clone(&self.tx_active),
-        ))
     }
 
     /// Shut down gracefully.
