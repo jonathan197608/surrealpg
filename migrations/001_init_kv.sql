@@ -4,11 +4,33 @@
 -- SurrealDB datastore. The `key` column stores the encoded namespace path
 -- (e.g. /*{ns_id}*{db_id}*{table_id}*{record_id}), and `val` stores the
 -- serialized record value.
+--
+-- Choose ONE of the two options below:
+--   Option A — Non-partitioned (default, hash_partitions=1)
+--   Option B — Hash-partitioned (e.g. hash_partitions=4)
+
+-- ── Option A: Non-partitioned table ───────────────────────────────────────
+-- Matches the default behavior (hash_partitions ≤ 1).
 
 CREATE TABLE IF NOT EXISTS kv (
     key BYTEA PRIMARY KEY,
     val BYTEA NOT NULL
 );
+
+-- ── Option B: Hash-partitioned table ──────────────────────────────────────
+-- Uncomment the block below and COMMENT OUT Option A if you want hash
+-- partitioning. Replace 4 with your desired partition count (2–1024).
+-- The partition count must match the hash_partitions config parameter
+-- (URL ?hash_partitions=N, env PG_TUNED_TABLE_HASH_PARTITIONS, or default 1).
+--
+-- CREATE TABLE IF NOT EXISTS kv (
+--     key BYTEA PRIMARY KEY,
+--     val BYTEA NOT NULL
+-- ) PARTITION BY HASH (key);
+-- CREATE TABLE IF NOT EXISTS kv_p0 PARTITION OF kv FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+-- CREATE TABLE IF NOT EXISTS kv_p1 PARTITION OF kv FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+-- CREATE TABLE IF NOT EXISTS kv_p2 PARTITION OF kv FOR VALUES WITH (MODULUS 4, REMAINDER 2);
+-- CREATE TABLE IF NOT EXISTS kv_p3 PARTITION OF kv FOR VALUES WITH (MODULUS 4, REMAINDER 3);
 
 -- ── Performance tuning (optional but recommended) ─────────────────────────
 --
@@ -16,14 +38,51 @@ CREATE TABLE IF NOT EXISTS kv (
 -- the table (auto_create_table = true), apply the following tuning for
 -- optimal write-heavy KV performance. These match PgTuneConfig defaults.
 --
--- -- Reduce page fill to leave room for in-place updates ( HOT updates ):
 -- ALTER TABLE kv SET (fillfactor = 90);
---
--- -- Store large values out-of-line (reduces TOAST table scan overhead):
 -- ALTER TABLE kv ALTER COLUMN val SET STORAGE external;
---
--- -- Autovacuum tuning for high-churn KV workloads (matches PgTuneConfig defaults):
 -- ALTER TABLE kv SET (
+--     autovacuum_vacuum_scale_factor = 0.05,
+--     autovacuum_vacuum_threshold = 50,
+--     autovacuum_analyze_scale_factor = 0.02,
+--     autovacuum_vacuum_cost_limit = 2000,
+--     autovacuum_vacuum_cost_delay = 1
+-- );
+--
+-- ── Partition tuning (required if using Option B) ─────────────────────────
+-- PG does NOT propagate parent ALTER TABLE settings to child partitions.
+-- You MUST apply the same fillfactor/autovacuum settings to each partition.
+-- Example for 4 partitions (kv_p0 through kv_p3):
+--
+-- ALTER TABLE kv_p0 SET (fillfactor = 90);
+-- ALTER TABLE kv_p0 ALTER COLUMN val SET STORAGE external;
+-- ALTER TABLE kv_p0 SET (
+--     autovacuum_vacuum_scale_factor = 0.05,
+--     autovacuum_vacuum_threshold = 50,
+--     autovacuum_analyze_scale_factor = 0.02,
+--     autovacuum_vacuum_cost_limit = 2000,
+--     autovacuum_vacuum_cost_delay = 1
+-- );
+-- ALTER TABLE kv_p1 SET (fillfactor = 90);
+-- ALTER TABLE kv_p1 ALTER COLUMN val SET STORAGE external;
+-- ALTER TABLE kv_p1 SET (
+--     autovacuum_vacuum_scale_factor = 0.05,
+--     autovacuum_vacuum_threshold = 50,
+--     autovacuum_analyze_scale_factor = 0.02,
+--     autovacuum_vacuum_cost_limit = 2000,
+--     autovacuum_vacuum_cost_delay = 1
+-- );
+-- ALTER TABLE kv_p2 SET (fillfactor = 90);
+-- ALTER TABLE kv_p2 ALTER COLUMN val SET STORAGE external;
+-- ALTER TABLE kv_p2 SET (
+--     autovacuum_vacuum_scale_factor = 0.05,
+--     autovacuum_vacuum_threshold = 50,
+--     autovacuum_analyze_scale_factor = 0.02,
+--     autovacuum_vacuum_cost_limit = 2000,
+--     autovacuum_vacuum_cost_delay = 1
+-- );
+-- ALTER TABLE kv_p3 SET (fillfactor = 90);
+-- ALTER TABLE kv_p3 ALTER COLUMN val SET STORAGE external;
+-- ALTER TABLE kv_p3 SET (
 --     autovacuum_vacuum_scale_factor = 0.05,
 --     autovacuum_vacuum_threshold = 50,
 --     autovacuum_analyze_scale_factor = 0.02,
