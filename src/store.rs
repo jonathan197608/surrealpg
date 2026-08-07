@@ -785,26 +785,30 @@ impl PgStore {
                 }
             }
             ConnectionMode::Direct(_) => {
+                // SurrealDB's shutdown sequence calls our shutdown() *before*
+                // dropping in-flight transactions. So waiting for tx_active==0
+                // is a deadlock: shutdown() waits for the transactions to drain,
+                // but they can only drain after shutdown() returns and SurrealDB
+                // proceeds to drop them.
+                //
+                // Instead, give a short grace period (3s) for any transactions
+                // that are *truly* in-flight (mid-query) to finish naturally.
+                // When transactions are later dropped by SurrealDB, the Drop
+                // impl closes the TCP connection and PG aborts the transaction.
                 let active = self.tx_active.load(AtomicOrdering::Relaxed);
                 if active > 0 {
                     info!(
                         tx_active = active,
-                        "shutdown: waiting for in-flight direct-mode transactions to complete"
+                        "shutdown: direct mode with in-flight transactions — \
+                         giving 3s grace period before proceeding"
                     );
-                    // Wait for active transactions to drain. Each transaction
-                    // decrements tx_active on commit/cancel/drop.
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
                     loop {
                         let remaining = self.tx_active.load(AtomicOrdering::Relaxed);
                         if remaining == 0 {
                             break;
                         }
                         if std::time::Instant::now() >= deadline {
-                            warn!(
-                                tx_active = remaining,
-                                "shutdown: timed out waiting for direct-mode transactions \
-                                 to complete — proceeding with shutdown"
-                            );
                             break;
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1099,64 +1103,88 @@ async fn direct_mode_heartbeat(
         }
 
         // Try to establish a connection if we don't have one.
+        // Use tokio::select! with cancel so shutdown doesn't have to wait
+        // for a potentially 30s connect_timeout to elapse.
         if conn.is_none() {
-            match connect_direct_with_session(
+            let connect_fut = connect_direct_with_session(
                 &opts,
                 connect_timeout,
                 &keepalive_sql,
                 &session_sql,
                 "heartbeat",
-            )
-            .await
-            {
-                Ok(c) => {
-                    conn = Some(c);
-                    if consecutive_failures > 0 {
-                        info!(
-                            consecutive_failures,
-                            "direct-mode heartbeat: connection re-established after failures"
-                        );
-                    }
-                    consecutive_failures = 0;
+            );
+            tokio::pin!(connect_fut);
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!("direct-mode heartbeat task shutting down during connect");
+                    return;
                 }
-                Err(e) => {
-                    consecutive_failures += 1;
-                    warn!(
-                        error = %e,
-                        consecutive_failures,
-                        "direct-mode heartbeat: failed to connect — PG may be unreachable"
-                    );
-                    // Exponential backoff on repeated failures: min(consecutive^2 * 5s, 5min)
-                    let backoff_secs = std::cmp::min((consecutive_failures as u64).pow(2) * 5, 300);
-                    tokio::select! {
-                        _ = cancel.cancelled() => {
-                            info!("direct-mode heartbeat task shutting down during backoff");
-                            return;
+                result = &mut connect_fut => {
+                    match result {
+                        Ok(c) => {
+                            conn = Some(c);
+                            if consecutive_failures > 0 {
+                                info!(
+                                    consecutive_failures,
+                                    "direct-mode heartbeat: connection re-established after failures"
+                                );
+                            }
+                            consecutive_failures = 0;
                         }
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                        Err(e) => {
+                            consecutive_failures += 1;
+                            warn!(
+                                error = %e,
+                                consecutive_failures,
+                                "direct-mode heartbeat: failed to connect — PG may be unreachable"
+                            );
+                            // Exponential backoff on repeated failures: min(consecutive^2 * 5s, 5min)
+                            let backoff_secs = std::cmp::min((consecutive_failures as u64).pow(2) * 5, 300);
+                            tokio::select! {
+                                _ = cancel.cancelled() => {
+                                    info!("direct-mode heartbeat task shutting down during backoff");
+                                    return;
+                                }
+                                _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                            }
+                            continue;
+                        }
                     }
-                    continue;
                 }
             }
         }
 
         // Execute the heartbeat query.
-        if let Some(c) = conn.as_mut() {
-            match Executor::execute(c, sqlx::raw_sql("SELECT 1")).await {
-                Ok(_) => {
-                    if consecutive_failures > 0 {
-                        info!("direct-mode heartbeat: SELECT 1 succeeded after failures");
-                    }
-                    consecutive_failures = 0;
+        // Use tokio::select! with cancel so shutdown doesn't wait for a
+        // hung SELECT 1 (e.g. PG unreachable, TCP half-open).
+        // We take() the connection to avoid borrow conflicts: select! drops
+        // all futures before running the winning branch, so the borrow on c
+        // is released before we move it.
+        if let Some(mut c) = conn.take() {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!("direct-mode heartbeat task shutting down during SELECT 1");
+                    return;
                 }
-                Err(e) => {
-                    consecutive_failures += 1;
-                    warn!(
-                        error = %e,
-                        consecutive_failures,
-                        "direct-mode heartbeat: SELECT 1 failed — dropping connection"
-                    );
-                    conn = None; // Drop the broken connection; next loop will reconnect.
+                result = Executor::execute(&mut c, sqlx::raw_sql("SELECT 1")) => {
+                    match result {
+                        Ok(_) => {
+                            if consecutive_failures > 0 {
+                                info!("direct-mode heartbeat: SELECT 1 succeeded after failures");
+                            }
+                            consecutive_failures = 0;
+                            conn = Some(c); // Put the healthy connection back.
+                        }
+                        Err(e) => {
+                            consecutive_failures += 1;
+                            warn!(
+                                error = %e,
+                                consecutive_failures,
+                                "direct-mode heartbeat: SELECT 1 failed — dropping connection"
+                            );
+                            // c is dropped here — broken connection closed.
+                        }
+                    }
                 }
             }
         }
