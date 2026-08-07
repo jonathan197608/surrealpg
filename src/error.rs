@@ -73,8 +73,9 @@ impl PgStoreError {
     /// - `PoolTimeout`: pool exhausted, may recover when connections are returned.
     /// - `ConnectTimeout`: TCP connect timed out — may be transient (network
     ///   blip, DNS hiccup, server temporarily refusing connections).
-    /// - `Io`: network I/O error (broken pipe, connection reset, etc.) —
-    ///   typically transient and recoverable with a fresh connection.
+    /// - `Io`: network I/O error (broken pipe, connection reset, TLS handshake
+    ///   failure, protocol error, etc.) — typically transient and recoverable
+    ///   with a fresh connection.
     /// - `Postgres` errors with `connection error [08`: the pooler/PG server
     ///   may have dropped the connection; retrying with a fresh connection
     ///   typically succeeds.
@@ -130,6 +131,14 @@ impl PgStoreError {
             sqlx::Error::PoolTimedOut => Self::PoolTimeout,
             sqlx::Error::PoolClosed => Self::PoolClosed,
             sqlx::Error::Io(e) => Self::Io(e.to_string()),
+            // TLS handshake failure — typically transient (network blip, cert rotation).
+            // Map to Io so is_transient() returns true and begin_direct retry logic
+            // can kick in.
+            sqlx::Error::Tls(e) => Self::Io(format!("TLS error: {e}")),
+            // Protocol-level communication error — typically transient (connection
+            // reset, corrupted frame from a stale connection). Map to Io so
+            // is_transient() returns true.
+            sqlx::Error::Protocol(msg) => Self::Io(format!("protocol error: {msg}")),
             _ => Self::Postgres(format!("{e}")),
         }
     }
@@ -175,6 +184,35 @@ impl From<PgStoreError> for surrealdb_core::kvs::Error {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn test_from_sqlx_tls_is_transient() {
+        // sqlx::Error::Tls should map to Io, which is transient
+        let key: Option<&[u8]> = None;
+        let tls_err = sqlx::Error::Tls(Box::new(std::io::Error::other("handshake failed")));
+        let err = PgStoreError::from_sqlx(key, &tls_err);
+        assert!(err.is_transient(), "sqlx::Error::Tls must be transient");
+        match &err {
+            PgStoreError::Io(msg) => assert!(msg.starts_with("TLS error:")),
+            _ => panic!("expected Io variant, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn test_from_sqlx_protocol_is_transient() {
+        // sqlx::Error::Protocol should map to Io, which is transient
+        let key: Option<&[u8]> = None;
+        let proto_err = sqlx::Error::Protocol("unexpected message".to_string());
+        let err = PgStoreError::from_sqlx(key, &proto_err);
+        assert!(
+            err.is_transient(),
+            "sqlx::Error::Protocol must be transient"
+        );
+        match &err {
+            PgStoreError::Io(msg) => assert!(msg.starts_with("protocol error:")),
+            _ => panic!("expected Io variant, got {err:?}"),
+        }
+    }
 
     #[test]
     fn test_is_transient() {

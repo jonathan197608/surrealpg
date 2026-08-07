@@ -1223,28 +1223,28 @@ async fn direct_mode_heartbeat(
             }
         }
 
-        // Execute the heartbeat query.
-        // Use tokio::select! with cancel so shutdown doesn't wait for a
-        // hung SELECT 1 (e.g. PG unreachable, TCP half-open).
-        // We take() the connection to avoid borrow conflicts: select! drops
-        // all futures before running the winning branch, so the borrow on c
-        // is released before we move it.
+        // Execute the heartbeat query with a 10s timeout.
+        // Without this, a TCP half-open connection to an unreachable PG could
+        // hang indefinitely until the OS TCP keepalive fires (potentially minutes).
+        // The tokio::select! with cancel still ensures shutdown doesn't block.
+        const HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
         if let Some(mut c) = conn.take() {
             tokio::select! {
                 _ = cancel.cancelled() => {
                     info!("direct-mode heartbeat task shutting down during SELECT 1");
                     return;
                 }
-                result = Executor::execute(&mut c, sqlx::raw_sql("SELECT 1")) => {
+                result = tokio::time::timeout(HEARTBEAT_TIMEOUT, Executor::execute(&mut c, sqlx::raw_sql("SELECT 1"))) => {
                     match result {
-                        Ok(_) => {
+                        Ok(Ok(_)) => {
                             if consecutive_failures > 0 {
                                 info!("direct-mode heartbeat: SELECT 1 succeeded after failures");
                             }
                             consecutive_failures = 0;
                             conn = Some(c); // Put the healthy connection back.
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             consecutive_failures += 1;
                             warn!(
                                 error = %e,
@@ -1252,6 +1252,14 @@ async fn direct_mode_heartbeat(
                                 "direct-mode heartbeat: SELECT 1 failed — dropping connection"
                             );
                             // c is dropped here — broken connection closed.
+                        }
+                        Err(_elapsed) => {
+                            consecutive_failures += 1;
+                            warn!(
+                                consecutive_failures,
+                                "direct-mode heartbeat: SELECT 1 timed out after 10s — dropping connection"
+                            );
+                            // c is dropped here — hung connection closed.
                         }
                     }
                 }
