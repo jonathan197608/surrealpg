@@ -391,8 +391,14 @@ impl PgConfig {
     /// - `PG_PERSISTENT_STATEMENTS`: `auto` | `true`/`1`/`on` | `false`/`0`/`off`
     ///   — override the persistent-statements policy when auto-detection fails.
     pub fn merge_env(&mut self) {
-        if let Ok(val) = std::env::var("PG_PERSISTENT_STATEMENTS") {
-            if let Some(v) = PersistentStatements::parse(&val) {
+        if let Ok(raw) = std::env::var("PG_PERSISTENT_STATEMENTS") {
+            // F3: Trim the env value before parsing. Environment variables
+            // may contain leading/trailing whitespace (e.g. from shell
+            // exports like `PG_PERSISTENT_STATEMENTS=" auto "`), which
+            // would cause `PersistentStatements::parse` to fail to match
+            // (" auto " ≠ "auto").
+            let val = raw.trim();
+            if let Some(v) = PersistentStatements::parse(val) {
                 tracing::info!(
                     env = "PG_PERSISTENT_STATEMENTS",
                     value = %val,

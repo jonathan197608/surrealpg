@@ -562,8 +562,18 @@ impl PgTuneConfig {
             self.autovac_vacuum_scale
         );
         assert!(
+            (0.0..=1.0).contains(&self.autovac_vacuum_scale),
+            "autovac_vacuum_scale must be in [0.0, 1.0], got {}",
+            self.autovac_vacuum_scale
+        );
+        assert!(
             self.autovac_analyze_scale.is_finite(),
             "autovac_analyze_scale must be finite, got {}",
+            self.autovac_analyze_scale
+        );
+        assert!(
+            (0.0..=1.0).contains(&self.autovac_analyze_scale),
+            "autovac_analyze_scale must be in [0.0, 1.0], got {}",
             self.autovac_analyze_scale
         );
         // Defense-in-depth: autovac cost_limit/cost_delay must be non-negative.
@@ -730,6 +740,14 @@ ALTER TABLE {part} SET (
             self.server_random_page_cost.is_finite(),
             "server_random_page_cost must be finite, got {}",
             self.server_random_page_cost
+        );
+        // F5: Defense-in-depth — stats_target must be in [-1, 10000].
+        // from_env() validates this, but pub fields allow direct construction
+        // with out-of-range values that would produce invalid SQL.
+        assert!(
+            (-1..=10000).contains(&self.stats_target),
+            "stats_target must be in [-1, 10000], got {}",
+            self.stats_target
         );
         // F2: Use Duration formatting that preserves sub-second precision.
         // `as_secs()` truncates sub-second values (e.g. 500ms → 0s), which

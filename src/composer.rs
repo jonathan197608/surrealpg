@@ -55,7 +55,10 @@ fn redact_url(url: &str) -> String {
 
     // Authority may be `[ipv6]:port` — still needs userinfo redaction if
     // it contains '@', e.g. `user:pass@[::1]:5432`.
-    if let Some(at_pos) = authority.find('@') {
+    // Use rfind('@') instead of find('@') because the password may
+    // contain '@' (e.g. `user:p@ss@host`). Per libpq convention the
+    // *last* '@' separates userinfo from host.
+    if let Some(at_pos) = authority.rfind('@') {
         let host_port = &authority[at_pos + 1..];
         let scheme = &url[..scheme_end + 3]; // includes "://"
         format!("{scheme}***:***@{host_port}{rest}")

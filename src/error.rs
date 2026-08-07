@@ -46,6 +46,14 @@ pub enum PgStoreError {
     #[error("connection timeout: failed to connect within {0:?}")]
     ConnectTimeout(std::time::Duration),
 
+    /// Network I/O error (broken pipe, connection reset, etc.)
+    ///
+    /// These errors are typically transient — the caller may retry with a
+    /// fresh connection. Mapped from `sqlx::Error::Io` so that the SurrealDB
+    /// engine's `is_transient()` check correctly identifies them as retryable.
+    #[error("I/O error: {0}")]
+    Io(String),
+
     /// Connection pool closed
     #[error("connection pool closed")]
     PoolClosed,
@@ -65,6 +73,8 @@ impl PgStoreError {
     /// - `PoolTimeout`: pool exhausted, may recover when connections are returned.
     /// - `ConnectTimeout`: TCP connect timed out — may be transient (network
     ///   blip, DNS hiccup, server temporarily refusing connections).
+    /// - `Io`: network I/O error (broken pipe, connection reset, etc.) —
+    ///   typically transient and recoverable with a fresh connection.
     /// - `Postgres` errors with `connection error [08`: the pooler/PG server
     ///   may have dropped the connection; retrying with a fresh connection
     ///   typically succeeds.
@@ -73,7 +83,7 @@ impl PgStoreError {
     #[must_use]
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::PoolTimeout | Self::ConnectTimeout(_) => true,
+            Self::PoolTimeout | Self::ConnectTimeout(_) | Self::Io(_) => true,
             Self::Postgres(msg) => msg.starts_with("connection error [08"),
             Self::Deadlock(_) | Self::SerializationFailure(_) => true,
             _ => false,
@@ -119,6 +129,7 @@ impl PgStoreError {
             }
             sqlx::Error::PoolTimedOut => Self::PoolTimeout,
             sqlx::Error::PoolClosed => Self::PoolClosed,
+            sqlx::Error::Io(e) => Self::Io(e.to_string()),
             _ => Self::Postgres(format!("{e}")),
         }
     }
@@ -150,6 +161,7 @@ impl From<PgStoreError> for surrealdb_core::kvs::Error {
             PgStoreError::ConnectTimeout(d) => Self::ConnectionFailed(format!(
                 "connection timeout: failed to connect within {d:?}"
             )),
+            PgStoreError::Io(msg) => Self::ConnectionFailed(msg),
             PgStoreError::PoolClosed => {
                 Self::ConnectionFailed("connection pool closed".to_string())
             }
@@ -186,6 +198,8 @@ mod tests {
         assert!(!PgStoreError::TxReadOnly.is_transient());
         // KeyAlreadyExists is NOT transient
         assert!(!PgStoreError::KeyAlreadyExists(b"k".to_vec().into_boxed_slice()).is_transient());
+        // Io is transient
+        assert!(PgStoreError::Io("broken pipe".to_string()).is_transient());
         // PoolClosed is NOT transient
         assert!(!PgStoreError::PoolClosed.is_transient());
     }
