@@ -29,6 +29,9 @@ use crate::tune::PgTuneConfig;
 ///
 /// `Pooled` mode is the default for direct PG connections. It uses sqlx's
 /// `PgPool` with `min_connections`, `idle_timeout`, `max_lifetime`, etc.
+/// `Pooled` variant clones cheaply (PgPool is Arc-wrapped), while `Direct`
+/// clones the boxed PgConnectOptions (one heap allocation). Both are safe;
+/// this derive is intentional for PgStore::clone().
 #[derive(Clone)]
 enum ConnectionMode {
     /// sqlx connection pool (default, for direct PG).
@@ -440,6 +443,7 @@ impl PgStore {
             match &mode {
                 ConnectionMode::Pooled(pool) => {
                     let row = sqlx::query(&check_sql)
+                        .bind(table)
                         .fetch_one(pool)
                         .await
                         .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
@@ -449,6 +453,7 @@ impl PgStore {
                 ConnectionMode::Direct(conn_opts) => {
                     let mut conn = connect_direct(conn_opts, connect_timeout).await?;
                     let row = sqlx::query(&check_sql)
+                        .bind(table)
                         .fetch_one(&mut conn)
                         .await
                         .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
@@ -797,14 +802,12 @@ impl PgStore {
                     .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
             }
             ConnectionMode::Direct(opts) => {
-                let mut conn = connect_direct_with_session(
-                    opts,
-                    self.connect_timeout,
-                    &self.keepalive_sql,
-                    &self.session_sql,
-                    "health-check",
-                )
-                .await?;
+                // F4: health_check uses connect_direct (no session SQL) —
+                // keepalive + session SQL SETs add 2 extra network round-trips
+                // which is wasteful for a lightweight liveness probe called
+                // every ~10s by Kubernetes. A bare TCP connect + SELECT 1 is
+                // sufficient to verify PG reachability.
+                let mut conn = connect_direct(opts, self.connect_timeout).await?;
                 Executor::execute(&mut conn, sqlx::raw_sql("SELECT 1"))
                     .await
                     .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
@@ -899,14 +902,31 @@ impl PgStore {
 /// also applies keepalive + session SQL. Only use this helper directly
 /// when you need full control over session setup (e.g. `begin_direct`
 /// treats session SQL failure as fatal, partition verification skips it).
+///
+/// # Panics
+///
+/// Debug builds assert that `connect_timeout > Duration::ZERO`. In pool
+/// mode, `connect_timeout` is set to `ZERO` (unused) — passing it here
+/// would cause every call to time out immediately. The assert catches
+/// this programming error early.
 async fn connect_direct(
     opts: &PgConnectOptions,
     connect_timeout: std::time::Duration,
 ) -> Result<sqlx::postgres::PgConnection> {
+    debug_assert!(
+        !connect_timeout.is_zero(),
+        "connect_direct: connect_timeout must be > 0 (pool mode sets it to ZERO — caller bug)"
+    );
     match tokio::time::timeout(connect_timeout, opts.connect()).await {
         Ok(Ok(conn)) => Ok(conn),
         Ok(Err(e)) => Err(PgStoreError::from_sqlx(None, &e)),
-        Err(_) => Err(PgStoreError::ConnectTimeout(connect_timeout)),
+        Err(_) => {
+            warn!(
+                timeout_secs = connect_timeout.as_secs(),
+                "direct-mode TCP connect timed out"
+            );
+            Err(PgStoreError::ConnectTimeout(connect_timeout))
+        }
     }
 }
 

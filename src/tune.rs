@@ -473,16 +473,22 @@ impl PgTuneConfig {
     /// Generate SQL to query the actual partition count of a table.
     ///
     /// Returns a query that yields a single row with the partition count
-    /// (0 if the table is not partitioned, >0 if it is).
+    /// (0 if the table is not partitioned, >0 if it is). The table name
+    /// is passed as a `$1` parameter rather than interpolated into the
+    /// SQL string, preventing SQL injection even if `validate_identifier`
+    /// were bypassed.
     #[must_use]
-    pub fn partition_count_sql(&self, table: &str) -> String {
-        crate::config::PgConfig::validate_identifier(table)
+    pub fn partition_count_sql(&self, _table: &str) -> String {
+        // F3: Table name is no longer interpolated — it is bound via $1
+        // at the call site (sqlx::query().bind(table_name)). We keep the
+        // `table` parameter for API compatibility and validation only.
+        crate::config::PgConfig::validate_identifier(_table)
             .expect("table name must be a valid SQL identifier");
-        format!(
+        String::from(
             "SELECT count(*) AS part_cnt FROM pg_partitioned_table pt \
              JOIN pg_class c ON c.oid = pt.partrelid \
              JOIN pg_inherits i ON i.inhparent = c.oid \
-             WHERE c.relname = '{table}'"
+             WHERE c.relname = $1",
         )
     }
 
@@ -1535,7 +1541,8 @@ mod tests {
         assert!(sql.contains("pg_partitioned_table"));
         assert!(sql.contains("pg_class"));
         assert!(sql.contains("pg_inherits"));
-        assert!(sql.contains("relname = 'kv'"));
+        // F3: table name is now a $1 parameter, not interpolated
+        assert!(sql.contains("relname = $1"));
     }
 
     // ── verify_partition_count tests (in store.rs test module) ──
