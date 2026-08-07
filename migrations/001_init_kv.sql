@@ -51,7 +51,16 @@ CREATE TABLE IF NOT EXISTS kv (
 -- ── Partition tuning (required if using Option B) ─────────────────────────
 -- PG does NOT propagate parent ALTER TABLE settings to child partitions.
 -- You MUST apply the same fillfactor/autovacuum settings to each partition.
+-- IMPORTANT: On PG 13+, partitioned parent tables CANNOT have SET (...)
+-- storage parameters (including fillfactor, toast_tuple_target, autovacuum_*).
+-- Only ALTER COLUMN SET STORAGE is allowed on the parent. All other tuning
+-- must be applied to each child partition individually.
 -- Example for 4 partitions (kv_p0 through kv_p3):
+--
+-- -- Parent: only SET STORAGE allowed (PG 13+ restriction)
+-- ALTER TABLE kv ALTER COLUMN val SET STORAGE external;
+--
+-- -- Each child partition: full tuning allowed
 --
 -- ALTER TABLE kv_p0 SET (fillfactor = 90);
 -- ALTER TABLE kv_p0 ALTER COLUMN val SET STORAGE external;

@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: 'a566f9cc-74dd-4284-ad54-f29735ea7a74'
-  PropagateID: 'a566f9cc-74dd-4284-ad54-f29735ea7a74'
-  ReservedCode1: 'c2c60658-22bb-4e9a-ac81-e5d1d7e6f694'
-  ReservedCode2: 'c2c60658-22bb-4e9a-ac81-e5d1d7e6f694'
+  ProduceID: '82991926-e759-49cc-9a9d-eab0ee37da35'
+  PropagateID: '82991926-e759-49cc-9a9d-eab0ee37da35'
+  ReservedCode1: 'ff384300-6fcb-4b5d-950b-c8035b09babf'
+  ReservedCode2: 'ff384300-6fcb-4b5d-950b-c8035b09babf'
 ---
 
 # surreal-pg
@@ -56,7 +56,7 @@ SurrealDB 的事务语义 1:1 映射到 PostgreSQL 的 `BEGIN` / `COMMIT` / `ROL
 `surreal-pg` 支持两种连接模式，通过 URL 参数 `pooler=true` 切换：
 
 - **连接池模式**（默认）：使用 sqlx 连接池管理连接，复用连接减少建连开销，适用于直连 PostgreSQL 主机的场景。连接池自动管理连接生命周期（创建、健康检查、回收），并支持 prepared statement 复用。
-- **直连模式**（`pooler=true`）：绕过 sqlx 连接池，每个事务独立建连、用完即弃。专为 PgBouncer / Supavisor 等 transaction-mode pooler 设计，从根本上避免连接池静默回收导致的“僵尸池”问题。直连模式下不再有连接池超时、连接健康检查等开销，每个事务拿到的是新鲜的 PG 连接，事务结束后 TCP 关闭即可。直连模式强制使用 unnamed prepared statement（兼容 transaction-mode pooler）。
+- **直连模式**（`pooler=true`）：绕过 sqlx 连接池，每个事务独立建连、用完即弃。专为 PgBouncer / Supavisor 等 transaction-mode pooler 设计，从根本上避免连接池静默回收导致的“僵尸池”问题。直连模式下不再有连接池超时、连接健康检查等开销，每个事务拿到的是新鲜的 PG 连接，事务结束后 TCP 关闭即可。直连模式强制使用 unnamed prepared statement（兼容 transaction-mode pooler）。启动时自动创建后台心跳任务（`direct_mode_heartbeat`），每隔 `keepalive_idle`（默认 60s）执行 `SELECT 1`，保持到 PG 服务器的连接路径活跃，避免被中间层（如 Supabase Pooler）静默断开。心跳失败时自动重连并指数退避（5s→20s→45s→最大 5min），shutdown 时通过 CancellationToken 优雅关闭（宽限期 3s）。
 
 **如何选择**：
 - 直连 PostgreSQL 主机（无 pooler）→ 用默认连接池模式，性能最佳
@@ -167,9 +167,9 @@ PostgreSQL SQLSTATE 语义错误自动映射到 SurrealDB 的 `kvs::Error`：
 
 ### 连接泄漏恢复
 
-**连接池模式**：从池中获取的连接可能残留前一个泄漏的事务状态。`begin()` 采用乐观策略——直接执行 `BEGIN`，仅在遇到 `25P02`（in_failed_sql_transaction）时才执行 `ROLLBACK` 清理并重试。连接池耗尽时采用重试+退避策略（正常模式 200ms→400ms，僵尸池模式 5s→10s），并检测僵尸池状态。
+**连接池模式**：`begin_pooled()` 采用 transient 错误重试策略——遇到 transient 错误（连接断开、池超时等）时最多重试 2 次（共 3 次尝试），重试间隔 200ms。当连续失败达到阈值时进入"僵尸池检测"模式，退避间隔延长至 5s→10s，并在恢复后记录诊断日志。僵尸池状态在首次成功后自动清除。
 
-**直连模式**：每个事务独立建立新鲜连接，不存在连接复用和泄漏问题，无需恢复策略。事务结束后 TCP 关闭，PostgreSQL 自动 abort 未提交的事务。
+**直连模式**：每个事务独立建立新鲜连接，不存在连接复用和泄漏问题，无需恢复策略。事务结束后 TCP 关闭，PostgreSQL 自动 abort 未提交的事务。后台心跳任务保持连接路径活跃，心跳失败时自动重连并指数退避（5s→20s→45s→最大 5min）。
 
 ---
 
@@ -373,7 +373,12 @@ curl -X POST -u "root:secret" \
 
 #### PG 服务器级（8 个参数）
 
-通过 `after_connect` 的 session `SET` 语句生效（部分仅在 `postgresql.conf` 中可设）。
+通过 `after_connect` 的 session `SET` 语句生效（连接池模式）或 `begin_direct` 的 session SQL（直连模式）。其中部分参数为只读，仅能在 `postgresql.conf` 中设置：
+
+- **Session SET 可生效**：`work_mem`、`maintenance_work_mem`、`random_page_cost`、`effective_cache_size` — 每连接动态设置，无需重启 PG
+- **仅 postgresql.conf 可设**：`shared_buffers`、`wal_buffers`、`max_connections`、`checkpoint_completion_target` — 全局只读参数，需在 PG 配置文件中设置并重启
+
+下表中标记"需 postgresql.conf"的参数仅作为建议值记录，不会通过 `SET` 语句发送。
 
 | 环境变量 | 默认值 | 说明 |
 |---------|--------|------|
@@ -408,7 +413,7 @@ curl -X POST -u "root:secret" \
 | `PG_TUNED_KEEPALIVE_INTERVAL` | `10s` | 探测间隔 |
 | `PG_TUNED_KEEPALIVE_COUNT` | `5` | 连续探测失败次数，达到后判定连接死亡。总检测时间 = idle + interval × count |
 
-默认配置下，死亡连接在 60 + 10×5 = 110s 内被检测到。托管 PG（如 Supabase）可能忽略这些设置，但设置它们是安全的，对直连 PG 场景特别有效。使用 `pooler=true` 直连模式时，由于每个事务连接短暂，keepalive 主要在长事务期间发挥作用。
+默认配置下，死亡连接在 60 + 10×5 = 110s 内被检测到。托管 PG（如 Supabase）可能忽略这些设置，但设置它们是安全的，对直连 PG 场景特别有效。使用 `pooler=true` 直连模式时，由于每个事务连接短暂，keepalive 主要在长事务期间发挥作用。此外，直连模式还会启动后台心跳任务（间隔 = `PG_TUNED_KEEPALIVE_IDLE`），周期性执行 `SELECT 1` 主动保活，弥补 OS 级 keepalive 在托管环境中可能被忽略的不足。
 
 #### KV 表存储级（5 个参数）
 
@@ -607,9 +612,12 @@ PG_TUNED_POOL_IDLE_TIMEOUT=300s \
 | 1. PG 服务器 | `statement_timeout` | 30s | `PG_TUNED_QUERY_STATEMENT_TIMEOUT` | 单条 SQL 执行上限 |
 | 2. PG 服务器 | `lock_timeout` | 10s | `PG_TUNED_QUERY_LOCK_TIMEOUT` | 等锁超时 |
 | 3. 连接池 | `acquire_timeout` | 10s | `PG_TUNED_POOL_ACQUIRE_TIMEOUT` | **推荐 30s**。仅连接池模式；直连模式无此层 |
+| 3b. 直连模式 | `connect_timeout` | 30s | URL 参数 `connect_timeout` | TCP 建连超时（直连模式专属） |
+| 3c. 直连模式 | 心跳间隔 | 60s | `PG_TUNED_KEEPALIVE_IDLE` | 后台心跳 SELECT 1 间隔（复用 keepalive_idle 参数） |
 | 4. SurrealDB | `query-timeout` | 无限制 | `--query-timeout` / `SURREAL_QUERY_TIMEOUT` | 查询总执行上限 |
 | 5. SurrealDB | 节点注册超时 | 60s | **不可配置** | 硬编码常量 |
 | 6. SurrealDB | 事务超时 | 无限制 | `--transaction-timeout` / `SURREAL_TRANSACTION_TIMEOUT` | 事务总执行上限 |
+| 7. shutdown | 直连宽限期 | 3s | **不可配置** | 等待直连模式后台心跳任务优雅关闭 |
 
 推荐关系：`lock_timeout ≤ statement_timeout < acquire_timeout ≤ query-timeout`
 
