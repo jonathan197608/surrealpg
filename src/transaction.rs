@@ -269,7 +269,7 @@ impl PgTransaction {
     /// non-KV methods (savepoint operations). All KV operation methods
     /// use inline destructured borrows instead to avoid conflicts with
     /// `&self.sql` references.
-    fn conn_mut(&mut self) -> Result<&mut sqlx::postgres::PgConnection> {
+    fn conn_mut(&mut self) -> Result<&mut PgConnection> {
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         Ok(conn.conn_mut())
     }
@@ -797,7 +797,7 @@ impl PgTransaction {
     /// `&mut self.conn` borrow — Rust sees them as borrows of different
     /// fields, which is allowed.
     async fn range_query_offset(
-        conn: &mut sqlx::postgres::PgConnection,
+        conn: &mut PgConnection,
         persistent: bool,
         range_sql: &str,
         rng: Range<Key>,

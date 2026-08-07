@@ -405,33 +405,14 @@ impl PgStore {
                     }
                 }
                 ConnectionMode::Direct(conn_opts) => {
-                    let mut conn =
-                        match tokio::time::timeout(connect_timeout, conn_opts.connect()).await {
-                            Ok(Ok(c)) => c,
-                            Ok(Err(e)) => {
-                                return Err(PgStoreError::from_sqlx(None, &e));
-                            }
-                            Err(_) => {
-                                return Err(PgStoreError::ConnectTimeout(connect_timeout));
-                            }
-                        };
-                    // Apply session SQL + keepalive to this DDL connection too.
-                    if let Err(e) =
-                        Executor::execute(&mut conn, sqlx::raw_sql(&keepalive_sql)).await
-                    {
-                        warn!(
-                            error = %e,
-                            "tcp_keepalive SET failed on DDL connection (non-fatal)"
-                        );
-                    }
-                    if let Err(e) = Executor::execute(&mut conn, sqlx::raw_sql(&session_sql)).await
-                    {
-                        warn!(
-                            error = %e,
-                            "session SQL failed on DDL connection (non-fatal, but \
-                             subsequent transactions may also fail)"
-                        );
-                    }
+                    let mut conn = connect_direct_with_session(
+                        conn_opts,
+                        connect_timeout,
+                        &keepalive_sql,
+                        &session_sql,
+                        "DDL",
+                    )
+                    .await?;
                     Executor::execute(&mut conn, sqlx::raw_sql(&create_sql))
                         .await
                         .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
@@ -466,12 +447,7 @@ impl PgStore {
                     verify_partition_count(table, expected, actual)?;
                 }
                 ConnectionMode::Direct(conn_opts) => {
-                    let mut conn =
-                        match tokio::time::timeout(connect_timeout, conn_opts.connect()).await {
-                            Ok(Ok(c)) => c,
-                            Ok(Err(e)) => return Err(PgStoreError::from_sqlx(None, &e)),
-                            Err(_) => return Err(PgStoreError::ConnectTimeout(connect_timeout)),
-                        };
+                    let mut conn = connect_direct(conn_opts, connect_timeout).await?;
                     let row = sqlx::query(&check_sql)
                         .fetch_one(&mut conn)
                         .await
@@ -648,20 +624,18 @@ impl PgStore {
 
     /// Direct-mode begin: connect, apply session SQL, send BEGIN.
     async fn begin_direct(&self, opts: &PgConnectOptions, write: bool) -> Result<PgTransaction> {
-        // Connect with timeout.
-        let mut conn = match tokio::time::timeout(self.connect_timeout, opts.connect()).await {
-            Ok(Ok(conn)) => conn,
-            Ok(Err(e)) => return Err(PgStoreError::from_sqlx(None, &e)),
-            Err(_) => return Err(PgStoreError::ConnectTimeout(self.connect_timeout)),
-        };
+        let mut conn = connect_direct(opts, self.connect_timeout).await?;
 
-        // Apply keepalive (non-fatal) + session SQL.
+        // Apply keepalive (non-fatal).
         if let Err(e) = Executor::execute(&mut conn, sqlx::raw_sql(&self.keepalive_sql)).await {
             warn!(
                 error = %e,
                 "tcp_keepalive SET failed (non-fatal, may not be supported by this PG)"
             );
         }
+        // Apply session SQL — fatal on failure (unlike vacuum/health_check
+        // which tolerate missing timeouts). begin_direct is on the hot path;
+        // if session SQL fails, subsequent transactions will also fail.
         if let Err(e) = Executor::execute(&mut conn, sqlx::raw_sql(&self.session_sql)).await {
             warn!(
                 error = %e,
@@ -794,31 +768,14 @@ impl PgStore {
                     .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
             }
             ConnectionMode::Direct(opts) => {
-                let mut conn =
-                    match tokio::time::timeout(self.connect_timeout, opts.connect()).await {
-                        Ok(Ok(c)) => c,
-                        Ok(Err(e)) => return Err(PgStoreError::from_sqlx(None, &e)),
-                        Err(_) => return Err(PgStoreError::ConnectTimeout(self.connect_timeout)),
-                    };
-                // Apply keepalive (non-fatal) + session SQL.
-                if let Err(e) =
-                    Executor::execute(&mut conn, sqlx::raw_sql(&self.keepalive_sql)).await
-                {
-                    warn!(
-                        error = %e,
-                        "tcp_keepalive SET failed on VACUUM connection (non-fatal, \
-                         may not be supported by this PG)"
-                    );
-                }
-                if let Err(e) = Executor::execute(&mut conn, sqlx::raw_sql(&self.session_sql)).await
-                {
-                    warn!(
-                        error = %e,
-                        "session SQL failed on VACUUM connection (non-fatal, but \
-                         statement_timeout/lock_timeout will not be set — VACUUM \
-                         may run longer than expected)"
-                    );
-                }
+                let mut conn = connect_direct_with_session(
+                    opts,
+                    self.connect_timeout,
+                    &self.keepalive_sql,
+                    &self.session_sql,
+                    "VACUUM",
+                )
+                .await?;
                 Executor::execute(&mut conn, sqlx::raw_sql(&self.vacuum_sql))
                     .await
                     .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
@@ -840,29 +797,14 @@ impl PgStore {
                     .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
             }
             ConnectionMode::Direct(opts) => {
-                let mut conn =
-                    match tokio::time::timeout(self.connect_timeout, opts.connect()).await {
-                        Ok(Ok(c)) => c,
-                        Ok(Err(e)) => return Err(PgStoreError::from_sqlx(None, &e)),
-                        Err(_) => return Err(PgStoreError::ConnectTimeout(self.connect_timeout)),
-                    };
-                // Apply keepalive + session SQL for consistency with begin_direct/vacuum.
-                if let Err(e) =
-                    Executor::execute(&mut conn, sqlx::raw_sql(&self.keepalive_sql)).await
-                {
-                    warn!(
-                        error = %e,
-                        "tcp_keepalive SET failed on health-check connection (non-fatal, \
-                         may not be supported by this PG)"
-                    );
-                }
-                if let Err(e) = Executor::execute(&mut conn, sqlx::raw_sql(&self.session_sql)).await
-                {
-                    warn!(
-                        error = %e,
-                        "session SQL failed on health-check connection (non-fatal)"
-                    );
-                }
+                let mut conn = connect_direct_with_session(
+                    opts,
+                    self.connect_timeout,
+                    &self.keepalive_sql,
+                    &self.session_sql,
+                    "health-check",
+                )
+                .await?;
                 Executor::execute(&mut conn, sqlx::raw_sql("SELECT 1"))
                     .await
                     .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
@@ -946,6 +888,58 @@ impl PgStore {
         }
         Ok(())
     }
+}
+
+// ─── Direct-mode connection helpers ────────────────
+
+/// Open a direct-mode TCP connection with timeout.
+///
+/// This is the low-level shared core of all direct-mode operations.
+/// Most call sites should prefer [`connect_direct_with_session`] which
+/// also applies keepalive + session SQL. Only use this helper directly
+/// when you need full control over session setup (e.g. `begin_direct`
+/// treats session SQL failure as fatal, partition verification skips it).
+async fn connect_direct(
+    opts: &PgConnectOptions,
+    connect_timeout: std::time::Duration,
+) -> Result<sqlx::postgres::PgConnection> {
+    match tokio::time::timeout(connect_timeout, opts.connect()).await {
+        Ok(Ok(conn)) => Ok(conn),
+        Ok(Err(e)) => Err(PgStoreError::from_sqlx(None, &e)),
+        Err(_) => Err(PgStoreError::ConnectTimeout(connect_timeout)),
+    }
+}
+
+/// Open a direct-mode connection and apply keepalive + session SQL.
+///
+/// Keeps the connection ready for use — keepalive and session SQL failures
+/// are logged as warnings (non-fatal) since the connection itself is
+/// functional without them. `label` is used in log messages to identify
+/// which operation triggered the connection (e.g. "DDL", "VACUUM",
+/// "health-check").
+async fn connect_direct_with_session(
+    opts: &PgConnectOptions,
+    connect_timeout: std::time::Duration,
+    keepalive_sql: &str,
+    session_sql: &str,
+    label: &str,
+) -> Result<sqlx::postgres::PgConnection> {
+    let mut conn = connect_direct(opts, connect_timeout).await?;
+    if let Err(e) = Executor::execute(&mut conn, sqlx::raw_sql(keepalive_sql)).await {
+        warn!(
+            error = %e,
+            "tcp_keepalive SET failed on {label} connection (non-fatal, \
+             may not be supported by this PG)"
+        );
+    }
+    if let Err(e) = Executor::execute(&mut conn, sqlx::raw_sql(session_sql)).await {
+        warn!(
+            error = %e,
+            "session SQL failed on {label} connection (non-fatal, but \
+             statement_timeout/lock_timeout will not be set)"
+        );
+    }
+    Ok(conn)
 }
 
 #[cfg(test)]
