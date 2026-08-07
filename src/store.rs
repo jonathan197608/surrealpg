@@ -311,12 +311,26 @@ impl PgStore {
         // Session SQL and TCP keepalive SQL — applied to every new connection
         // in both pooled and direct modes.
         let session_sql: Arc<str> = tune.session_sql().into();
+        // F4: Format keepalive Duration values for PG's tcp_keepalives_*
+        // parameters, which only accept integer seconds. Use `as_secs()`
+        // which truncates sub-second components, but guard against 0s
+        // (sub-second durations like 500ms would truncate to 0 which is
+        // invalid — PG would reject or ignore it). Floor at 1s.
+        let fmt_keepalive_secs = |d: std::time::Duration| -> String {
+            let secs = d.as_secs();
+            if secs == 0 && !d.is_zero() {
+                // Sub-second value truncated to 0 — use minimum 1s
+                "1".to_string()
+            } else {
+                secs.to_string()
+            }
+        };
         let keepalive_sql: Arc<str> = format!(
             "SET tcp_keepalives_idle = {idle}; \
              SET tcp_keepalives_interval = {interval}; \
              SET tcp_keepalives_count = {count}",
-            idle = tune.keepalive_idle.as_secs(),
-            interval = tune.keepalive_interval.as_secs(),
+            idle = fmt_keepalive_secs(tune.keepalive_idle),
+            interval = fmt_keepalive_secs(tune.keepalive_interval),
             count = tune.keepalive_count,
         )
         .into();
@@ -576,6 +590,8 @@ impl PgStore {
         loop {
             attempt += 1;
 
+            // begin_with() requires Cow<'static, str> — we must own the
+            // string, so to_string() is unavoidable here (Arc<str> → String).
             match pool.begin_with(self.begin_sql.to_string()).await {
                 Ok(tx) => {
                     self.tx_started.fetch_add(1, AtomicOrdering::Relaxed);
