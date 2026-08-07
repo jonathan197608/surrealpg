@@ -726,11 +726,13 @@ impl PgStore {
         // Apply session SQL — fatal on failure (unlike vacuum/health_check
         // which tolerate missing timeouts). begin_direct is on the hot path;
         // if session SQL fails, subsequent transactions will also fail.
+        // The warn below is for operator visibility — the error is returned
+        // to the caller so SurrealDB can take corrective action.
         if let Err(e) = Executor::execute(&mut conn, sqlx::raw_sql(&self.session_sql)).await {
             warn!(
                 error = %e,
-                "session SQL failed on direct-mode connection (non-fatal, but \
-                 statement_timeout/lock_timeout will not be set)"
+                "session SQL failed on direct-mode connection — statement_timeout/lock_timeout \
+                 will not be set for this transaction"
             );
             return Err(PgStoreError::from_sqlx(None, &e));
         }
@@ -756,12 +758,15 @@ impl PgStore {
     /// Shut down gracefully.
     ///
     /// **Pool mode**: closes the sqlx connection pool (waits for all
-    /// connections to be returned, then closes them).
+    /// connections to be returned, then closes them) with a 30s timeout.
     ///
-    /// **Direct mode**: waits for in-flight transactions to finish (up to
-    /// 30s), then logs completion. There is no pool to close — each
-    /// transaction owns its TCP connection, which is closed when the
-    /// transaction commits/cancels/drops.
+    /// **Direct mode**: sets the shutdown barrier, cancels the heartbeat
+    /// task, and gives in-flight transactions a short 3s grace period to
+    /// finish naturally. SurrealDB's shutdown sequence calls `shutdown()`
+    /// *before* dropping in-flight transactions, so we cannot wait for
+    /// `tx_active == 0` (that would deadlock). When transactions are later
+    /// dropped by SurrealDB, the `Drop` impl closes each TCP connection
+    /// and PG aborts the transaction.
     pub async fn shutdown(&self) {
         // Set barrier to prevent new begin() calls.
         self.shutting_down.store(true, AtomicOrdering::Relaxed);
