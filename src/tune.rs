@@ -591,14 +591,15 @@ impl PgTuneConfig {
         // For non-partitioned tables: generate the full storage SQL (fillfactor +
         // toast_tuple_target + SET STORAGE) + autovacuum SQL.
         //
-        // For hash-partitioned tables: PG does NOT allow storage parameters
-        // (fillfactor, toast_tuple_target) on a partitioned parent table —
-        // attempting `ALTER TABLE parent SET (fillfactor=...)` raises
-        // "cannot specify storage parameters for a partitioned table".
-        // Only autovacuum parameters and `ALTER COLUMN SET STORAGE` are
-        // legal on the parent (autovacuum cascades to children; SET STORAGE
-        // is inherited). Child partitions get the full storage + autovacuum
-        // ALTER since they are regular tables.
+        // For hash-partitioned tables: PG does NOT allow ANY storage parameters
+        // (fillfactor, toast_tuple_target, autovacuum_*) on a partitioned parent
+        // table — attempting `ALTER TABLE parent SET (...)` raises
+        // "cannot specify storage parameters for a partitioned table" in PG 13.
+        // (PG 14+ allows autovacuum reloptions on partitioned tables, but we
+        // omit them for cross-version compatibility.) Only `ALTER COLUMN SET
+        // STORAGE` is legal on the parent (inherited by children). Each child
+        // partition is a regular table and receives the full storage +
+        // autovacuum ALTER.
         if self.hash_partitions <= 1 {
             // Non-partitioned: full storage SQL + autovacuum SQL
             let storage_sql = format!(
@@ -631,31 +632,23 @@ ALTER TABLE {table} SET (
             );
             format!("{storage_sql}{autovac_sql}")
         } else {
-            // Hash-partitioned: parent only gets SET STORAGE + autovacuum
-            // (fillfactor/toast_tuple_target are illegal on partitioned tables).
-            let parent_storage_sql = format!(
+            // Hash-partitioned: parent table cannot have ANY storage
+            // parameters — neither fillfactor/toast_tuple_target nor
+            // autovacuum_* are allowed on a partitioned table in PG 13.
+            // (PG 14+ allows autovacuum on partitioned tables, but we
+            // omit it for cross-version compatibility.) Only ALTER COLUMN
+            // SET STORAGE is legal on the parent (it's inherited by
+            // children). Child partitions are regular tables, so all
+            // storage + autovacuum ALTERs are applied to each child.
+            let mut sql = format!(
                 r#"
--- Parent table: SET STORAGE only (fillfactor/toast_tuple_target illegal on partitioned tables)
+-- Parent table: SET STORAGE only (all SET (...) storage parameters are
+-- illegal on partitioned tables in PG 13; child partitions get the full
+-- storage + autovacuum tuning below).
 ALTER TABLE {table} ALTER COLUMN val SET STORAGE {toast};"#,
+                table = table,
                 toast = self.toast_storage,
             );
-            let autovac_sql = format!(
-                r#"
--- Parent table autovacuum tuning (cascades to child partitions)
-ALTER TABLE {table} SET (
-    autovacuum_vacuum_scale_factor = {vscale},
-    autovacuum_vacuum_threshold = {vthresh},
-    autovacuum_analyze_scale_factor = {ascale},
-    autovacuum_vacuum_cost_limit = {vclimit},
-    autovacuum_vacuum_cost_delay = {vcdelay}
-);"#,
-                vscale = self.autovac_vacuum_scale,
-                vthresh = self.autovac_vacuum_threshold,
-                ascale = self.autovac_analyze_scale,
-                vclimit = self.autovac_vacuum_cost_limit,
-                vcdelay = self.autovac_vacuum_cost_delay,
-            );
-            let mut sql = format!("{parent_storage_sql}{autovac_sql}");
             // F1: For hash-partitioned tables, ALTER TABLE SET (fillfactor=...)
             // on the parent does NOT propagate to child partitions. PG's ALTER
             // TABLE on a partitioned parent only sets the parent's own storage
@@ -680,6 +673,7 @@ ALTER TABLE {part} SET (
     autovacuum_vacuum_cost_limit = {vclimit},
     autovacuum_vacuum_cost_delay = {vcdelay}
 );"#,
+                    part = part,
                     fillfactor = self.fillfactor,
                     toast = self.toast_storage,
                     toast_threshold = self.toast_threshold,
@@ -1698,49 +1692,32 @@ mod tests {
     #[test]
     fn test_tune_table_sql_on_partitioned_table() {
         // tune_table_sql on partitioned tables: parent table must NOT
-        // contain fillfactor/toast_tuple_target (illegal on partitioned
-        // tables in PG), only SET STORAGE + autovacuum. Child partitions
-        // get the full storage + autovacuum ALTER.
+        // contain ANY SET (...) clause (fillfactor, toast_tuple_target,
+        // and autovacuum_* are all illegal on partitioned tables in PG 13).
+        // Only ALTER COLUMN SET STORAGE is allowed on the parent. Child
+        // partitions get the full storage + autovacuum ALTER.
         let c = PgTuneConfig {
             hash_partitions: 4,
             ..PgTuneConfig::default()
         };
         let sql = c.tune_table_sql("kv");
 
-        // Parent table: should have SET STORAGE and autovacuum, but NOT
-        // fillfactor/toast_tuple_target SET clause
+        // Parent table: should have SET STORAGE, but NO ALTER TABLE kv SET (...)
         assert!(
             sql.contains("ALTER TABLE kv ALTER COLUMN val SET STORAGE external"),
             "parent should have SET STORAGE: {sql}"
         );
-        assert!(
-            sql.contains("ALTER TABLE kv SET (\n    autovacuum_vacuum_scale_factor"),
-            "parent should have autovacuum ALTER: {sql}"
-        );
 
-        // Parent table must NOT contain the storage-parameter ALTER
-        // (fillfactor/toast_tuple_target are illegal on partitioned tables)
-        // Find the first "ALTER TABLE kv SET" — it should be autovacuum,
-        // not fillfactor.
+        // Parent table must NOT contain any "ALTER TABLE kv SET" clause
+        // (all SET (...) storage parameters are illegal on partitioned tables)
         let parent_set_matches: Vec<_> = sql
             .lines()
             .filter(|l| l.contains("ALTER TABLE kv SET"))
             .collect();
         assert!(
-            !parent_set_matches.is_empty(),
-            "parent should have at least one ALTER TABLE kv SET"
+            parent_set_matches.is_empty(),
+            "parent should have NO ALTER TABLE kv SET (...) clause, but found: {parent_set_matches:?}"
         );
-        // All "ALTER TABLE kv SET" lines should be autovacuum-related
-        for m in &parent_set_matches {
-            assert!(
-                !m.contains("fillfactor"),
-                "parent ALTER should not contain fillfactor: {m}"
-            );
-            assert!(
-                !m.contains("toast_tuple_target"),
-                "parent ALTER should not contain toast_tuple_target: {m}"
-            );
-        }
 
         // Child partitions: should have fillfactor (full storage ALTER)
         assert!(sql.contains("ALTER TABLE kv_p0 SET"));
@@ -1751,6 +1728,12 @@ mod tests {
         assert!(
             sql.contains("fillfactor = 90"),
             "child partitions should have fillfactor: {sql}"
+        );
+
+        // Child partitions should contain autovacuum
+        assert!(
+            sql.contains("autovacuum_vacuum_scale_factor"),
+            "child partitions should have autovacuum: {sql}"
         );
     }
 
