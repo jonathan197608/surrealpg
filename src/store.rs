@@ -773,14 +773,11 @@ impl PgStore {
                     .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
             }
             ConnectionMode::Direct(opts) => {
-                let mut conn = connect_direct_with_session(
-                    opts,
-                    self.connect_timeout,
-                    &self.keepalive_sql,
-                    &self.session_sql,
-                    "VACUUM",
-                )
-                .await?;
+                // F4: VACUUM operates outside a transaction and doesn't need
+                // session SQL (statement_timeout/lock_timeout). Using
+                // connect_direct instead of connect_direct_with_session
+                // saves 2 network round-trips (keepalive + session SQL SETs).
+                let mut conn = connect_direct(opts, self.connect_timeout).await?;
                 Executor::execute(&mut conn, sqlx::raw_sql(&self.vacuum_sql))
                     .await
                     .map_err(|e| PgStoreError::from_sqlx(None, &e))?;

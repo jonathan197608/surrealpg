@@ -799,6 +799,7 @@ impl PgTransaction {
     async fn range_query_offset(
         conn: &mut PgConnection,
         persistent: bool,
+        label: &str,
         range_sql: &str,
         rng: Range<Key>,
         limit: u32,
@@ -811,7 +812,9 @@ impl PgTransaction {
         if skip > 1000 {
             warn!(
                 skip,
-                limit, "large OFFSET in range scan — consider cursor-based pagination"
+                limit,
+                op = label,
+                "large OFFSET in range scan — consider cursor-based pagination"
             );
         }
         Self::build_query(persistent, range_sql)
@@ -848,6 +851,7 @@ impl PgTransaction {
         let rows = Self::range_query_offset(
             conn.conn_mut(),
             persistent,
+            "keys",
             &self.sql.range_keys_asc,
             rng,
             limit,
@@ -867,6 +871,7 @@ impl PgTransaction {
         let rows = Self::range_query_offset(
             conn.conn_mut(),
             persistent,
+            "keysr",
             &self.sql.range_keys_desc,
             rng,
             limit,
@@ -891,6 +896,7 @@ impl PgTransaction {
         let rows = Self::range_query_offset(
             conn.conn_mut(),
             persistent,
+            "scan",
             &self.sql.range_kv_asc,
             rng,
             limit,
@@ -915,6 +921,7 @@ impl PgTransaction {
         let rows = Self::range_query_offset(
             conn.conn_mut(),
             persistent,
+            "scanr",
             &self.sql.range_kv_desc,
             rng,
             limit,

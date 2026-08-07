@@ -1,4 +1,4 @@
-//! PostgreSQL tuning configuration — 5-layer, 26-parameter system.
+//! PostgreSQL tuning configuration — 6-layer, 30-parameter system.
 //!
 //! All parameters have sensible defaults and can be overridden via
 //! `PG_TUNED_*` environment variables. See `PostgreSQL_KV存储层调优方案.docx`
@@ -10,7 +10,7 @@
 //! |-------|--------|------------|-------------|
 //! | PG server | 8 | `PG_TUNED_SERVER_` | session SET + log hints |
 //! | Pool | 5 | `PG_TUNED_POOL_` | `PgPoolOptions` at startup |
-//! | Table storage | 4 | `PG_TUNED_TABLE_` | DDL (`ALTER TABLE`) |
+//! | Table storage | 5 | `PG_TUNED_TABLE_` | DDL (`ALTER TABLE`) |
 //! | Autovacuum | 5 | `PG_TUNED_AUTOVAC_` | DDL (`ALTER TABLE`) |
 //! | Query runtime | 4 | `PG_TUNED_QUERY_` | session SET (`after_connect`) |
 
@@ -559,14 +559,21 @@ impl PgTuneConfig {
             "toast_threshold must be in [128, 8160], got {}",
             self.toast_threshold
         );
-        format!(
+        let storage_sql = format!(
             r#"
 -- Table storage tuning
 ALTER TABLE {table} SET (
     fillfactor = {fillfactor},
     toast_tuple_target = {toast_threshold}
 );
-ALTER TABLE {table} ALTER COLUMN val SET STORAGE {toast};
+ALTER TABLE {table} ALTER COLUMN val SET STORAGE {toast};"#,
+            fillfactor = self.fillfactor,
+            toast = self.toast_storage,
+            toast_threshold = self.toast_threshold,
+        );
+
+        let autovac_sql = format!(
+            r#"
 -- Autovacuum tuning
 ALTER TABLE {table} SET (
     autovacuum_vacuum_scale_factor = {vscale},
@@ -575,15 +582,53 @@ ALTER TABLE {table} SET (
     autovacuum_vacuum_cost_limit = {vclimit},
     autovacuum_vacuum_cost_delay = {vcdelay}
 );"#,
-            fillfactor = self.fillfactor,
-            toast = self.toast_storage,
-            toast_threshold = self.toast_threshold,
             vscale = self.autovac_vacuum_scale,
             vthresh = self.autovac_vacuum_threshold,
             ascale = self.autovac_analyze_scale,
             vclimit = self.autovac_vacuum_cost_limit,
             vcdelay = self.autovac_vacuum_cost_delay,
-        )
+        );
+
+        // F1: For hash-partitioned tables, ALTER TABLE SET (fillfactor=...)
+        // on the parent does NOT propagate to child partitions. PG's ALTER
+        // TABLE on a partitioned parent only sets the parent's own storage
+        // parameters — child partitions inherit their own defaults at creation
+        // time. We must explicitly apply the same settings to each child
+        // partition to ensure consistent behavior across all partitions.
+        if self.hash_partitions <= 1 {
+            format!("{storage_sql}{autovac_sql}")
+        } else {
+            let mut sql = format!("{storage_sql}{autovac_sql}");
+            for i in 0..self.hash_partitions {
+                let part = format!("{table}_p{i}");
+                sql.push_str(&format!(
+                    r#"
+-- Partition {part} storage tuning
+ALTER TABLE {part} SET (
+    fillfactor = {fillfactor},
+    toast_tuple_target = {toast_threshold}
+);
+ALTER TABLE {part} ALTER COLUMN val SET STORAGE {toast};
+-- Partition {part} autovacuum tuning
+ALTER TABLE {part} SET (
+    autovacuum_vacuum_scale_factor = {vscale},
+    autovacuum_vacuum_threshold = {vthresh},
+    autovacuum_analyze_scale_factor = {ascale},
+    autovacuum_vacuum_cost_limit = {vclimit},
+    autovacuum_vacuum_cost_delay = {vcdelay}
+);"#,
+                    fillfactor = self.fillfactor,
+                    toast = self.toast_storage,
+                    toast_threshold = self.toast_threshold,
+                    vscale = self.autovac_vacuum_scale,
+                    vthresh = self.autovac_vacuum_threshold,
+                    ascale = self.autovac_analyze_scale,
+                    vclimit = self.autovac_vacuum_cost_limit,
+                    vcdelay = self.autovac_vacuum_cost_delay,
+                ));
+            }
+            sql
+        }
     }
 
     /// Generate session-level `SET` statements.
@@ -1549,14 +1594,22 @@ mod tests {
 
     #[test]
     fn test_tune_table_sql_on_partitioned_table() {
-        // tune_table_sql should still work on partitioned tables —
+        // tune_table_sql should work on partitioned tables —
         // ALTER TABLE SET (...) cascades to child partitions in PG 13+.
+        // F1: For hash-partitioned tables, we now also generate ALTER TABLE
+        // for each child partition (kv_p0, kv_p1, ...) because PG does not
+        // propagate fillfactor/autovacuum settings from parent to children.
         let c = PgTuneConfig {
             hash_partitions: 4,
             ..PgTuneConfig::default()
         };
         let sql = c.tune_table_sql("kv");
+        // Parent table
         assert!(sql.contains("ALTER TABLE kv SET"));
         assert!(sql.contains("fillfactor = 90"));
+        // Child partitions
+        assert!(sql.contains("ALTER TABLE kv_p0 SET"));
+        assert!(sql.contains("ALTER TABLE kv_p3 SET"));
+        assert!(!sql.contains("ALTER TABLE kv_p4 SET"));
     }
 }
