@@ -8,6 +8,7 @@ use sqlx::ConnectOptions;
 use sqlx::Executor;
 use sqlx::Row;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::config::PgConfig;
@@ -84,6 +85,13 @@ pub struct PgStore {
     keepalive_sql: Arc<str>,
     /// Connect timeout for direct-mode connections (TCP connect phase).
     connect_timeout: std::time::Duration,
+    /// Cancellation token for the direct-mode background heartbeat task.
+    /// `None` in pool mode (no heartbeat task spawned).
+    heartbeat_cancel: Option<CancellationToken>,
+    /// Heartbeat interval for direct-mode background keepalive.
+    /// Uses `keepalive_idle` value (default 60s) — probes just before
+    /// the pooler would drop idle connections.
+    heartbeat_interval: std::time::Duration,
 }
 
 // ─── URL sanitization ─────────────────────────────────
@@ -335,6 +343,53 @@ impl PgStore {
         )
         .into();
 
+        // ── Direct-mode heartbeat task ──
+        //
+        // In pooler (direct) mode, we spawn a background task that maintains
+        // a long-lived TCP connection to PG and periodically executes `SELECT 1`.
+        // This serves two purposes:
+        // 1. Keep the connection path alive — Supabase Pooler typically drops
+        //    idle connections after ~60s. The heartbeat probes at the same
+        //    cadence as TCP keepalive (keepalive_idle), preventing the pooler
+        //    from reclaiming the connection.
+        // 2. Early detection of PG reachability issues — if the heartbeat
+        //    fails, we log a warning and attempt to reconnect. This gives
+        //    operators visibility into connectivity problems before they
+        //    cascade to transaction failures.
+        let heartbeat_cancel = if config.pooler {
+            let cancel = CancellationToken::new();
+            let interval = tune.keepalive_idle;
+            // Clone the parsed PgConnectOptions for the heartbeat task.
+            // We must re-parse because `opts` is moved into `ConnectionMode`
+            // below. The options are Arc-wrapped internally, so cloning is
+            // cheap (no deep copy of the URL string).
+            let opts_hb: PgConnectOptions = strip_custom_params(url)
+                .parse()
+                .map_err(|e: sqlx::Error| PgStoreError::Postgres(format!("invalid URL: {e}")))?;
+            let opts_boxed = Box::new(opts_hb);
+            let keepalive_sql_hb = Arc::clone(&keepalive_sql);
+            let session_sql_hb = Arc::clone(&session_sql);
+            let cancel_clone = cancel.clone();
+
+            tokio::spawn(direct_mode_heartbeat(
+                opts_boxed,
+                connect_timeout,
+                interval,
+                keepalive_sql_hb,
+                session_sql_hb,
+                cancel_clone,
+            ));
+
+            info!(
+                "direct-mode heartbeat task spawned: interval={:?}, connect_timeout={:?}",
+                interval, connect_timeout
+            );
+            Some(cancel)
+        } else {
+            None
+        };
+        let heartbeat_interval = tune.keepalive_idle;
+
         // ── Branch: pooler (direct) vs pooled ──
         let mode = if config.pooler {
             info!(
@@ -547,6 +602,8 @@ impl PgStore {
             session_sql,
             keepalive_sql,
             connect_timeout,
+            heartbeat_cancel,
+            heartbeat_interval,
         }))
     }
 
@@ -708,6 +765,13 @@ impl PgStore {
     pub async fn shutdown(&self) {
         // Set barrier to prevent new begin() calls.
         self.shutting_down.store(true, AtomicOrdering::Relaxed);
+
+        // Cancel the direct-mode heartbeat task (if any).
+        if let Some(cancel) = &self.heartbeat_cancel {
+            cancel.cancel();
+            info!("direct-mode heartbeat task cancellation requested");
+        }
+
         match &self.mode {
             ConnectionMode::Pooled(pool) => {
                 // Close the pool with a 30s timeout. Without this, pool.close()
@@ -790,6 +854,16 @@ impl PgStore {
     #[must_use]
     pub fn is_direct_mode(&self) -> bool {
         matches!(self.mode, ConnectionMode::Direct(_))
+    }
+
+    /// Get the heartbeat interval for direct-mode background keepalive.
+    ///
+    /// Returns the `keepalive_idle` value (default 60s). In direct mode,
+    /// this is the interval at which the background heartbeat task probes
+    /// PG with `SELECT 1`. In pool mode, this value is informational.
+    #[must_use]
+    pub fn heartbeat_interval(&self) -> std::time::Duration {
+        self.heartbeat_interval
     }
 
     /// Run VACUUM ANALYZE on the table (must be called outside a transaction).
@@ -986,6 +1060,110 @@ async fn connect_direct_with_session(
     }
     Ok(conn)
 }
+
+/// Background heartbeat task for direct-mode connections.
+///
+/// Maintains a long-lived TCP connection to PG and periodically executes
+/// `SELECT 1` to keep the connection path alive. This prevents Supabase
+/// Pooler / pgbouncer from dropping idle connections between transactions
+/// and provides early detection of PG reachability issues.
+///
+/// On heartbeat failure, the connection is dropped and re-established.
+/// Continuous failures are logged with exponential backoff to avoid log
+/// flooding.
+async fn direct_mode_heartbeat(
+    opts: Box<PgConnectOptions>,
+    connect_timeout: std::time::Duration,
+    interval: std::time::Duration,
+    keepalive_sql: Arc<str>,
+    session_sql: Arc<str>,
+    cancel: CancellationToken,
+) {
+    let mut conn: Option<sqlx::postgres::PgConnection> = None;
+    let mut consecutive_failures: u32 = 0;
+
+    loop {
+        // Wait for the next heartbeat interval (or cancellation).
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                info!("direct-mode heartbeat task shutting down");
+                return;
+            }
+            _ = tokio::time::sleep(interval) => {}
+        }
+
+        // If cancellation was requested during the sleep, exit.
+        if cancel.is_cancelled() {
+            info!("direct-mode heartbeat task shutting down");
+            return;
+        }
+
+        // Try to establish a connection if we don't have one.
+        if conn.is_none() {
+            match connect_direct_with_session(
+                &opts,
+                connect_timeout,
+                &keepalive_sql,
+                &session_sql,
+                "heartbeat",
+            )
+            .await
+            {
+                Ok(c) => {
+                    conn = Some(c);
+                    if consecutive_failures > 0 {
+                        info!(
+                            consecutive_failures,
+                            "direct-mode heartbeat: connection re-established after failures"
+                        );
+                    }
+                    consecutive_failures = 0;
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    warn!(
+                        error = %e,
+                        consecutive_failures,
+                        "direct-mode heartbeat: failed to connect — PG may be unreachable"
+                    );
+                    // Exponential backoff on repeated failures: min(consecutive^2 * 5s, 5min)
+                    let backoff_secs = std::cmp::min((consecutive_failures as u64).pow(2) * 5, 300);
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            info!("direct-mode heartbeat task shutting down during backoff");
+                            return;
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // Execute the heartbeat query.
+        if let Some(c) = conn.as_mut() {
+            match Executor::execute(c, sqlx::raw_sql("SELECT 1")).await {
+                Ok(_) => {
+                    if consecutive_failures > 0 {
+                        info!("direct-mode heartbeat: SELECT 1 succeeded after failures");
+                    }
+                    consecutive_failures = 0;
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    warn!(
+                        error = %e,
+                        consecutive_failures,
+                        "direct-mode heartbeat: SELECT 1 failed — dropping connection"
+                    );
+                    conn = None; // Drop the broken connection; next loop will reconnect.
+                }
+            }
+        }
+    }
+}
+
+// ─── Tests ──────────────────────────────────────────────
 
 #[cfg(test)]
 mod test_strip {
