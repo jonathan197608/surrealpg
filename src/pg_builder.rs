@@ -105,7 +105,7 @@ impl TransactionBuilder for PgStore {
                 if metric == "pg_pool_size" {
                     Some(size as u64)
                 } else {
-                    Some(idle as u64)
+                    Some(idle) // already u64 from pool_size()
                 }
             }
             "pg_pool_max" => Some(self.pool_max() as u64),

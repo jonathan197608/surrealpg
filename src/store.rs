@@ -9,7 +9,7 @@ use sqlx::Executor;
 use sqlx::Row;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::PgConfig;
 use crate::error::{PgStoreError, Result};
@@ -88,6 +88,12 @@ pub struct PgStore {
     /// Cancellation token for the direct-mode background heartbeat task.
     /// `None` in pool mode (no heartbeat task spawned).
     heartbeat_cancel: Option<CancellationToken>,
+    /// JoinHandle for the direct-mode background heartbeat task.
+    /// Stored so `shutdown()` can await the task's graceful exit.
+    /// `None` in pool mode (no heartbeat task spawned).
+    /// Arc<tokio::sync::Mutex<..>> so the field is Clone (PgStore derives Clone)
+    /// and the guard is Send (required for async shutdown).
+    heartbeat_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Heartbeat interval for direct-mode background keepalive.
     /// Uses `keepalive_idle` value (default 60s) — probes just before
     /// the pooler would drop idle connections.
@@ -356,7 +362,7 @@ impl PgStore {
         //    fails, we log a warning and attempt to reconnect. This gives
         //    operators visibility into connectivity problems before they
         //    cascade to transaction failures.
-        let heartbeat_cancel = if config.pooler {
+        let (heartbeat_cancel, heartbeat_handle) = if config.pooler {
             let cancel = CancellationToken::new();
             let interval = tune.keepalive_idle;
             // Clone the parsed PgConnectOptions for the heartbeat task.
@@ -371,7 +377,7 @@ impl PgStore {
             let session_sql_hb = Arc::clone(&session_sql);
             let cancel_clone = cancel.clone();
 
-            tokio::spawn(direct_mode_heartbeat(
+            let heartbeat_handle = tokio::spawn(direct_mode_heartbeat(
                 opts_boxed,
                 connect_timeout,
                 interval,
@@ -384,9 +390,9 @@ impl PgStore {
                 "direct-mode heartbeat task spawned: interval={:?}, connect_timeout={:?}",
                 interval, connect_timeout
             );
-            Some(cancel)
+            (Some(cancel), Some(heartbeat_handle))
         } else {
-            None
+            (None, None)
         };
         let heartbeat_interval = tune.keepalive_idle;
 
@@ -447,13 +453,21 @@ impl PgStore {
                         Ok(())
                     })
                 })
-                .before_acquire(|conn, meta| {
-                    Box::pin(async move {
-                        if meta.idle_for > std::time::Duration::from_secs(60) {
-                            sqlx::Connection::ping(conn).await?;
-                        }
-                        Ok(true)
-                    })
+                .before_acquire({
+                    // Use keepalive_idle as the ping threshold: if a connection
+                    // has been idle longer than keepalive_idle (default 60s),
+                    // ping it to verify the server is still reachable before
+                    // handing it to a caller. This aligns with the direct-mode
+                    // heartbeat interval which also uses keepalive_idle.
+                    let ping_threshold = tune.keepalive_idle;
+                    move |conn, meta| {
+                        Box::pin(async move {
+                            if meta.idle_for > ping_threshold {
+                                sqlx::Connection::ping(conn).await?;
+                            }
+                            Ok(true)
+                        })
+                    }
                 })
                 .connect_with(opts)
                 .await
@@ -603,6 +617,7 @@ impl PgStore {
             keepalive_sql,
             connect_timeout,
             heartbeat_cancel,
+            heartbeat_handle: Arc::new(tokio::sync::Mutex::new(heartbeat_handle)),
             heartbeat_interval,
         }))
     }
@@ -770,6 +785,19 @@ impl PgStore {
                     match Executor::execute(&mut conn, sqlx::raw_sql(&self.begin_sql)).await {
                         Ok(_) => {}
                         Err(e) => {
+                            // Best-effort ROLLBACK: if BEGIN was sent but PG returned
+                            // an error, PG may or may not be in a transaction. Send
+                            // ROLLBACK to ensure clean state before dropping the
+                            // connection (in pooler environments, the server-side
+                            // connection may be reused).
+                            if let Err(rb_err) =
+                                Executor::execute(&mut conn, sqlx::raw_sql("ROLLBACK")).await
+                            {
+                                debug!(
+                                    error = %rb_err,
+                                    "best-effort ROLLBACK after BEGIN failure (ignored)"
+                                );
+                            }
                             let pg_err = PgStoreError::from_sqlx(None, &e);
                             if pg_err.is_transient() && attempt <= MAX_RETRIES {
                                 let delay =
@@ -835,10 +863,21 @@ impl PgStore {
         // Set barrier to prevent new begin() calls.
         self.shutting_down.store(true, AtomicOrdering::Relaxed);
 
-        // Cancel the direct-mode heartbeat task (if any).
+        // Cancel the direct-mode heartbeat task (if any) and await its exit.
         if let Some(cancel) = &self.heartbeat_cancel {
             cancel.cancel();
             info!("direct-mode heartbeat task cancellation requested");
+        }
+        if let Some(handle) = self.heartbeat_handle.lock().await.take() {
+            // The heartbeat task checks cancellation in tokio::select! branches,
+            // so it should exit promptly. But if a SELECT 1 or connect is in
+            // progress, it may take up to ~10s (HEARTBEAT_TIMEOUT). Give it
+            // 15s to finish before giving up.
+            match tokio::time::timeout(std::time::Duration::from_secs(15), handle).await {
+                Ok(Ok(())) => info!("direct-mode heartbeat task exited cleanly"),
+                Ok(Err(e)) => warn!(error = %e, "direct-mode heartbeat task exited with error"),
+                Err(_) => warn!("direct-mode heartbeat task did not exit within 15s — proceeding"),
+            }
         }
 
         match &self.mode {
@@ -992,9 +1031,9 @@ impl PgStore {
     ///
     /// In direct mode, returns `(0, 0)` — there is no pool.
     #[must_use]
-    pub fn pool_size(&self) -> (u32, u32) {
+    pub fn pool_size(&self) -> (u32, u64) {
         match &self.mode {
-            ConnectionMode::Pooled(pool) => (pool.size(), pool.num_idle() as u32),
+            ConnectionMode::Pooled(pool) => (pool.size(), pool.num_idle() as u64),
             ConnectionMode::Direct(_) => (0, 0),
         }
     }
@@ -1075,20 +1114,21 @@ impl PgStore {
 /// when you need full control over session setup (e.g. `begin_direct`
 /// treats session SQL failure as fatal, partition verification skips it).
 ///
-/// # Panics
+/// # Errors
 ///
-/// Debug builds assert that `connect_timeout > Duration::ZERO`. In pool
-/// mode, `connect_timeout` is set to `ZERO` (unused) — passing it here
-/// would cause every call to time out immediately. The assert catches
-/// this programming error early.
+/// Returns `PgStoreError::Other` if `connect_timeout` is zero (this is
+/// a programming error — pool mode sets connect_timeout to ZERO and
+/// must never call this function). In debug builds, this also panics.
 async fn connect_direct(
     opts: &PgConnectOptions,
     connect_timeout: std::time::Duration,
 ) -> Result<sqlx::postgres::PgConnection> {
-    debug_assert!(
-        !connect_timeout.is_zero(),
-        "connect_direct: connect_timeout must be > 0 (pool mode sets it to ZERO — caller bug)"
-    );
+    if connect_timeout.is_zero() {
+        const MSG: &str =
+            "connect_direct: connect_timeout must be > 0 (pool mode sets it to ZERO — caller bug)";
+        debug_assert!(false, "{MSG}");
+        return Err(PgStoreError::Other(MSG.to_string()));
+    }
     match tokio::time::timeout(connect_timeout, opts.connect()).await {
         Ok(Ok(conn)) => Ok(conn),
         Ok(Err(e)) => Err(PgStoreError::from_sqlx(None, &e)),
