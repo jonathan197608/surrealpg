@@ -811,7 +811,7 @@ fn env_str_validated(key: &str, default: &str, validate: fn(&str) -> bool) -> St
             if validate(v) {
                 v.to_string()
             } else {
-                tracing::warn!(
+                warn!(
                     env = key,
                     value = %raw,
                     "invalid value, falling back to default '{default}'"
