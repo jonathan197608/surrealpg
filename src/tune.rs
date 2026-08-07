@@ -42,11 +42,21 @@ pub struct PgTuneConfig {
     /// (e.g. 60 + 10*5 = 110s).
     pub keepalive_count: u32,
 
-    // ── KV table storage (4) ──
+    // ── KV table storage (5) ──
     pub fillfactor: i32,
     pub toast_storage: String,
     pub toast_threshold: i32,
     pub use_unlogged: bool,
+    /// Number of hash partitions for the KV table.
+    ///
+    /// - 1 (default): single unpartitioned table.
+    /// - >1: `CREATE TABLE ... PARTITION BY HASH (key)` with N partitions.
+    ///
+    /// **Hash partition count is immutable** in PostgreSQL — once a table
+    /// is created with N partitions, it cannot be changed. If the table
+    /// already exists with a different partition count, startup will fail
+    /// with a clear error message.
+    pub hash_partitions: u32,
 
     // ── Autovacuum (5) ──
     pub autovac_vacuum_scale: f64,
@@ -89,6 +99,7 @@ impl Default for PgTuneConfig {
             toast_storage: "external".to_string(),
             toast_threshold: 2032,
             use_unlogged: false,
+            hash_partitions: 1,
 
             autovac_vacuum_scale: 0.05,
             autovac_vacuum_threshold: 50,
@@ -223,6 +234,26 @@ impl PgTuneConfig {
                 }
             },
             use_unlogged: env_bool("PG_TUNED_TABLE_UNLOGGED", false),
+            hash_partitions: {
+                let v = env_u32("PG_TUNED_TABLE_HASH_PARTITIONS", 1);
+                if v == 0 {
+                    warn!(
+                        env = "PG_TUNED_TABLE_HASH_PARTITIONS",
+                        value = v,
+                        "must be >= 1, using default 1"
+                    );
+                    1
+                } else if v > 1024 {
+                    warn!(
+                        env = "PG_TUNED_TABLE_HASH_PARTITIONS",
+                        value = v,
+                        "unreasonably high (>1024), using default 1"
+                    );
+                    1
+                } else {
+                    v
+                }
+            },
 
             // Autovacuum
             autovac_vacuum_scale: {
@@ -391,6 +422,11 @@ impl PgTuneConfig {
     ///
     /// This should be executed **once** after pool creation. Failure is fatal.
     ///
+    /// When `hash_partitions > 1`, the table is created as a hash-partitioned
+    /// table with N child partitions. Hash partition count is **immutable** in
+    /// PostgreSQL — once created, the number of partitions cannot be changed
+    /// without dropping and recreating the table.
+    ///
     /// # Panics
     ///
     /// Panics if `table` is not a valid SQL identifier (only `[a-zA-Z0-9_]`).
@@ -399,9 +435,54 @@ impl PgTuneConfig {
         crate::config::PgConfig::validate_identifier(table)
             .expect("table name must be a valid SQL identifier");
         let kw = if self.use_unlogged { "UNLOGGED " } else { "" };
+        if self.hash_partitions <= 1 {
+            format!(
+                "CREATE {kw}TABLE IF NOT EXISTS {table} \
+                 (key BYTEA PRIMARY KEY, val BYTEA NOT NULL)"
+            )
+        } else {
+            // Hash-partitioned table: parent + N child partitions.
+            //
+            // PostgreSQL's hash partitioning uses MODULUS/REMAINDER:
+            //   PARTITION p0 FOR VALUES WITH (MODULUS N, REMAINDER 0)
+            //   PARTITION p1 FOR VALUES WITH (MODULUS N, REMAINDER 1)
+            //   ...
+            //
+            // The modulus must equal the total number of partitions.
+            // Each row is assigned to partition (hash(key) % N).
+            //
+            // Note: PRIMARY KEY on a partitioned table must include the
+            // partition key. Since we partition by `key`, and our PK is
+            // already `key`, this is satisfied automatically.
+            let n = self.hash_partitions;
+            let mut sql = format!(
+                "CREATE {kw}TABLE IF NOT EXISTS {table} \
+                 (key BYTEA PRIMARY KEY, val BYTEA NOT NULL) \
+                 PARTITION BY HASH (key)"
+            );
+            for i in 0..n {
+                sql.push_str(&format!(
+                    "\nCREATE TABLE IF NOT EXISTS {table}_p{i} \
+                     PARTITION OF {table} FOR VALUES WITH (MODULUS {n}, REMAINDER {i})"
+                ));
+            }
+            sql
+        }
+    }
+
+    /// Generate SQL to query the actual partition count of a table.
+    ///
+    /// Returns a query that yields a single row with the partition count
+    /// (0 if the table is not partitioned, >0 if it is).
+    #[must_use]
+    pub fn partition_count_sql(&self, table: &str) -> String {
+        crate::config::PgConfig::validate_identifier(table)
+            .expect("table name must be a valid SQL identifier");
         format!(
-            "CREATE {kw}TABLE IF NOT EXISTS {table} \
-             (key BYTEA PRIMARY KEY, val BYTEA NOT NULL)"
+            "SELECT count(*) AS part_cnt FROM pg_partitioned_table pt \
+             JOIN pg_class c ON c.oid = pt.partrelid \
+             JOIN pg_inherits i ON i.inhparent = c.oid \
+             WHERE c.relname = '{table}'"
         )
     }
 
@@ -1368,5 +1449,107 @@ mod tests {
             ..PgTuneConfig::default()
         };
         let _ = c.tune_table_sql("kv");
+    }
+
+    // ── hash_partitions tests ──
+
+    #[test]
+    fn test_hash_partitions_default() {
+        let c = PgTuneConfig::default();
+        assert_eq!(
+            c.hash_partitions, 1,
+            "default should be 1 (no partitioning)"
+        );
+    }
+
+    #[test]
+    fn test_hash_partitions_env() {
+        // Valid value
+        unsafe { std::env::set_var("PG_TUNED_TABLE_HASH_PARTITIONS", "4") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.hash_partitions, 4);
+
+        // 0 is invalid
+        unsafe { std::env::set_var("PG_TUNED_TABLE_HASH_PARTITIONS", "0") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.hash_partitions, 1, "0 should fall back to 1");
+
+        // >1024 is unreasonable
+        unsafe { std::env::set_var("PG_TUNED_TABLE_HASH_PARTITIONS", "2000") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.hash_partitions, 1, "2000 should fall back to 1");
+
+        // Boundary: 1024 is valid
+        unsafe { std::env::set_var("PG_TUNED_TABLE_HASH_PARTITIONS", "1024") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.hash_partitions, 1024);
+
+        // Boundary: 1 is valid (no partitioning)
+        unsafe { std::env::set_var("PG_TUNED_TABLE_HASH_PARTITIONS", "1") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.hash_partitions, 1);
+
+        unsafe { std::env::remove_var("PG_TUNED_TABLE_HASH_PARTITIONS") };
+    }
+
+    #[test]
+    fn test_create_table_sql_no_partition() {
+        let c = PgTuneConfig::default();
+        let sql = c.create_table_sql("kv");
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS kv"));
+        assert!(!sql.contains("PARTITION BY"));
+    }
+
+    #[test]
+    fn test_create_table_sql_with_partitions() {
+        let c = PgTuneConfig {
+            hash_partitions: 4,
+            ..PgTuneConfig::default()
+        };
+        let sql = c.create_table_sql("kv");
+        assert!(sql.contains("PARTITION BY HASH (key)"));
+        assert!(sql.contains("PARTITION OF kv FOR VALUES WITH (MODULUS 4, REMAINDER 0)"));
+        assert!(sql.contains("PARTITION OF kv FOR VALUES WITH (MODULUS 4, REMAINDER 1)"));
+        assert!(sql.contains("PARTITION OF kv FOR VALUES WITH (MODULUS 4, REMAINDER 2)"));
+        assert!(sql.contains("PARTITION OF kv FOR VALUES WITH (MODULUS 4, REMAINDER 3)"));
+        // Should not have remainder 4
+        assert!(!sql.contains("REMAINDER 4"));
+    }
+
+    #[test]
+    fn test_create_table_sql_unlogged_with_partitions() {
+        let c = PgTuneConfig {
+            hash_partitions: 2,
+            use_unlogged: true,
+            ..PgTuneConfig::default()
+        };
+        let sql = c.create_table_sql("kv");
+        assert!(sql.contains("CREATE UNLOGGED TABLE IF NOT EXISTS kv"));
+        assert!(sql.contains("PARTITION BY HASH (key)"));
+    }
+
+    #[test]
+    fn test_partition_count_sql() {
+        let c = PgTuneConfig::default();
+        let sql = c.partition_count_sql("kv");
+        assert!(sql.contains("pg_partitioned_table"));
+        assert!(sql.contains("pg_class"));
+        assert!(sql.contains("pg_inherits"));
+        assert!(sql.contains("relname = 'kv'"));
+    }
+
+    // ── verify_partition_count tests (in store.rs test module) ──
+
+    #[test]
+    fn test_tune_table_sql_on_partitioned_table() {
+        // tune_table_sql should still work on partitioned tables —
+        // ALTER TABLE SET (...) cascades to child partitions in PG 13+.
+        let c = PgTuneConfig {
+            hash_partitions: 4,
+            ..PgTuneConfig::default()
+        };
+        let sql = c.tune_table_sql("kv");
+        assert!(sql.contains("ALTER TABLE kv SET"));
+        assert!(sql.contains("fillfactor = 90"));
     }
 }

@@ -116,6 +116,15 @@ pub struct PgConfig {
     ///
     /// Set via the `pooler=true` URL query parameter.
     pub pooler: bool,
+    /// Number of hash partitions for the KV table (default: 1 = no partitioning).
+    ///
+    /// When > 1, the table is created as `PARTITION BY HASH (key)` with N
+    /// child partitions. Hash partition count is **immutable** in PostgreSQL —
+    /// if the table already exists with a different partition count, startup
+    /// will fail with a clear error message.
+    ///
+    /// Set via the `hash_partitions` URL query parameter.
+    pub hash_partitions: Option<u32>,
 }
 
 /// Policy for persistent prepared statements.
@@ -212,6 +221,7 @@ impl Default for PgConfig {
             isolation_level: PgIsolation::default(),
             persistent_statements: PersistentStatements::Auto,
             pooler: false,
+            hash_partitions: None,
         }
     }
 }
@@ -431,6 +441,7 @@ impl PgConfig {
                 "slow_acquire_threshold_secs",
                 "slow_statements_threshold_secs",
                 "pooler",
+                "hash_partitions",
             ];
             for pair in query.split('&') {
                 if let Some((key, value)) = pair.split_once('=') {
@@ -568,6 +579,17 @@ impl PgConfig {
                             Some(v) => self.pooler = v,
                             None => tracing::warn!(
                                 "pooler='{value}' is not a valid bool (expected true/false/yes/no/on/off/1/0), ignoring"
+                            ),
+                        },
+                        "hash_partitions" => match value.parse::<u32>() {
+                            Ok(0) => {
+                                tracing::warn!(
+                                    "hash_partitions=0 is invalid (must be >= 1), ignoring"
+                                );
+                            }
+                            Ok(v) => self.hash_partitions = Some(v),
+                            Err(_) => tracing::warn!(
+                                "hash_partitions='{value}' is not a valid u32, ignoring"
                             ),
                         },
                         _ => {}
@@ -917,5 +939,27 @@ mod tests {
             Some(Duration::from_secs(5)),
             "slow_acquire_threshold_secs=5 should pass through"
         );
+    }
+
+    // hash_partitions URL parameter
+    #[test]
+    fn test_hash_partitions_url_param() {
+        // Valid value
+        let mut config = PgConfig::default();
+        config
+            .merge_url_params("postgresql://u:p@h/db?hash_partitions=4")
+            .unwrap();
+        assert_eq!(config.hash_partitions, Some(4));
+
+        // 0 is invalid
+        let mut config2 = PgConfig::default();
+        config2
+            .merge_url_params("postgresql://u:p@h/db?hash_partitions=0")
+            .unwrap();
+        assert_eq!(config2.hash_partitions, None, "0 should be ignored");
+
+        // Default is None (use env/default)
+        let config3 = PgConfig::default();
+        assert_eq!(config3.hash_partitions, None);
     }
 }

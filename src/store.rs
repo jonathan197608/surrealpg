@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
 use sqlx::ConnectOptions;
 use sqlx::Executor;
+use sqlx::Row;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use tracing::{info, warn};
 
@@ -100,6 +101,7 @@ const CUSTOM_PARAMS: &[&str] = &[
     "slow_acquire_threshold_secs",
     "slow_statements_threshold_secs",
     "pooler",
+    "hash_partitions",
 ];
 
 /// Strip our custom query parameters from a PostgreSQL URL so that sqlx's
@@ -139,6 +141,50 @@ fn strip_custom_params(url: &str) -> String {
     }
 }
 
+/// Verify that the actual partition count matches the configured value.
+///
+/// Hash partition count is immutable in PostgreSQL — once a table is created
+/// with N partitions, it cannot be changed without dropping and recreating
+/// the table. This function checks the result of `partition_count_sql()`
+/// and returns a fatal error if there is a mismatch.
+///
+/// - `expected == 1` (no partitioning): actual must be 0 (unpartitioned table).
+/// - `expected > 1` (hash partitioning): actual must equal `expected`.
+fn verify_partition_count(table: &str, expected: u32, actual: i64) -> Result<()> {
+    let expected_i = expected as i64;
+    if expected <= 1 {
+        // No partitioning expected — table should be unpartitioned (0 child partitions).
+        if actual > 0 {
+            return Err(PgStoreError::Other(format!(
+                "hash_partitions mismatch: table '{table}' has {actual} existing hash \
+                 partitions but configuration expects no partitioning (hash_partitions=1). \
+                 Hash partition count is immutable — to change it, drop and recreate the \
+                 table, or update hash_partitions to {actual} to match the existing table."
+            )));
+        }
+        Ok(())
+    } else {
+        // Hash partitioning expected — actual must match.
+        if actual != expected_i {
+            if actual == 0 {
+                return Err(PgStoreError::Other(format!(
+                    "hash_partitions mismatch: table '{table}' is not partitioned \
+                     but configuration expects hash_partitions={expected}. \
+                     Hash partition count is immutable — to use partitioning, drop \
+                     and recreate the table."
+                )));
+            }
+            return Err(PgStoreError::Other(format!(
+                "hash_partitions mismatch: table '{table}' has {actual} existing hash \
+                 partitions but configuration expects hash_partitions={expected}. \
+                 Hash partition count is immutable — to change it, drop and recreate \
+                 the table, or update hash_partitions to {actual} to match the existing table."
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl PgStore {
     /// Create a new `PgStore` from a PostgreSQL connection URL.
     ///
@@ -172,6 +218,29 @@ impl PgStore {
         }
 
         let tune = PgTuneConfig::from_env();
+
+        // URL param `hash_partitions` overrides the env var
+        // `PG_TUNED_TABLE_HASH_PARTITIONS`. This is consistent with how
+        // pool sizing params work (URL > env > default).
+        let mut tune = tune;
+        if let Some(hp) = config.hash_partitions {
+            if hp == 0 {
+                warn!("hash_partitions=0 from URL is invalid, using env/default");
+            } else if hp > 1024 {
+                warn!(
+                    "hash_partitions={hp} from URL is unreasonably high (>1024), using env/default"
+                );
+            } else {
+                if tune.hash_partitions != hp {
+                    info!(
+                        env_value = tune.hash_partitions,
+                        url_value = hp,
+                        "hash_partitions overridden by URL parameter"
+                    );
+                }
+                tune.hash_partitions = hp;
+            }
+        }
 
         // URL params override tuning env vars for pool sizing.
         let pool_max = config.max_connections.unwrap_or(tune.pool_max);
@@ -375,6 +444,40 @@ impl PgStore {
                         Err(e) => warn!("table tuning partially failed (non-fatal): {e}"),
                     }
                     // Connection drops here — DDL is done.
+                }
+            }
+
+            // ── Partition count verification ──
+            //
+            // Hash partition count is immutable in PostgreSQL. If the table
+            // already existed (CREATE TABLE IF NOT EXISTS was a no-op) with a
+            // different partition count, we must detect and report it here.
+            //
+            // This runs after the DDL block (both pooled and direct modes).
+            let check_sql = tune.partition_count_sql(table);
+            let expected = tune.hash_partitions;
+            match &mode {
+                ConnectionMode::Pooled(pool) => {
+                    let row = sqlx::query(&check_sql)
+                        .fetch_one(pool)
+                        .await
+                        .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
+                    let actual: i64 = row.get("part_cnt");
+                    verify_partition_count(table, expected, actual)?;
+                }
+                ConnectionMode::Direct(conn_opts) => {
+                    let mut conn =
+                        match tokio::time::timeout(connect_timeout, conn_opts.connect()).await {
+                            Ok(Ok(c)) => c,
+                            Ok(Err(e)) => return Err(PgStoreError::from_sqlx(None, &e)),
+                            Err(_) => return Err(PgStoreError::ConnectTimeout(connect_timeout)),
+                        };
+                    let row = sqlx::query(&check_sql)
+                        .fetch_one(&mut conn)
+                        .await
+                        .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
+                    let actual: i64 = row.get("part_cnt");
+                    verify_partition_count(table, expected, actual)?;
                 }
             }
         }
@@ -891,5 +994,67 @@ mod test_strip {
             strip_custom_params("postgresql://u:p@h/db?min_connections=0#frag"),
             "postgresql://u:p@h/db#frag"
         );
+    }
+
+    #[test]
+    fn strip_hash_partitions() {
+        assert_eq!(
+            strip_custom_params("postgresql://u:p@h/db?hash_partitions=4&sslmode=require"),
+            "postgresql://u:p@h/db?sslmode=require"
+        );
+    }
+}
+
+#[cfg(test)]
+mod test_partition {
+    use super::*;
+
+    #[test]
+    fn test_verify_no_partition_expected_none() {
+        // expected=1 (no partitioning), actual=0 → OK
+        assert!(verify_partition_count("kv", 1, 0).is_ok());
+    }
+
+    #[test]
+    fn test_verify_no_partition_expected_none_borderline() {
+        // expected=0 is treated like 1 (no partitioning)
+        assert!(verify_partition_count("kv", 0, 0).is_ok());
+    }
+
+    #[test]
+    fn test_verify_mismatch_expected_none_actual_partitioned() {
+        // expected=1 but table has 4 partitions → error
+        let result = verify_partition_count("kv", 1, 4);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("mismatch"));
+        assert!(msg.contains("hash_partitions=1"));
+    }
+
+    #[test]
+    fn test_verify_partitioned_match() {
+        // expected=4, actual=4 → OK
+        assert!(verify_partition_count("kv", 4, 4).is_ok());
+    }
+
+    #[test]
+    fn test_verify_partitioned_mismatch() {
+        // expected=4 but actual=8 → error
+        let result = verify_partition_count("kv", 4, 8);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("mismatch"));
+        assert!(msg.contains("hash_partitions=4"));
+        assert!(msg.contains("8"));
+    }
+
+    #[test]
+    fn test_verify_partitioned_but_table_not_partitioned() {
+        // expected=4 but actual=0 (not partitioned) → error
+        let result = verify_partition_count("kv", 4, 0);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("not partitioned"));
+        assert!(msg.contains("hash_partitions=4"));
     }
 }
