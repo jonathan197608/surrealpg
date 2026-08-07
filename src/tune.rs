@@ -464,7 +464,7 @@ impl PgTuneConfig {
         if self.hash_partitions <= 1 {
             format!(
                 "CREATE {kw}TABLE IF NOT EXISTS {table} \
-                 (key BYTEA PRIMARY KEY, val BYTEA NOT NULL)"
+                 (key BYTEA PRIMARY KEY, val BYTEA NOT NULL);"
             )
         } else {
             // Hash-partitioned table: parent + N child partitions.
@@ -480,16 +480,20 @@ impl PgTuneConfig {
             // Note: PRIMARY KEY on a partitioned table must include the
             // partition key. Since we partition by `key`, and our PK is
             // already `key`, this is satisfied automatically.
+            //
+            // Each statement must end with `;` because `raw_sql()` sends
+            // the entire string as a single multi-statement command — PG
+            // requires `;` between statements.
             let n = self.hash_partitions;
             let mut sql = format!(
                 "CREATE {kw}TABLE IF NOT EXISTS {table} \
                  (key BYTEA PRIMARY KEY, val BYTEA NOT NULL) \
-                 PARTITION BY HASH (key)"
+                 PARTITION BY HASH (key);\n"
             );
             for i in 0..n {
                 sql.push_str(&format!(
-                    "\nCREATE TABLE IF NOT EXISTS {table}_p{i} \
-                     PARTITION OF {table} FOR VALUES WITH (MODULUS {n}, REMAINDER {i})"
+                    "CREATE TABLE IF NOT EXISTS {table}_p{i} \
+                     PARTITION OF {table} FOR VALUES WITH (MODULUS {n}, REMAINDER {i});\n"
                 ));
             }
             sql
@@ -1595,6 +1599,11 @@ mod tests {
         let sql = c.create_table_sql("kv");
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS kv"));
         assert!(!sql.contains("PARTITION BY"));
+        // Non-partitioned: single statement must end with `;`
+        assert!(
+            sql.trim().ends_with(';'),
+            "non-partitioned DDL must end with semicolon: {sql}"
+        );
     }
 
     #[test]
@@ -1611,6 +1620,20 @@ mod tests {
         assert!(sql.contains("PARTITION OF kv FOR VALUES WITH (MODULUS 4, REMAINDER 3)"));
         // Should not have remainder 4
         assert!(!sql.contains("REMAINDER 4"));
+        // Partitioned: multi-statement DDL — every statement must end with `;`
+        // because raw_sql() sends the entire string and PG requires `;` between
+        // statements.
+        let stmts: Vec<&str> = sql.split(';').filter(|s| !s.trim().is_empty()).collect();
+        assert_eq!(
+            stmts.len(),
+            5,
+            "4 partitions → 5 statements (1 parent + 4 children), got {}: {sql}",
+            stmts.len()
+        );
+        assert!(
+            sql.contains("PARTITION BY HASH (key);"),
+            "parent statement must end with `;` before child partitions: {sql}"
+        );
     }
 
     #[test]
