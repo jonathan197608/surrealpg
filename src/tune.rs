@@ -125,6 +125,29 @@ impl Default for PgTuneConfig {
 }
 
 impl PgTuneConfig {
+    /// Validate that partition child names (`{table}_p{i}`) do not exceed
+    /// PG's 63-byte identifier limit (NAMEDATALEN − 1).
+    ///
+    /// When `hash_partitions > 1`, the last child partition name is
+    /// `{table}_p{hash_partitions - 1}` (the longest because the suffix
+    /// has the most digits). If this exceeds 63 bytes, PG silently truncates
+    /// the name, which can cause identifier collisions or DDL failures.
+    fn validate_partition_names(&self, table: &str) {
+        if self.hash_partitions <= 1 {
+            return;
+        }
+        // The last partition has the longest suffix `_p{N-1}`.
+        let last_idx = self.hash_partitions - 1;
+        let suffix_len = 2 + format!("{last_idx}").len(); // "_p" + digits
+        let name_len = table.len() + suffix_len;
+        assert!(
+            name_len <= 63,
+            "partition name '{table}_p{last_idx}' is {name_len} bytes, \
+             exceeding PG's 63-byte identifier limit (NAMEDATALEN). \
+             Use a shorter table name or fewer partitions."
+        );
+    }
+
     /// Load all parameters from environment variables, falling back to defaults.
     ///
     /// Priority: `PG_TUNED_*` env vars > defaults.
@@ -429,11 +452,14 @@ impl PgTuneConfig {
     ///
     /// # Panics
     ///
-    /// Panics if `table` is not a valid SQL identifier (only `[a-zA-Z0-9_]`).
+    /// Panics if `table` is not a valid SQL identifier (only `[a-zA-Z0-9_]`),
+    /// or if partition names (`{table}_p{i}`) would exceed PG's 63-byte
+    /// identifier limit (NAMEDATALEN − 1).
     #[must_use]
     pub fn create_table_sql(&self, table: &str) -> String {
         crate::config::PgConfig::validate_identifier(table)
             .expect("table name must be a valid SQL identifier");
+        self.validate_partition_names(table);
         let kw = if self.use_unlogged { "UNLOGGED " } else { "" };
         if self.hash_partitions <= 1 {
             format!(
@@ -504,14 +530,13 @@ impl PgTuneConfig {
     ///
     /// # Panics
     ///
-    /// Panics if `table` is not a valid SQL identifier (only `[a-zA-Z0-9_]`),
-    /// or if `toast_storage` / `fillfactor` fail defense-in-depth validation
-    /// (these are validated in `from_env()`, but direct struct construction
-    /// with malicious values is possible since all fields are `pub`).
+    /// Panics if `table` is not a valid SQL identifier, or if partition
+    /// names (`{table}_p{i}`) would exceed PG's 63-byte identifier limit.
     #[must_use]
     pub fn tune_table_sql(&self, table: &str) -> String {
         crate::config::PgConfig::validate_identifier(table)
             .expect("table name must be a valid SQL identifier");
+        self.validate_partition_names(table);
         // H-1: Defense-in-depth — validate toast_storage and fillfactor
         // here, not just in from_env(). PgTuneConfig fields are all pub,
         // so a caller could construct it directly with malicious values.
@@ -674,18 +699,33 @@ ALTER TABLE {part} SET (
             "server_random_page_cost must be finite, got {}",
             self.server_random_page_cost
         );
+        // F2: Use Duration formatting that preserves sub-second precision.
+        // `as_secs()` truncates sub-second values (e.g. 500ms → 0s), which
+        // would disable the timeout. PG accepts `'500ms'` syntax, so we
+        // format as seconds when the Duration is an exact number of seconds,
+        // and as milliseconds otherwise.
+        let fmt_dur = |d: Duration| -> String {
+            let sub_ms = d.subsec_millis();
+            if sub_ms == 0 {
+                // Exact seconds — use 'Ns' format (PG standard)
+                format!("{}s", d.as_secs())
+            } else {
+                // Has sub-second component — use 'Nms' format
+                format!("{}ms", d.as_millis())
+            }
+        };
         format!(
-            r#"SET statement_timeout = '{st}s';
-SET idle_in_transaction_session_timeout = '{it}s';
-SET lock_timeout = '{lt}s';
+            r#"SET statement_timeout = '{st}';
+SET idle_in_transaction_session_timeout = '{it}';
+SET lock_timeout = '{lt}';
 SET default_statistics_target = {st_target};
 SET work_mem = '{wm}';
 SET maintenance_work_mem = '{mwm}';
 SET random_page_cost = {rpc};
 SET effective_cache_size = '{ecs}';"#,
-            st = self.statement_timeout.as_secs(),
-            it = self.idle_txn_timeout.as_secs(),
-            lt = self.lock_timeout.as_secs(),
+            st = fmt_dur(self.statement_timeout),
+            it = fmt_dur(self.idle_txn_timeout),
+            lt = fmt_dur(self.lock_timeout),
             st_target = self.stats_target,
             wm = self.server_work_mem,
             mwm = self.server_maintenance_work_mem,
@@ -758,16 +798,22 @@ fn env_f64(key: &str, default: f64) -> f64 {
 
 /// Like `env_str`, but validates the env value with a predicate.
 /// Falls back to the default if validation fails (with a warning).
+/// F3: Trims whitespace before validation and stores the trimmed value,
+/// so `v = " 64MB "` is treated identically to `"64MB"`.
 fn env_str_validated(key: &str, default: &str, validate: fn(&str) -> bool) -> String {
     match std::env::var(key) {
-        Ok(ref v) if validate(v) => v.clone(),
-        Ok(ref v) => {
-            warn!(
-                env = key,
-                value = %v,
-                "invalid value, falling back to default '{default}'"
-            );
-            default.to_string()
+        Ok(ref raw) => {
+            let v = raw.trim();
+            if validate(v) {
+                v.to_string()
+            } else {
+                tracing::warn!(
+                    env = key,
+                    value = %raw,
+                    "invalid value, falling back to default '{default}'"
+                );
+                default.to_string()
+            }
         }
         Err(_) => default.to_string(),
     }
@@ -1611,5 +1657,71 @@ mod tests {
         assert!(sql.contains("ALTER TABLE kv_p0 SET"));
         assert!(sql.contains("ALTER TABLE kv_p3 SET"));
         assert!(!sql.contains("ALTER TABLE kv_p4 SET"));
+    }
+
+    // F1: Partition names exceeding PG's 63-byte limit should panic
+    #[test]
+    #[should_panic(expected = "exceeding PG's 63-byte identifier limit")]
+    fn test_create_table_sql_partition_name_too_long() {
+        let c = PgTuneConfig {
+            hash_partitions: 4,
+            ..PgTuneConfig::default()
+        };
+        // 60 chars + "_p3" = 63 bytes — just at the limit
+        let name60 = "a".repeat(60);
+        let _ = c.create_table_sql(&name60); // should NOT panic
+
+        // 61 chars + "_p3" = 64 bytes — exceeds limit
+        let name61 = "a".repeat(61);
+        let _ = c.create_table_sql(&name61); // SHOULD panic
+    }
+
+    // F1: Partition name boundary — exactly 63 bytes should be OK
+    #[test]
+    fn test_create_table_sql_partition_name_at_limit() {
+        let c = PgTuneConfig {
+            hash_partitions: 4,
+            ..PgTuneConfig::default()
+        };
+        // 60 chars + "_p3" = 63 bytes — exactly at the limit
+        let name60 = "a".repeat(60);
+        let sql = c.create_table_sql(&name60);
+        assert!(sql.contains("PARTITION BY HASH"));
+    }
+
+    // F2: session_sql should use ms suffix for sub-second durations
+    #[test]
+    fn test_session_sql_subsecond_duration() {
+        let c = PgTuneConfig {
+            statement_timeout: Duration::from_millis(500),
+            idle_txn_timeout: Duration::from_secs(10), // exact seconds
+            lock_timeout: Duration::from_secs(10),
+            ..PgTuneConfig::default()
+        };
+        let sql = c.session_sql();
+        // 500ms has sub-second component → "500ms"
+        assert!(
+            sql.contains("statement_timeout = '500ms'"),
+            "sub-second should use ms: {sql}"
+        );
+        // 10s is exact seconds → "10s"
+        assert!(
+            sql.contains("idle_in_transaction_session_timeout = '10s'"),
+            "exact seconds should use s: {sql}"
+        );
+        assert!(
+            sql.contains("lock_timeout = '10s'"),
+            "whole seconds should use s: {sql}"
+        );
+    }
+
+    // F2: Default config should produce second-based timeout strings
+    #[test]
+    fn test_session_sql_default_uses_seconds() {
+        let c = PgTuneConfig::default();
+        let sql = c.session_sql();
+        assert!(sql.contains("statement_timeout = '30s'"));
+        assert!(sql.contains("idle_in_transaction_session_timeout = '60s'"));
+        assert!(sql.contains("lock_timeout = '10s'"));
     }
 }

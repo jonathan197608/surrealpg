@@ -212,6 +212,18 @@ impl PgStore {
         config.merge_url_params(url).map_err(PgStoreError::Other)?;
         config.merge_env();
 
+        // F4: Defense-in-depth — validate table_name after all config
+        // merging is done. `merge_url_params` validates on input, but
+        // `merge_env` could theoretically override it (currently it doesn't
+        // set table_name, but future code might). This assert catches any
+        // path that could produce an invalid identifier.
+        if let Err(e) = PgConfig::validate_identifier(&config.table_name) {
+            return Err(PgStoreError::Other(format!(
+                "table_name '{name}' is invalid after config merge: {e}",
+                name = config.table_name
+            )));
+        }
+
         // Post-merge cross-validation: min_connections must not exceed max_connections.
         if let (Some(min), Some(max)) = (config.min_connections, config.max_connections)
             && min > max
