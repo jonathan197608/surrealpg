@@ -579,7 +579,7 @@ impl PgTransaction {
         let total = pairs.len();
         let mut start = 0;
         while start < total {
-            let end = (start + SETM_MAX_PAIRS).min(total);
+            let end = start.saturating_add(SETM_MAX_PAIRS).min(total);
             self.setm_batch(&pairs[start..end]).await?;
             start = end;
         }

@@ -1325,8 +1325,13 @@ async fn direct_mode_heartbeat(
                                 consecutive_failures,
                                 "direct-mode heartbeat: failed to connect — PG may be unreachable"
                             );
-                            // Exponential backoff on repeated failures: min(consecutive^2 * 5s, 5min)
-                            let backoff_secs = std::cmp::min((consecutive_failures as u64).pow(2) * 5, 300);
+                            // Exponential backoff on repeated failures: min(consecutive^2 * 5s, 5min).
+                            // Use saturating arithmetic to prevent theoretical u64 overflow
+                            // at very high failure counts (debug-build panic / release wrap).
+                            let backoff_secs = (consecutive_failures as u64)
+                                .saturating_pow(2)
+                                .saturating_mul(5)
+                                .min(300);
                             tokio::select! {
                                 _ = cancel.cancelled() => {
                                     info!("direct-mode heartbeat task shutting down during backoff");
