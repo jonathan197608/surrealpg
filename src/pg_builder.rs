@@ -69,7 +69,7 @@ impl TransactionBuilder for PgStore {
                 },
                 Metric {
                     name: "pg_pool_max",
-                    description: "Maximum number of connections allowed in the pool",
+                    description: "Maximum number of connections allowed in the pool (0 in direct mode)",
                 },
                 // F8: Transaction lifecycle metrics.
                 Metric {
@@ -108,7 +108,11 @@ impl TransactionBuilder for PgStore {
                     Some(idle) // already u64 from pool_size()
                 }
             }
-            "pg_pool_max" => Some(self.pool_max() as u64),
+            "pg_pool_max" => Some(if self.is_direct_mode() {
+                0
+            } else {
+                self.pool_max() as u64
+            }),
             "pg_tx_started" | "pg_tx_committed" | "pg_tx_rolled_back" | "pg_tx_active" => {
                 let (started, committed, rolled_back, active) = self.tx_metrics();
                 match metric {

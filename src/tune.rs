@@ -1,8 +1,8 @@
 //! PostgreSQL tuning configuration — 6-layer, 30-parameter system.
 //!
 //! All parameters have sensible defaults and can be overridden via
-//! `PG_TUNED_*` environment variables. See `PostgreSQL_KV存储层调优方案.docx`
-//! for the full design document.
+//! `PG_TUNED_*` environment variables. See the README for the full
+//! tuning parameter reference.
 //!
 //! ## Layers
 //!
@@ -10,6 +10,7 @@
 //! |-------|--------|------------|-------------|
 //! | PG server | 8 | `PG_TUNED_SERVER_` | session SET + log hints |
 //! | Pool | 5 | `PG_TUNED_POOL_` | `PgPoolOptions` at startup |
+//! | TCP keepalive | 3 | `PG_TUNED_KEEPALIVE_` | session SET (`tcp_keepalives_*`) |
 //! | Table storage | 5 | `PG_TUNED_TABLE_` | DDL (`ALTER TABLE`) |
 //! | Autovacuum | 5 | `PG_TUNED_AUTOVAC_` | DDL (`ALTER TABLE`) |
 //! | Query runtime | 4 | `PG_TUNED_QUERY_` | session SET (`after_connect`) |

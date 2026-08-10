@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: '6e9c580a-6a0a-4639-b8c6-26c1ddefdc00'
-  PropagateID: '6e9c580a-6a0a-4639-b8c6-26c1ddefdc00'
-  ReservedCode1: '94b5b1d3-1cdb-4cb7-b737-014542cf6efc'
-  ReservedCode2: '94b5b1d3-1cdb-4cb7-b737-014542cf6efc'
+  ProduceID: '6f19e4e3-09c1-4a0b-aadf-a628c5b90f72'
+  PropagateID: '6f19e4e3-09c1-4a0b-aadf-a628c5b90f72'
+  ReservedCode1: 'b1413b04-1945-47c5-ae64-1337e5407f32'
+  ReservedCode2: 'b1413b04-1945-47c5-ae64-1337e5407f32'
 ---
 
 # 测试文档
@@ -17,14 +17,14 @@ AIGC:
 |------|------|--------|------|
 | 单元测试 | `src/config.rs` | 23 | URL 参数解析、percent-decode、标识符校验、SQL 保留字检测、persistent_statements 解析、参数同义词、超时/阈值零值拒绝 |
 | 单元测试 | `src/tune.rs` | 41 | PgTuneConfig 参数解析、SQL 生成（DDL/ALTER/session）、Duration 解析、Hash 分区、分区表处理、各种边界值校验 |
-| 单元测试 | `src/store.rs` | 12 | URL 参数剥离、分区验证逻辑 |
-| 单元测试 | `src/composer.rs` | 7 | URL 脱敏（IPv4/IPv6/带查询参数/无用户信息等） |
-| 单元测试 | `src/transaction.rs` | 5 | setm 去重逻辑（空/单/无重复/最后写入胜出/大集合） |
-| 单元测试 | `src/error.rs` | 1 | transient 错误检测 |
+| 单元测试 | `src/store.rs` | 15 | URL 参数剥离、分区验证逻辑 |
+| 单元测试 | `src/composer.rs` | 12 | URL 脱敏（IPv4/IPv6/带查询参数/无用户信息等） |
+| 单元测试 | `src/transaction.rs` | 9 | setm 去重逻辑、getm HashMap 路径 |
+| 单元测试 | `src/error.rs` | 3 | transient 错误检测、Tls/Protocol 映射 |
 | 集成测试 | `tests/integration_test.rs` | 19 | 直接测试 KV 层（PgStore / PgTransaction），不经过 SurrealDB 引擎 |
 | SurrealQL 测试 | `tests/surreal_kv_suite.rs` | 2 | 通过 SurrealDB Datastore API 端到端验证 SurrealQL 语句 |
 
-**合计 110 个测试**（89 个单元测试 + 19 个集成测试 + 2 个 SurrealQL 测试）。89 个单元测试无需数据库即可运行，集成测试和 SurrealQL 测试需要 `PG_TEST_URL` 环境变量。
+**合计 124 个测试**（103 个单元测试 + 19 个集成测试 + 2 个 SurrealQL 测试）。103 个单元测试无需数据库即可运行，集成测试和 SurrealQL 测试需要 `PG_TEST_URL` 环境变量。
 
 ---
 
@@ -91,14 +91,14 @@ AIGC:
 | `test_checkpoint_target_clamping` | checkpoint_completion_target 超范围 clamp 到 [0.0, 1.0] |
 | `test_pool_max_zero_fallback` | pool_max_connections=0 回退到默认值 |
 | `test_pool_min_exceeds_max_clamped` | pool_min > pool_max 时 clamp 到 max |
-| `test_fillfactor_out_of_range` | fillfactor 越界 [10, 100] 被拒绝 |
+| `test_fillfactor_out_of_range` | fillfactor 越界 [1, 100] 被拒绝 |
 | `test_f64_nan_infinity_fallback` | NaN/Infinity f64 值回退到默认 |
 | `test_toast_threshold_min_value` | toast_tuple_target 最小值校验 |
 | `test_toast_threshold_upper_bound` | toast_tuple_target 上界校验 [128, 8160] |
 | `test_autovac_nonneg_validation` | autovacuum 参数非负校验 |
 | `test_stats_target_range_validation` | default_statistics_target 范围校验 [-1, 10000] |
 | `test_autovac_vacuum_threshold_nonneg` | autovacuum_vacuum_threshold 非负校验 |
-| `test_autovac_scale_range_validation` | autovacuum_scale_factor 范围校验 [0.0, 100.0] |
+| `test_autovac_scale_range_validation` | autovacuum_scale_factor 范围校验 [0.0, 1.0] |
 | `test_keepalive_count_upper_bound` | keepalive_count 上界校验 |
 | `test_duration_zero_rejected` | Duration 零值被拒绝 |
 | `test_server_max_connections_range` | max_connections 范围校验 |
@@ -106,18 +106,21 @@ AIGC:
 | `test_hash_partitions_env` | 环境变量设置 hash_partitions |
 | `test_partition_count_sql` | 分区计数 SQL 生成 |
 
-### `src/store.rs`（12 个）
+### `src/store.rs`（15 个）
 
-**test_strip 模块**（6 个）— URL 参数剥离逻辑：
+**test_strip 模块**（9 个）— URL 参数剥离逻辑：
 
 | 测试名 | 验证内容 |
-|--------|---------|
+|--------|----------|
 | `no_query` | 无查询参数的 URL 不变 |
 | `preserve_sqlx_params` | 保留 sqlx 内部参数（如 `sslmode`） |
 | `strip_all_custom` | 剥离所有自定义参数 |
 | `strip_hash_partitions` | 剥离 `hash_partitions` 参数 |
 | `mixed_params` | 混合参数部分剥离部分保留 |
 | `with_fragment` | 带 fragment 的 URL 正确处理 |
+| `strip_bare_param_no_equals` | 裸参数（无 `=`）被剥离 |
+| `strip_empty_value_param` | 空值参数被剥离 |
+| `strip_only_bare_custom_params` | 仅裸自定义参数的 URL |
 
 **test_partition 模块**（6 个）— 分区验证逻辑：
 
@@ -130,10 +133,10 @@ AIGC:
 | `test_verify_mismatch_expected_none_actual_partitioned` | 非分区表 + 期望分区 → 失败 |
 | `test_verify_partitioned_but_table_not_partitioned` | 期望分区但表实际非分区 → 失败 |
 
-### `src/composer.rs`（7 个）
+### `src/composer.rs`（12 个）
 
 | 测试名 | 验证内容 |
-|--------|---------|
+|--------|----------|
 | `test_redact_url_basic` | 基本 IPv4 URL 脱敏（user:pass → user:***） |
 | `test_redact_url_no_userinfo` | 无用户信息的 URL 不变 |
 | `test_redact_url_with_query` | 含查询参数的 URL 脱敏 |
@@ -141,22 +144,33 @@ AIGC:
 | `test_redact_url_ipv6_with_userinfo` | IPv6 + 用户信息脱敏 |
 | `test_redact_url_ipv6_no_userinfo` | IPv6 无用户信息不变 |
 | `test_redact_url_ipv6_with_query` | IPv6 + 查询参数脱敏 |
+| `test_redact_url_password_with_at_sign` | 密码含 `@` 的 rfind 行为 |
+| `test_redact_url_password_with_multiple_at_signs` | 密码含多个 `@` 的 rfind 行为 |
+| `test_redact_url_no_path` | 无路径的 URL 脱敏 |
+| `test_redact_url_no_port` | 无端口的 URL 脱敏 |
+| `test_redact_url_userinfo_host_only` | 仅含用户信息+主机的 URL 脱敏 |
 
-### `src/transaction.rs`（5 个）
+### `src/transaction.rs`（9 个）
 
 | 测试名 | 验证内容 |
-|--------|---------|
+|--------|----------|
 | `test_dedup_pairs_empty` | 空输入 |
 | `test_dedup_pairs_single` | 单个键值对 |
 | `test_dedup_pairs_no_duplicates` | 无重复键 |
 | `test_dedup_pairs_last_wins` | 重复键最后写入胜出 |
 | `test_dedup_pairs_large` | 大集合去重 |
+| `test_dedup_pairs_boundary_32` | 32 对边界（线性路径） |
+| `test_dedup_pairs_boundary_33` | 33 对边界（HashMap 路径） |
+| `test_getm_hashmap_path_duplicate_keys` | getm HashMap 路径重复键处理 |
+| `test_getm_hashmap_path_large_result_set` | getm HashMap 路径大结果集 |
 
-### `src/error.rs`（1 个）
+### `src/error.rs`（3 个）
 
 | 测试名 | 验证内容 |
-|--------|---------|
+|--------|----------|
 | `test_is_transient` | transient 错误码检测（`08xxx` 连接异常、`57P01` 等） |
+| `test_from_sqlx_tls_is_transient` | Tls 错误映射为 Io(transient) |
+| `test_from_sqlx_protocol_is_transient` | Protocol 错误映射为 Io(transient) |
 
 运行：
 

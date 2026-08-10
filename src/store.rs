@@ -1195,8 +1195,8 @@ impl PgStore {
 /// # Errors
 ///
 /// Returns `PgStoreError::Other` if `connect_timeout` is zero (this is
-/// a programming error — pool mode sets connect_timeout to ZERO and
-/// must never call this function). In debug builds, this also panics.
+/// a programming error — pool mode sets `connect_timeout` to `Duration::ZERO`
+/// and must never call this function). In debug builds, this also panics.
 async fn connect_direct(
     opts: &PgConnectOptions,
     connect_timeout: std::time::Duration,
