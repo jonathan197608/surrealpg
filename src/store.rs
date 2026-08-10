@@ -646,7 +646,9 @@ impl PgStore {
     /// dropped. No retry logic is needed — there is no pool to exhaust.
     pub async fn begin(&self, write: bool) -> Result<PgTransaction> {
         // Barrier: refuse new transactions after shutdown() has been called.
-        if self.shutting_down.load(AtomicOrdering::Relaxed) {
+        // R22-F1: Use Acquire ordering — pairs with Release store in shutdown()
+        // to ensure the barrier is visible on weak-memory architectures (ARM).
+        if self.shutting_down.load(AtomicOrdering::Acquire) {
             return Err(PgStoreError::Other(
                 "PgStore is shutting down — new transactions are refused".to_string(),
             ));
@@ -674,8 +676,9 @@ impl PgStore {
 
             // Re-check shutdown barrier on each retry attempt — if shutdown()
             // was called during the backoff sleep, don't waste resources
-            // creating a new connection.
-            if self.shutting_down.load(AtomicOrdering::Relaxed) {
+            // creating a new connection. R22-F1: Acquire ordering pairs with
+            // Release store in shutdown() for correct cross-thread visibility.
+            if self.shutting_down.load(AtomicOrdering::Acquire) {
                 return Err(PgStoreError::Other(
                     "PgStore is shutting down — new transactions are refused".to_string(),
                 ));
@@ -765,8 +768,8 @@ impl PgStore {
 
             // Re-check shutdown barrier on each retry attempt — if shutdown()
             // was called during the backoff sleep, don't waste resources
-            // creating a new connection.
-            if self.shutting_down.load(AtomicOrdering::Relaxed) {
+            // creating a new connection. R22-F1: Acquire ordering.
+            if self.shutting_down.load(AtomicOrdering::Acquire) {
                 return Err(PgStoreError::Other(
                     "PgStore is shutting down — new transactions are refused".to_string(),
                 ));
@@ -889,7 +892,9 @@ impl PgStore {
     /// and PG aborts the transaction.
     pub async fn shutdown(&self) {
         // Set barrier to prevent new begin() calls.
-        self.shutting_down.store(true, AtomicOrdering::Relaxed);
+        // R22-F1: Use Release ordering — pairs with Acquire loads in begin()
+        // to ensure the barrier is visible on weak-memory architectures (ARM).
+        self.shutting_down.store(true, AtomicOrdering::Release);
 
         // Cancel the direct-mode heartbeat task (if any) and await its exit.
         if let Some(cancel) = &self.heartbeat_cancel {
