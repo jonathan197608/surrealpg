@@ -270,4 +270,54 @@ mod tests {
             "postgresql://***:***@[2001:db8::1]:5432/db?sslmode=require"
         );
     }
+
+    // R26-F1: Password containing '@' must use rfind('@') to correctly
+    // identify the userinfo/host boundary. If find('@') is used instead,
+    // the first '@' (inside the password) is treated as the separator,
+    // and the real password fragment leaks into the "host" portion.
+    #[test]
+    fn test_redact_url_password_with_at_sign() {
+        assert_eq!(
+            redact_url("postgresql://user:p@ss@host:5432/db"),
+            "postgresql://***:***@host:5432/db"
+        );
+    }
+
+    // R26-F1: Multiple '@' in password — rfind ensures the last '@'
+    // separates userinfo from host.
+    #[test]
+    fn test_redact_url_password_with_multiple_at_signs() {
+        assert_eq!(
+            redact_url("postgresql://user:a@b@c@host:5432/db"),
+            "postgresql://***:***@host:5432/db"
+        );
+    }
+
+    // R26-F2: URL without a path — common in connection strings where
+    // only host:port is specified.
+    #[test]
+    fn test_redact_url_no_path() {
+        assert_eq!(
+            redact_url("postgresql://user:pass@host:5432"),
+            "postgresql://***:***@host:5432"
+        );
+    }
+
+    // R26-F2: URL without port number.
+    #[test]
+    fn test_redact_url_no_port() {
+        assert_eq!(
+            redact_url("postgresql://user:pass@host/db"),
+            "postgresql://***:***@host/db"
+        );
+    }
+
+    // R26-F2: URL with only a host and userinfo, no path or port.
+    #[test]
+    fn test_redact_url_userinfo_host_only() {
+        assert_eq!(
+            redact_url("postgresql://user:pass@host"),
+            "postgresql://***:***@host"
+        );
+    }
 }

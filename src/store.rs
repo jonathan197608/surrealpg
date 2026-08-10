@@ -1448,6 +1448,37 @@ mod test_strip {
             "postgresql://u:p@h/db?sslmode=require"
         );
     }
+
+    // R26-F3: Bare parameter with no '=' (e.g. "?pooler") — split_once
+    // returns None, key becomes the whole pair. It should still be
+    // stripped if it matches a custom param name.
+    #[test]
+    fn strip_bare_param_no_equals() {
+        assert_eq!(
+            strip_custom_params("postgresql://u:p@h/db?pooler&sslmode=require"),
+            "postgresql://u:p@h/db?sslmode=require"
+        );
+    }
+
+    // R26-F3: Empty value (e.g. "?pooler=") — key is "pooler", value is "".
+    // Should be stripped like any other custom param.
+    #[test]
+    fn strip_empty_value_param() {
+        assert_eq!(
+            strip_custom_params("postgresql://u:p@h/db?pooler=&sslmode=require"),
+            "postgresql://u:p@h/db?sslmode=require"
+        );
+    }
+
+    // R26-F3: Only bare custom params (no sqlx params) — trailing '?'
+    // must be omitted (consistent with strip_all_custom behavior).
+    #[test]
+    fn strip_only_bare_custom_params() {
+        assert_eq!(
+            strip_custom_params("postgresql://u:p@h/db?pooler"),
+            "postgresql://u:p@h/db"
+        );
+    }
 }
 
 #[cfg(test)]
