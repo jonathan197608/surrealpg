@@ -778,13 +778,28 @@ impl PgStore {
             match connect_direct(opts, self.connect_timeout).await {
                 Ok(mut conn) => {
                     // Apply keepalive (non-fatal).
-                    if let Err(e) =
-                        Executor::execute(&mut conn, sqlx::raw_sql(&self.keepalive_sql)).await
+                    // R31-F1: Wrap in timeout — without this, a half-open TCP
+                    // connection could hang here indefinitely, blocking the
+                    // session SQL timeout (R30-F2) from ever being reached.
+                    match tokio::time::timeout(
+                        self.connect_timeout,
+                        Executor::execute(&mut conn, sqlx::raw_sql(&self.keepalive_sql)),
+                    )
+                    .await
                     {
-                        warn!(
-                            error = %e,
-                            "tcp_keepalive SET failed (non-fatal, may not be supported by this PG)"
-                        );
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => {
+                            warn!(
+                                error = %e,
+                                "tcp_keepalive SET failed (non-fatal, may not be supported by this PG)"
+                            );
+                        }
+                        Err(_) => {
+                            warn!(
+                                timeout = ?self.connect_timeout,
+                                "tcp_keepalive SET timed out (non-fatal, half-open TCP suspected)"
+                            );
+                        }
                     }
                     // Apply session SQL — fatal on failure (unlike vacuum/health_check
                     // which tolerate missing timeouts). begin_direct is on the hot path;
@@ -1264,19 +1279,54 @@ async fn connect_direct_with_session(
     label: &str,
 ) -> Result<sqlx::postgres::PgConnection> {
     let mut conn = connect_direct(opts, connect_timeout).await?;
-    if let Err(e) = Executor::execute(&mut conn, sqlx::raw_sql(keepalive_sql)).await {
-        warn!(
-            error = %e,
-            "tcp_keepalive SET failed on {label} connection (non-fatal, \
-             may not be supported by this PG)"
-        );
+    // R31-F1: Wrap keepalive and session SQL in timeouts matching
+    // connect_timeout. Both are non-fatal (warn on failure), but without
+    // a timeout a half-open TCP connection could cause them to hang
+    // indefinitely — statement_timeout is not yet set because session SQL
+    // itself sets it (chicken-and-egg problem, same as R30-F2 in begin_direct).
+    match tokio::time::timeout(
+        connect_timeout,
+        Executor::execute(&mut conn, sqlx::raw_sql(keepalive_sql)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            warn!(
+                error = %e,
+                "tcp_keepalive SET failed on {label} connection (non-fatal, \
+                 may not be supported by this PG)"
+            );
+        }
+        Err(_) => {
+            warn!(
+                timeout = ?connect_timeout,
+                "tcp_keepalive SET timed out on {label} connection (non-fatal, \
+                 half-open TCP suspected) — proceeding without keepalive"
+            );
+        }
     }
-    if let Err(e) = Executor::execute(&mut conn, sqlx::raw_sql(session_sql)).await {
-        warn!(
-            error = %e,
-            "session SQL failed on {label} connection (non-fatal, but \
-             statement_timeout/lock_timeout will not be set)"
-        );
+    match tokio::time::timeout(
+        connect_timeout,
+        Executor::execute(&mut conn, sqlx::raw_sql(session_sql)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            warn!(
+                error = %e,
+                "session SQL failed on {label} connection (non-fatal, but \
+                 statement_timeout/lock_timeout will not be set)"
+            );
+        }
+        Err(_) => {
+            warn!(
+                timeout = ?connect_timeout,
+                "session SQL timed out on {label} connection (non-fatal, \
+                 half-open TCP suspected) — proceeding without session SQL"
+            );
+        }
     }
     Ok(conn)
 }
