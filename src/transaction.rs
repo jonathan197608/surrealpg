@@ -378,7 +378,9 @@ impl PgTransaction {
             TxConn::Pooled(tx) => {
                 let result = tx.commit().await;
                 if let Err(e) = &result {
-                    warn!("COMMIT failed (PG will auto-rollback): {e}");
+                    // Log only supplemental context; the error is propagated
+                    // upstream where the caller decides whether to log it.
+                    debug!(error = %e, "COMMIT failed (PG will auto-rollback)");
                 }
                 result.map_err(|e| PgStoreError::from_sqlx(None, &e))?;
             }
@@ -386,7 +388,7 @@ impl PgTransaction {
                 // Send COMMIT. On failure, PG auto-rollbacks; the connection
                 // is about to be closed anyway.
                 if let Err(e) = Executor::execute(&mut conn, sqlx::raw_sql("COMMIT")).await {
-                    warn!("COMMIT failed (direct mode, PG auto-rollbacks): {e}");
+                    debug!(error = %e, "COMMIT failed (direct mode, PG auto-rollbacks)");
                     return Err(PgStoreError::from_sqlx(None, &e));
                 }
                 // Connection is dropped here — TCP connection closes.
@@ -417,13 +419,13 @@ impl PgTransaction {
             TxConn::Pooled(tx) => {
                 let result = tx.rollback().await;
                 if let Err(e) = &result {
-                    warn!("ROLLBACK failed: {e}");
+                    debug!(error = %e, "ROLLBACK failed");
                 }
                 result.map_err(|e| PgStoreError::from_sqlx(None, &e))?;
             }
             TxConn::Direct(mut conn) => {
                 if let Err(e) = Executor::execute(&mut conn, sqlx::raw_sql("ROLLBACK")).await {
-                    warn!("ROLLBACK failed (direct mode): {e}");
+                    debug!(error = %e, "ROLLBACK failed (direct mode)");
                     return Err(PgStoreError::from_sqlx(None, &e));
                 }
                 // Connection is dropped here — TCP connection closes.
@@ -1039,7 +1041,7 @@ impl Drop for PgTransaction {
         // can accurately report how many connections are held by transactions.
         if self.conn.is_some() {
             self.release_active();
-            debug!("PgTransaction dropped without explicit commit/cancel; auto-rollback");
+            trace!("PgTransaction dropped without explicit commit/cancel; auto-rollback");
         }
     }
 }

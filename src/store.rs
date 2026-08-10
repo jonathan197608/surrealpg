@@ -395,8 +395,9 @@ impl PgStore {
             ));
 
             info!(
-                "direct-mode heartbeat task spawned: interval={:?}, connect_timeout={:?}",
-                interval, connect_timeout
+                interval_ms = interval.as_millis(),
+                timeout_ms = connect_timeout.as_millis(),
+                "direct-mode heartbeat task spawned"
             );
             (Some(cancel), Some(heartbeat_handle))
         } else {
@@ -409,8 +410,8 @@ impl PgStore {
             info!(
                 "pooler=true: using DIRECT connection mode (bypassing sqlx pool). \
                  Each transaction creates a fresh TCP connection. \
-                 connect_timeout={:?}",
-                connect_timeout
+                 timeout_ms={}",
+                connect_timeout.as_millis()
             );
             ConnectionMode::Direct(Box::new(opts))
         } else {
@@ -418,7 +419,7 @@ impl PgStore {
             // pooler=true — session SQL (statement_timeout, lock_timeout, etc.)
             // set in after_connect will be silently lost when pgbouncer
             // reassigns the connection to a different transaction.
-            warn!(
+            info!(
                 "pool mode active: if this server is behind pgbouncer (transaction mode), \
                  session SQL (statement_timeout, lock_timeout, keepalive) set in after_connect \
                  will be silently lost on transaction boundaries. Use ?pooler=true to switch \
@@ -482,9 +483,13 @@ impl PgStore {
                 .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
 
             info!(
-                "connection pool created: max={}, min={}, acquire_timeout={:?}, \
-                 idle_timeout={:?}, max_lifetime={:?}, slow_acquire_threshold={:?}",
-                pool_max, pool_min, acquire_timeout, idle_timeout, max_lifetime, slow_acquire
+                max_conn = pool_max,
+                min_conn = pool_min,
+                acquire_timeout_ms = acquire_timeout.as_millis(),
+                idle_timeout_ms = idle_timeout.map(|d| d.as_millis()),
+                max_lifetime_ms = max_lifetime.map(|d| d.as_millis()),
+                slow_acquire_threshold_ms = slow_acquire.map(|d| d.as_millis()),
+                "connection pool created"
             );
             ConnectionMode::Pooled(pool)
         };
@@ -583,7 +588,7 @@ impl PgStore {
                      pgbouncer transaction mode — forced to false"
                 );
             } else {
-                info!("pooler mode: persistent-statements forced to false");
+                debug!("pooler mode: persistent-statements forced to false");
             }
             false
         } else {
@@ -610,9 +615,13 @@ impl PgStore {
         info!(
             mode = if config.pooler { "direct" } else { "pooled" },
             max_conn = pool_max,
+            min_conn = pool_min,
             table = &config.table_name,
             isolation = config.isolation_level.as_sql(),
             persistent,
+            hash_partitions = config.hash_partitions,
+            timeout_ms = connect_timeout.as_millis(),
+            keepalive_ms = tune.keepalive_idle.as_millis(),
             "PgStore created"
         );
 
@@ -696,6 +705,9 @@ impl PgStore {
             // string, so to_string() is unavoidable here (Arc<str> → String).
             match pool.begin_with(self.begin_sql.to_string()).await {
                 Ok(tx) => {
+                    if attempt > 1 {
+                        debug!(attempt, "begin_pooled succeeded after retry");
+                    }
                     self.tx_started.fetch_add(1, AtomicOrdering::Relaxed);
                     self.tx_active.fetch_add(1, AtomicOrdering::Relaxed);
                     return Ok(PgTransaction::new_pooled(
@@ -804,7 +816,7 @@ impl PgStore {
                         }
                         Err(_) => {
                             warn!(
-                                timeout = ?self.connect_timeout,
+                                timeout_ms = self.connect_timeout.as_millis(),
                                 "tcp_keepalive SET timed out (non-fatal, half-open TCP suspected)"
                             );
                         }
@@ -834,7 +846,7 @@ impl PgStore {
                                     attempt,
                                     max_retries = MAX_RETRIES,
                                     delay_ms = delay,
-                                    timeout = ?self.connect_timeout,
+                                    timeout_ms = self.connect_timeout.as_millis(),
                                     "session SQL timed out — retrying"
                                 );
                                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -901,6 +913,10 @@ impl PgStore {
 
                     self.tx_started.fetch_add(1, AtomicOrdering::Relaxed);
                     self.tx_active.fetch_add(1, AtomicOrdering::Relaxed);
+
+                    if attempt > 1 {
+                        debug!(attempt, "begin_direct succeeded after retry");
+                    }
 
                     return Ok(PgTransaction::new_direct(
                         conn,
@@ -1065,6 +1081,7 @@ impl PgStore {
 
     /// Run VACUUM ANALYZE on the table (must be called outside a transaction).
     pub async fn vacuum(&self) -> Result<()> {
+        let vacuum_start = std::time::Instant::now();
         match &self.mode {
             ConnectionMode::Pooled(pool) => {
                 Executor::execute(pool, sqlx::raw_sql(&self.vacuum_sql))
@@ -1083,7 +1100,10 @@ impl PgStore {
                 // Connection drops here.
             }
         }
-        info!("VACUUM ANALYZE {} completed", self.config.table_name);
+        info!(
+            duration_ms = vacuum_start.elapsed().as_millis(),
+            "VACUUM ANALYZE {} completed", self.config.table_name
+        );
         Ok(())
     }
 
@@ -1114,7 +1134,7 @@ impl PgStore {
                 // retry with a short delay catches transient network blips
                 // without adding significant latency to the steady-state case.
                 let mut attempt = 0;
-                const MAX_ATTEMPTS: u32 = 2;
+                const MAX_RETRIES: u32 = 2;
                 loop {
                     attempt += 1;
                     match connect_direct(opts, self.connect_timeout).await {
@@ -1123,10 +1143,10 @@ impl PgStore {
                                 Executor::execute(&mut conn, sqlx::raw_sql("SELECT 1")).await
                             {
                                 let pg_err = PgStoreError::from_sqlx(None, &e);
-                                if pg_err.is_transient() && attempt < MAX_ATTEMPTS {
+                                if pg_err.is_transient() && attempt < MAX_RETRIES {
                                     warn!(
                                         attempt,
-                                        max_attempts = MAX_ATTEMPTS,
+                                        max_retries = MAX_RETRIES,
                                         error = %pg_err,
                                         "health_check SELECT 1 failed (transient) — retrying"
                                     );
@@ -1135,13 +1155,16 @@ impl PgStore {
                                 }
                                 return Err(pg_err);
                             }
+                            if attempt > 1 {
+                                debug!(attempt, "health_check succeeded after retry");
+                            }
                             return Ok(());
                         }
                         Err(e) => {
-                            if e.is_transient() && attempt < MAX_ATTEMPTS {
+                            if e.is_transient() && attempt < MAX_RETRIES {
                                 warn!(
                                     attempt,
-                                    max_attempts = MAX_ATTEMPTS,
+                                    max_retries = MAX_RETRIES,
                                     error = %e,
                                     "health_check connect failed (transient) — retrying"
                                 );
@@ -1222,12 +1245,13 @@ impl PgStore {
         }
         match &self.mode {
             ConnectionMode::Pooled(_) => {
-                info!(
-                    "pool resize requested: max={max}, min={min} (not yet supported by sqlx 0.8)"
+                warn!(
+                    max,
+                    min, "pool resize requested (not yet supported by sqlx 0.8)"
                 );
             }
             ConnectionMode::Direct(_) => {
-                info!("pool resize requested in direct mode (no-op)");
+                debug!("pool resize requested in direct mode (no-op)");
             }
         }
         Ok(())
@@ -1264,7 +1288,7 @@ async fn connect_direct(
         Ok(Err(e)) => Err(PgStoreError::from_sqlx(None, &e)),
         Err(_) => {
             warn!(
-                timeout_secs = connect_timeout.as_secs(),
+                timeout_ms = connect_timeout.as_millis(),
                 "direct-mode TCP connect timed out"
             );
             Err(PgStoreError::ConnectTimeout(connect_timeout))
@@ -1308,7 +1332,7 @@ async fn connect_direct_with_session(
         }
         Err(_) => {
             warn!(
-                timeout = ?connect_timeout,
+                timeout_ms = connect_timeout.as_millis(),
                 "tcp_keepalive SET timed out on {label} connection (non-fatal, \
                  half-open TCP suspected) — proceeding without keepalive"
             );
@@ -1330,7 +1354,7 @@ async fn connect_direct_with_session(
         }
         Err(_) => {
             warn!(
-                timeout = ?connect_timeout,
+                timeout_ms = connect_timeout.as_millis(),
                 "session SQL timed out on {label} connection (non-fatal, \
                  half-open TCP suspected) — proceeding without session SQL"
             );
@@ -1372,7 +1396,7 @@ async fn direct_mode_heartbeat(
 
         // If cancellation was requested during the sleep, exit.
         if cancel.is_cancelled() {
-            info!("direct-mode heartbeat task shutting down");
+            debug!("direct-mode heartbeat task shutting down after sleep");
             return;
         }
 
@@ -1390,7 +1414,7 @@ async fn direct_mode_heartbeat(
             tokio::pin!(connect_fut);
             tokio::select! {
                 _ = cancel.cancelled() => {
-                    info!("direct-mode heartbeat task shutting down during connect");
+                    debug!("direct-mode heartbeat task shutting down during connect");
                     return;
                 }
                 result = &mut connect_fut => {
@@ -1421,7 +1445,7 @@ async fn direct_mode_heartbeat(
                                 .min(300);
                             tokio::select! {
                                 _ = cancel.cancelled() => {
-                                    info!("direct-mode heartbeat task shutting down during backoff");
+                                    debug!("direct-mode heartbeat task shutting down during backoff");
                                     return;
                                 }
                                 _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
@@ -1442,7 +1466,7 @@ async fn direct_mode_heartbeat(
         if let Some(mut c) = conn.take() {
             tokio::select! {
                 _ = cancel.cancelled() => {
-                    info!("direct-mode heartbeat task shutting down during SELECT 1");
+                    debug!("direct-mode heartbeat task shutting down during SELECT 1");
                     return;
                 }
                 result = tokio::time::timeout(HEARTBEAT_TIMEOUT, Executor::execute(&mut c, sqlx::raw_sql("SELECT 1"))) => {
