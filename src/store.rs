@@ -1033,6 +1033,10 @@ impl PgStore {
     /// Execute a lightweight health check (`SELECT 1`).
     ///
     /// Suitable for Kubernetes liveness/readiness probes.
+    ///
+    /// In direct mode, includes a single retry on transient connection
+    /// failures (e.g. brief network blip) to prevent K8s from restarting
+    /// the Pod due to a one-off timeout.
     pub async fn health_check(&self) -> Result<()> {
         match &self.mode {
             ConnectionMode::Pooled(pool) => {
@@ -1046,10 +1050,51 @@ impl PgStore {
                 // which is wasteful for a lightweight liveness probe called
                 // every ~10s by Kubernetes. A bare TCP connect + SELECT 1 is
                 // sufficient to verify PG reachability.
-                let mut conn = connect_direct(opts, self.connect_timeout).await?;
-                Executor::execute(&mut conn, sqlx::raw_sql("SELECT 1"))
-                    .await
-                    .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
+                //
+                // R21-F5: Retry once on transient errors — K8s liveness probe
+                // failures trigger Pod restart, which is disproportionately
+                // expensive compared to a second connect attempt. A single
+                // retry with a short delay catches transient network blips
+                // without adding significant latency to the steady-state case.
+                let mut attempt = 0;
+                const MAX_ATTEMPTS: u32 = 2;
+                loop {
+                    attempt += 1;
+                    match connect_direct(opts, self.connect_timeout).await {
+                        Ok(mut conn) => {
+                            if let Err(e) =
+                                Executor::execute(&mut conn, sqlx::raw_sql("SELECT 1")).await
+                            {
+                                let pg_err = PgStoreError::from_sqlx(None, &e);
+                                if pg_err.is_transient() && attempt < MAX_ATTEMPTS {
+                                    warn!(
+                                        attempt,
+                                        max_attempts = MAX_ATTEMPTS,
+                                        error = %pg_err,
+                                        "health_check SELECT 1 failed (transient) — retrying"
+                                    );
+                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                    continue;
+                                }
+                                return Err(pg_err);
+                            }
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            if e.is_transient() && attempt < MAX_ATTEMPTS {
+                                warn!(
+                                    attempt,
+                                    max_attempts = MAX_ATTEMPTS,
+                                    error = %e,
+                                    "health_check connect failed (transient) — retrying"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                continue;
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
             }
         }
         Ok(())

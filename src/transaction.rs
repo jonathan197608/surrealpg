@@ -976,7 +976,11 @@ impl PgTransaction {
             .fetch_optional(conn.conn_mut())
             .await
             .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
-        Ok(row.map(|r| r.get::<i64, _>("approx_cnt") as u64))
+        // R21-F1: Guard against negative reltuples — the SQL filters
+        // `reltuples >= 0`, but defense-in-depth: if the driver ever
+        // returns a negative i64 (e.g. encoding edge case), `.max(0)`
+        // prevents it from becoming a huge u64. Consistent with `count()`.
+        Ok(row.map(|r| r.get::<i64, _>("approx_cnt").max(0) as u64))
     }
 
     // ─── Savepoints (PG native) ──────────────────────────
