@@ -45,9 +45,16 @@ tracing = "0.1"
 async-trait = "0.1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["test-util", "macros"] }
+tokio = { version = "1", features = ["macros"] }
 chrono = "0.4"
 futures = "0.3"
+
+[profile.release]
+# Enable thin LTO and single codegen unit for better-optimised binaries
+lto = "thin"
+codegen-units = 1
+# Strip debug info from the release binary to reduce binary size
+strip = "debuginfo"
 
 [lints.rust]
 linker_messages = "allow"
