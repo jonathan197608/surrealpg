@@ -263,6 +263,17 @@ impl PgTransaction {
         self.tx_active.fetch_sub(1, AtomicOrdering::Relaxed);
     }
 
+    /// Create a guard that decrements `tx_active` when dropped.
+    ///
+    /// This ensures `tx_active` is always decremented even if `commit_inner`
+    /// or `cancel_inner` panics (defensive measure — panics in async DB
+    /// operations are extremely rare but could occur on OOM or logic bugs).
+    /// Without this guard, a panic between `conn.take()` and
+    /// `release_active()` would permanently leak the `tx_active` counter.
+    fn active_guard(&self) -> TxActiveGuard<'_> {
+        TxActiveGuard { tx: self }
+    }
+
     /// Get a mutable reference to the inner `PgConnection`.
     ///
     /// **Note**: This method borrows `&mut self` and is only used by
@@ -356,11 +367,10 @@ impl PgTransaction {
     pub async fn commit(&mut self) -> Result<()> {
         let txconn = self.conn.take().ok_or(PgStoreError::TxClosed)?;
         self.savepoints.clear();
-        // Note: release_active() is called after COMMIT/RB completes,
-        // so tx_active accurately reflects in-flight transactions.
-        let result = self.commit_inner(txconn).await;
-        self.release_active();
-        result
+        // RAII guard: ensures tx_active is decremented even if
+        // commit_inner panics (panic-safety for tx_active counter).
+        let _guard = self.active_guard();
+        self.commit_inner(txconn).await
     }
 
     async fn commit_inner(&self, txconn: TxConn) -> Result<()> {
@@ -396,11 +406,10 @@ impl PgTransaction {
     pub async fn cancel(&mut self) -> Result<()> {
         let txconn = self.conn.take().ok_or(PgStoreError::TxClosed)?;
         self.savepoints.clear();
-        // Note: release_active() is called after ROLLBACK completes,
-        // so tx_active accurately reflects in-flight transactions.
-        let result = self.cancel_inner(txconn).await;
-        self.release_active();
-        result
+        // RAII guard: ensures tx_active is decremented even if
+        // cancel_inner panics (panic-safety for tx_active counter).
+        let _guard = self.active_guard();
+        self.cancel_inner(txconn).await
     }
 
     async fn cancel_inner(&self, txconn: TxConn) -> Result<()> {
@@ -988,6 +997,22 @@ impl PgTransaction {
     #[must_use]
     pub fn savepoint_depth(&self) -> usize {
         self.savepoints.len()
+    }
+}
+
+/// RAII guard that decrements `tx_active` on drop.
+///
+/// Created by `PgTransaction::active_guard()` to ensure `tx_active` is
+/// always decremented even if `commit_inner` / `cancel_inner` panics.
+/// On the normal (non-panic) path, the guard is simply dropped after
+/// `commit_inner` / `cancel_inner` returns, decrementing the counter.
+struct TxActiveGuard<'a> {
+    tx: &'a PgTransaction,
+}
+
+impl Drop for TxActiveGuard<'_> {
+    fn drop(&mut self) {
+        self.tx.release_active();
     }
 }
 

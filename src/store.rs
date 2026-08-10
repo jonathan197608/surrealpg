@@ -789,9 +789,38 @@ impl PgStore {
                     // Apply session SQL — fatal on failure (unlike vacuum/health_check
                     // which tolerate missing timeouts). begin_direct is on the hot path;
                     // if session SQL fails, subsequent transactions will also fail.
-                    if let Err(e) =
-                        Executor::execute(&mut conn, sqlx::raw_sql(&self.session_sql)).await
-                    {
+                    //
+                    // R30-F1: Wrap session SQL in a timeout matching connect_timeout.
+                    // Without this, a half-open TCP connection (where the TCP handshake
+                    // completed but PG is unresponsive) could cause Executor::execute to
+                    // hang indefinitely — statement_timeout is not yet set at this point
+                    // because session SQL itself sets it.
+                    let session_result = tokio::time::timeout(
+                        self.connect_timeout,
+                        Executor::execute(&mut conn, sqlx::raw_sql(&self.session_sql)),
+                    )
+                    .await;
+                    let session_result = match session_result {
+                        Ok(inner) => inner,
+                        Err(_) => {
+                            let pg_err = PgStoreError::ConnectTimeout(self.connect_timeout);
+                            if attempt <= MAX_RETRIES {
+                                let delay =
+                                    (BASE_DELAY_MS * 2u64.pow(attempt - 1)).min(MAX_DELAY_MS);
+                                warn!(
+                                    attempt,
+                                    max_retries = MAX_RETRIES,
+                                    delay_ms = delay,
+                                    timeout = ?self.connect_timeout,
+                                    "session SQL timed out — retrying"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                                continue;
+                            }
+                            return Err(pg_err);
+                        }
+                    };
+                    if let Err(e) = session_result {
                         warn!(
                             error = %e,
                             "session SQL failed on direct-mode connection — \
