@@ -708,7 +708,7 @@ ALTER TABLE {part} SET (
     /// a pooler, set these at the database or role level
     /// (`ALTER DATABASE … SET …`).
     ///
-    /// # Safety
+    /// # Security
     ///
     /// Memory size strings (`work_mem`, etc.) are validated by
     /// `validate_pg_memory_size` during `from_env()`. Direct construction of

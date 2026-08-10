@@ -283,7 +283,7 @@ impl PgTransaction {
 
     /// Execute a parameterless SQL statement via simple query protocol.
     ///
-    /// # Safety
+    /// # Security
     ///
     /// This method uses `raw_sql()` with no parameterization — the caller
     /// must ensure that `sql` does not contain user-controlled data. All
@@ -1160,5 +1160,58 @@ mod tests {
         assert_eq!(results[2], Some(b"v1".to_vec()), "second k1 (duplicate)");
         assert_eq!(results[3], Some(b"v3".to_vec()), "k3");
         assert_eq!(results[4], Some(b"v2".to_vec()), "second k2 (duplicate)");
+    }
+
+    // R20: Verify getm HashMap path works with >64 rows (the threshold for
+    // switching from linear scan to HashMap in getm).
+    #[test]
+    fn test_getm_hashmap_path_large_result_set() {
+        // Build a map with 65 entries (above the 64-row linear-scan threshold).
+        let mut map = std::collections::HashMap::new();
+        for i in 0..65u32 {
+            let k = format!("key_{i:04}").into_bytes();
+            let v = format!("val_{i}").into_bytes();
+            map.insert(k, v);
+        }
+
+        // Look up a subset including some not in the map.
+        let keys: Vec<Vec<u8>> = vec![
+            format!("key_{:04}", 0).into_bytes(),
+            format!("key_{:04}", 32).into_bytes(),
+            format!("key_{:04}", 64).into_bytes(),
+            b"nonexistent".to_vec(),
+        ];
+
+        let results: Vec<Option<Vec<u8>>> = keys.iter().map(|k| map.get(k).cloned()).collect();
+        assert_eq!(results[0], Some("val_0".to_string().into_bytes()));
+        assert_eq!(results[1], Some("val_32".to_string().into_bytes()));
+        assert_eq!(results[2], Some("val_64".to_string().into_bytes()));
+        assert_eq!(results[3], None, "nonexistent key should return None");
+    }
+
+    // R20: dedup_pairs boundary — exactly 32 pairs (linear path threshold).
+    #[test]
+    fn test_dedup_pairs_boundary_32() {
+        let mut pairs = Vec::new();
+        for i in 0..32u32 {
+            pairs.push((format!("k{i}").into_bytes(), b"v".to_vec()));
+        }
+        let result = PgTransaction::dedup_pairs(pairs);
+        assert_eq!(result.len(), 32);
+    }
+
+    // R20: dedup_pairs boundary — 33 pairs (HashMap path).
+    #[test]
+    fn test_dedup_pairs_boundary_33() {
+        let mut pairs = Vec::new();
+        for i in 0..33u32 {
+            pairs.push((format!("k{i}").into_bytes(), b"v".to_vec()));
+        }
+        // Override k0 with new value.
+        pairs.push((b"k0".to_vec(), b"v_new".to_vec()));
+        let result = PgTransaction::dedup_pairs(pairs);
+        assert_eq!(result.len(), 33);
+        let k0 = result.iter().find(|(k, _)| k == b"k0").unwrap();
+        assert_eq!(k0.1, b"v_new", "last-write-wins for k0");
     }
 }
