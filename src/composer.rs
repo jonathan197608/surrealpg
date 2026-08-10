@@ -37,7 +37,7 @@ use crate::store::PgStore;
 /// Turns `postgresql://user:pass@host:5432/db` into `postgresql://***:***@host:5432/db`.
 /// If the URL cannot be parsed or has no userinfo, returns the original string
 /// with a `(redaction failed)` suffix so the operator knows something is wrong.
-fn redact_url(url: &str) -> String {
+pub(crate) fn redact_url(url: &str) -> String {
     // Find the scheme separator "://"
     let Some(scheme_end) = url.find("://") else {
         return url.to_string();

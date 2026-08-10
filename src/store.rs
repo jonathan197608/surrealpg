@@ -314,9 +314,13 @@ impl PgStore {
         let slow_acquire = config.slow_acquire_threshold_secs;
         let slow_stmts = config.slow_statements_threshold_secs;
 
-        let mut opts: PgConnectOptions = strip_custom_params(url)
-            .parse()
-            .map_err(|e: sqlx::Error| PgStoreError::Postgres(format!("invalid URL: {e}")))?;
+        let mut opts: PgConnectOptions =
+            strip_custom_params(url).parse().map_err(|e: sqlx::Error| {
+                PgStoreError::Postgres(format!(
+                    "invalid URL {}: {e}",
+                    crate::composer::redact_url(url)
+                ))
+            })?;
 
         if let Some(threshold) = slow_stmts {
             opts = opts.log_slow_statements(tracing::log::LevelFilter::Warn, threshold);
@@ -369,9 +373,13 @@ impl PgStore {
             // We must re-parse because `opts` is moved into `ConnectionMode`
             // below. The options are Arc-wrapped internally, so cloning is
             // cheap (no deep copy of the URL string).
-            let opts_hb: PgConnectOptions = strip_custom_params(url)
-                .parse()
-                .map_err(|e: sqlx::Error| PgStoreError::Postgres(format!("invalid URL: {e}")))?;
+            let opts_hb: PgConnectOptions =
+                strip_custom_params(url).parse().map_err(|e: sqlx::Error| {
+                    PgStoreError::Postgres(format!(
+                        "invalid URL {}: {e}",
+                        crate::composer::redact_url(url)
+                    ))
+                })?;
             let opts_boxed = Box::new(opts_hb);
             let keepalive_sql_hb = Arc::clone(&keepalive_sql);
             let session_sql_hb = Arc::clone(&session_sql);
