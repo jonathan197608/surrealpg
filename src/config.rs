@@ -449,6 +449,29 @@ impl PgConfig {
                 "pooler",
                 "hash_partitions",
             ];
+            // sqlx / libpq standard parameters that are NOT consumed by us
+            // but are valid for the underlying PostgreSQL connection. These
+            // should NOT trigger the "unknown URL parameter" warning.
+            const SQLX_KNOWN_PARAMS: &[&str] = &[
+                "sslmode",             // TLS mode (disable/prefer/require/verify-ca/verify-full)
+                "sslrootcert",         // CA certificate file
+                "sslcert",             // Client certificate file
+                "sslkey",              // Client key file
+                "application_name",    // Application name for pg_stat_activity
+                "options",             // Backend command-line options
+                "keepalives",          // Enable TCP keepalives (0/1)
+                "keepalives_idle",     // TCP keepalive idle time (seconds)
+                "keepalives_interval", // TCP keepalive interval (seconds)
+                "keepalives_count",    // TCP keepalive count
+                "user",                // Connection user (also in URL authority)
+                "password",            // Connection password (also in URL authority)
+                "dbname",              // Database name (also in URL path)
+                "host",                // Host address (also in URL authority)
+                "port",                // Host port (also in URL authority)
+                "connect_timeout",     // Deprecated alias — handled as our custom param above
+                "statement_timeout",   // Statement timeout (milliseconds)
+                "tcp_user_timeout",    // TCP user timeout (milliseconds)
+            ];
             for pair in query.split('&') {
                 if let Some((key, value)) = pair.split_once('=') {
                     // B6: Warn on duplicate known parameters.
@@ -609,10 +632,10 @@ impl PgConfig {
                             ),
                         },
                         _ => {
-                            // M5: Warn on unknown URL parameters instead of
-                            // silently ignoring them — helps catch typos
-                            // like `min_connctions=5`.
-                            if !key.is_empty() {
+                            // M5: Warn on truly unknown URL parameters to help
+                            // catch typos like `min_connctions=5`. Parameters
+                            // recognised by sqlx/libpq are silently allowed.
+                            if !key.is_empty() && !SQLX_KNOWN_PARAMS.contains(&key) {
                                 tracing::warn!("unknown URL parameter '{key}', ignoring");
                             }
                         }
@@ -1008,5 +1031,36 @@ mod tests {
             .merge_url_params("postgresql://u:p@h/db?min_connections=0")
             .unwrap();
         assert_eq!(config.min_connections, Some(0));
+    }
+
+    // R46: sqlx/libpq standard parameters should NOT trigger "unknown URL parameter" warning.
+    // These are silently passed through to the underlying connection.
+    #[test]
+    fn test_sqlx_params_not_warned() {
+        // sslmode is the most commonly reported parameter — it should be silently accepted.
+        let mut config = PgConfig::default();
+        config
+            .merge_url_params("postgresql://u:p@h/db?sslmode=require&application_name=myapp")
+            .unwrap();
+        // sslmode and application_name are sqlx params — they are NOT stored in PgConfig
+        // (we don't consume them), but they should not trigger a warning either.
+        assert_eq!(
+            config.max_connections, None,
+            "sqlx params should not affect PgConfig"
+        );
+
+        // A truly unknown/typo parameter should still be warned about.
+        // (We can't easily assert on the tracing::warn output in a unit test,
+        //  but at least verify the function completes without error.)
+        let mut config2 = PgConfig::default();
+        config2
+            .merge_url_params("postgresql://u:p@h/db?min_connctions=5")
+            .unwrap();
+        // min_connctions is a typo — NOT in KNOWN_PARAMS or SQLX_KNOWN_PARAMS
+        // It will emit a warn, but the function still succeeds.
+        assert_eq!(
+            config2.min_connections, None,
+            "typo param should not set min_connections"
+        );
     }
 }
