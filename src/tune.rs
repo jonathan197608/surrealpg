@@ -927,7 +927,8 @@ fn validate_toast_storage(v: &str) -> bool {
 
 fn env_bool(key: &str, default: bool) -> bool {
     match std::env::var(key) {
-        Ok(v) => {
+        Ok(raw) => {
+            let v = raw.trim();
             let lower = v.to_ascii_lowercase();
             if matches!(lower.as_str(), "true" | "1" | "yes" | "on") {
                 true

@@ -1179,7 +1179,7 @@ impl PgStore {
                                     continue;
                                 }
                                 return Err(PgStoreError::Other(format!(
-                                    "begin_direct: session SQL timed out after {attempt} attempts (last: {pg_err})"
+                                    "health_check: SELECT 1 failed after {attempt} attempts (last: {pg_err})"
                                 )));
                             }
                             if attempt > 1 {
