@@ -154,14 +154,20 @@ fn strip_custom_params(url: &str) -> String {
         None => (query, ""),
     };
 
-    let filtered: String = query_part
-        .split('&')
-        .filter(|pair| {
-            let key = pair.split_once('=').map(|(k, _)| k).unwrap_or(pair);
-            !CUSTOM_PARAMS.contains(&key)
-        })
-        .collect::<Vec<_>>()
-        .join("&");
+    // R55-M1: Avoid intermediate Vec<String> allocation — build the filtered
+    // query string directly with a single String buffer.
+    let mut filtered = String::with_capacity(query_part.len());
+    let mut first = true;
+    for pair in query_part.split('&') {
+        let key = pair.split_once('=').map(|(k, _)| k).unwrap_or(pair);
+        if !CUSTOM_PARAMS.contains(&key) {
+            if !first {
+                filtered.push('&');
+            }
+            filtered.push_str(pair);
+            first = false;
+        }
+    }
 
     // R2-H1: When all custom params are stripped and nothing remains,
     // omit the trailing '?' — a bare '?' is semantically "empty query
