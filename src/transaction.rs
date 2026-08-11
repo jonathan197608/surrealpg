@@ -22,9 +22,10 @@ pub type Val = Vec<u8>;
 
 /// Maximum number of key-value pairs per `setm` batch.
 ///
-/// PostgreSQL limits each query to 65,535 parameters. `setm` binds 2 array
-/// parameters (keys + vals), so each array can hold at most ~32,767 elements.
-/// We use 32,000 as a conservative limit to leave headroom.
+/// `setm` uses only 2 PG protocol parameters (two arrays via UNNEST),
+/// so the 65,535 protocol-parameter limit is not a concern. However, very
+/// large arrays can cause excessive server-side memory usage and slow
+/// query planning. 32,000 is a practical safeguard, not a protocol limit.
 //
 // O2: setm parameter-limit protection.
 const SETM_MAX_PAIRS: usize = 32_000;
@@ -594,11 +595,19 @@ impl PgTransaction {
         while start < total {
             let end = start.saturating_add(SETM_MAX_PAIRS).min(total);
             if let Err(e) = self.setm_batch(&pairs[start..end]).await {
-                return Err(PgStoreError::Other(format!(
-                    "setm chunked failed at chunk {}/{total_chunks} \
-                     ({start} pairs already buffered in transaction): {e}",
-                    chunk_idx + 1,
-                )));
+                // R49-M1: Preserve the original error type (e.g.
+                // SerializationFailure, Deadlock) so that is_transient()
+                // and SurrealDB's retry logic work correctly. Log chunk
+                // context via debug! instead of wrapping into Other(...)
+                // which would lose the transient classification.
+                debug!(
+                    chunk_idx = chunk_idx + 1,
+                    total_chunks,
+                    pairs_buffered = start,
+                    error = %e,
+                    "setm chunked failed — preserving original error type"
+                );
+                return Err(e);
             }
             chunk_idx += 1;
             start = end;
@@ -963,7 +972,13 @@ impl PgTransaction {
     pub async fn new_save_point(&mut self) -> Result<()> {
         let name = self.push_savepoint_name();
         let sql = Self::savepoint_sql("SAVEPOINT ", &name);
-        self.execute_simple(&sql, None).await?;
+        // R49-S1: If SAVEPOINT SQL fails (e.g. network error), pop the name
+        // back off the stack — PG doesn't have this savepoint, so our stack
+        // must not keep it.
+        if let Err(e) = self.execute_simple(&sql, None).await {
+            self.savepoints.pop();
+            return Err(e);
+        }
         debug!(savepoint = %name, "savepoint created");
         Ok(())
     }
@@ -974,7 +989,13 @@ impl PgTransaction {
             return Ok(());
         };
         let sql = Self::savepoint_sql("RELEASE SAVEPOINT ", &name);
-        self.execute_simple(&sql, None).await?;
+        // R49-S2: If RELEASE fails, push the name back so the stack stays
+        // consistent with PG state (the savepoint still exists on the PG
+        // side because RELEASE failed). Same pattern as rollback_to_save_point.
+        if let Err(e) = self.execute_simple(&sql, None).await {
+            self.savepoints.push(name);
+            return Err(e);
+        }
         debug!(savepoint = %name, "savepoint released");
         Ok(())
     }
@@ -992,7 +1013,12 @@ impl PgTransaction {
         };
         let rollback_sql = Self::savepoint_sql("ROLLBACK TO SAVEPOINT ", &name);
         let release_sql = Self::savepoint_sql("RELEASE SAVEPOINT ", &name);
-        self.execute_simple(&rollback_sql, None).await?;
+        // R49-S3: If ROLLBACK TO fails, push the name back so the stack
+        // stays consistent with PG state (the savepoint still exists).
+        if let Err(e) = self.execute_simple(&rollback_sql, None).await {
+            self.savepoints.push(name);
+            return Err(e);
+        }
         // M1: If RELEASE fails, push the name back so the stack stays
         // consistent with PG state. The caller can retry release_last_save_point
         // or rollback_to_save_point again.
