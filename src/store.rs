@@ -454,8 +454,9 @@ impl PgStore {
                         if let Err(e) = Executor::execute(conn, sqlx::raw_sql(&sql)).await {
                             warn!(
                                 error = %e,
-                                "session SQL failed in after_connect (non-fatal, but \
-                                 statement_timeout/lock_timeout will not be set)"
+                                "session SQL failed in after_connect — connection \
+                                 will be rejected (statement_timeout/lock_timeout \
+                                 not set for this connection)"
                             );
                             return Err(e);
                         }
@@ -753,6 +754,11 @@ impl PgStore {
                     }
 
                     if !pg_err.is_transient() || attempt > BEGIN_MAX_RETRIES {
+                        if attempt > 1 {
+                            return Err(PgStoreError::Other(format!(
+                                "begin_pooled failed after {attempt} attempts (last error: {pg_err})"
+                            )));
+                        }
                         return Err(pg_err);
                     }
 
@@ -873,6 +879,11 @@ impl PgStore {
                             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                             continue;
                         }
+                        if attempt > 1 {
+                            return Err(PgStoreError::Other(format!(
+                                "begin_direct: session SQL failed after {attempt} attempts (last: {pg_err})"
+                            )));
+                        }
                         return Err(pg_err);
                     }
 
@@ -907,6 +918,11 @@ impl PgStore {
                                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                                 continue;
                             }
+                            if attempt > 1 {
+                                return Err(PgStoreError::Other(format!(
+                                    "begin_direct: BEGIN failed after {attempt} attempts (last: {pg_err})"
+                                )));
+                            }
                             return Err(pg_err);
                         }
                     }
@@ -939,6 +955,11 @@ impl PgStore {
                         );
                         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                         continue;
+                    }
+                    if attempt > 1 {
+                        return Err(PgStoreError::Other(format!(
+                            "begin_direct: TCP connect failed after {attempt} attempts (last: {e})"
+                        )));
                     }
                     return Err(e);
                 }
@@ -1157,7 +1178,9 @@ impl PgStore {
                                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                     continue;
                                 }
-                                return Err(pg_err);
+                                return Err(PgStoreError::Other(format!(
+                                    "begin_direct: session SQL timed out after {attempt} attempts (last: {pg_err})"
+                                )));
                             }
                             if attempt > 1 {
                                 debug!(attempt, "health_check succeeded after retry");

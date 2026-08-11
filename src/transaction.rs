@@ -588,10 +588,19 @@ impl PgTransaction {
 
         // Process in chunks of SETM_MAX_PAIRS.
         let total = pairs.len();
+        let total_chunks = total.div_ceil(SETM_MAX_PAIRS);
         let mut start = 0;
+        let mut chunk_idx = 0;
         while start < total {
             let end = start.saturating_add(SETM_MAX_PAIRS).min(total);
-            self.setm_batch(&pairs[start..end]).await?;
+            if let Err(e) = self.setm_batch(&pairs[start..end]).await {
+                return Err(PgStoreError::Other(format!(
+                    "setm chunked failed at chunk {}/{total_chunks} \
+                     ({start} pairs already buffered in transaction): {e}",
+                    chunk_idx + 1,
+                )));
+            }
+            chunk_idx += 1;
             start = end;
         }
         trace!(
