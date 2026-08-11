@@ -202,6 +202,10 @@ fn verify_partition_count(table: &str, expected: u32, actual: i64) -> Result<()>
     }
 }
 
+/// Constant shutdown-barrier message — shared by `begin()`, `begin_pooled()`,
+/// and `begin_direct()` to avoid duplicating the string literal.
+const SHUTTING_DOWN_MSG: &str = "PgStore is shutting down — new transactions are refused";
+
 impl PgStore {
     /// Create a new `PgStore` from a PostgreSQL connection URL.
     ///
@@ -370,17 +374,16 @@ impl PgStore {
             let cancel = CancellationToken::new();
             let interval = tune.keepalive_idle;
             // Clone the parsed PgConnectOptions for the heartbeat task.
-            // We must re-parse because `opts` is moved into `ConnectionMode`
-            // below. The options are Arc-wrapped internally, so cloning is
-            // cheap (no deep copy of the URL string).
-            let opts_hb: PgConnectOptions =
-                strip_custom_params(url).parse().map_err(|e: sqlx::Error| {
-                    PgStoreError::Postgres(format!(
-                        "invalid URL {}: {e}",
-                        crate::composer::redact_url(url)
-                    ))
-                })?;
-            let opts_boxed = Box::new(opts_hb);
+            // `opts` hasn't been moved yet — it's consumed into `ConnectionMode`
+            // below. Cloning is cheap: PgConnectOptions is Arc-wrapped internally,
+            // so the URL string is shared (no deep copy). This avoids a redundant
+            // `strip_custom_params` + URL parse round-trip.
+            //
+            // Note: `opts` may have `log_slow_statements` configured (from URL
+            // param `slow_statements_threshold_secs`). The heartbeat inherits this
+            // — if SELECT 1 exceeds the threshold, a slow-statement warning is
+            // logged, which is actually useful for diagnosing pooler latency.
+            let opts_boxed = Box::new(opts.clone());
             let keepalive_sql_hb = Arc::clone(&keepalive_sql);
             let session_sql_hb = Arc::clone(&session_sql);
             let cancel_clone = cancel.clone();
@@ -667,9 +670,7 @@ impl PgStore {
         // R22-F1: Use Acquire ordering — pairs with Release store in shutdown()
         // to ensure the barrier is visible on weak-memory architectures (ARM).
         if self.shutting_down.load(AtomicOrdering::Acquire) {
-            return Err(PgStoreError::Other(
-                "PgStore is shutting down — new transactions are refused".to_string(),
-            ));
+            return Err(PgStoreError::Other(SHUTTING_DOWN_MSG.to_string()));
         }
         match &self.mode {
             ConnectionMode::Pooled(pool) => self.begin_pooled(pool, write).await,
@@ -697,9 +698,7 @@ impl PgStore {
             // creating a new connection. R22-F1: Acquire ordering pairs with
             // Release store in shutdown() for correct cross-thread visibility.
             if self.shutting_down.load(AtomicOrdering::Acquire) {
-                return Err(PgStoreError::Other(
-                    "PgStore is shutting down — new transactions are refused".to_string(),
-                ));
+                return Err(PgStoreError::Other(SHUTTING_DOWN_MSG.to_string()));
             }
 
             // begin_with() requires Cow<'static, str> — we must own the
@@ -796,9 +795,7 @@ impl PgStore {
             // was called during the backoff sleep, don't waste resources
             // creating a new connection. R22-F1: Acquire ordering.
             if self.shutting_down.load(AtomicOrdering::Acquire) {
-                return Err(PgStoreError::Other(
-                    "PgStore is shutting down — new transactions are refused".to_string(),
-                ));
+                return Err(PgStoreError::Other(SHUTTING_DOWN_MSG.to_string()));
             }
 
             match connect_direct(opts, self.connect_timeout).await {
