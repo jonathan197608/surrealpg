@@ -1156,7 +1156,7 @@ impl PgStore {
                 // retry with a short delay catches transient network blips
                 // without adding significant latency to the steady-state case.
                 let mut attempt = 0;
-                const MAX_RETRIES: u32 = 2;
+                const MAX_ATTEMPTS: u32 = 2;
                 loop {
                     attempt += 1;
                     match connect_direct(opts, self.connect_timeout).await {
@@ -1165,10 +1165,10 @@ impl PgStore {
                                 Executor::execute(&mut conn, sqlx::raw_sql("SELECT 1")).await
                             {
                                 let pg_err = PgStoreError::from_sqlx(None, &e);
-                                if pg_err.is_transient() && attempt < MAX_RETRIES {
+                                if pg_err.is_transient() && attempt < MAX_ATTEMPTS {
                                     warn!(
                                         attempt,
-                                        max_retries = MAX_RETRIES,
+                                        max_attempts = MAX_ATTEMPTS,
                                         error = %pg_err,
                                         "health_check SELECT 1 failed (transient) — retrying"
                                     );
@@ -1185,15 +1185,20 @@ impl PgStore {
                             return Ok(());
                         }
                         Err(e) => {
-                            if e.is_transient() && attempt < MAX_RETRIES {
+                            if e.is_transient() && attempt < MAX_ATTEMPTS {
                                 warn!(
                                     attempt,
-                                    max_retries = MAX_RETRIES,
+                                    max_attempts = MAX_ATTEMPTS,
                                     error = %e,
                                     "health_check connect failed (transient) — retrying"
                                 );
                                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                 continue;
+                            }
+                            if attempt > 1 {
+                                return Err(PgStoreError::Other(format!(
+                                    "health_check: connect failed after {attempt} attempts (last: {e})"
+                                )));
                             }
                             return Err(e);
                         }

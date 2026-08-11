@@ -452,25 +452,33 @@ impl PgConfig {
             // sqlx / libpq standard parameters that are NOT consumed by us
             // but are valid for the underlying PostgreSQL connection. These
             // should NOT trigger the "unknown URL parameter" warning.
+            // Note: connect_timeout is NOT listed here because it is
+            // intercepted in the match above (KNOWN_PARAMS) and stripped
+            // from the URL before sqlx sees it — it would be dead code here.
             const SQLX_KNOWN_PARAMS: &[&str] = &[
-                "sslmode",             // TLS mode (disable/prefer/require/verify-ca/verify-full)
-                "sslrootcert",         // CA certificate file
-                "sslcert",             // Client certificate file
-                "sslkey",              // Client key file
-                "application_name",    // Application name for pg_stat_activity
-                "options",             // Backend command-line options
-                "keepalives",          // Enable TCP keepalives (0/1)
-                "keepalives_idle",     // TCP keepalive idle time (seconds)
-                "keepalives_interval", // TCP keepalive interval (seconds)
-                "keepalives_count",    // TCP keepalive count
-                "user",                // Connection user (also in URL authority)
-                "password",            // Connection password (also in URL authority)
-                "dbname",              // Database name (also in URL path)
-                "host",                // Host address (also in URL authority)
-                "port",                // Host port (also in URL authority)
-                "connect_timeout",     // Deprecated alias — handled as our custom param above
-                "statement_timeout",   // Statement timeout (milliseconds)
-                "tcp_user_timeout",    // TCP user timeout (milliseconds)
+                "sslmode",              // TLS mode (disable/prefer/require/verify-ca/verify-full)
+                "sslrootcert",          // CA certificate file
+                "sslcert",              // Client certificate file
+                "sslkey",               // Client key file
+                "application_name",     // Application name for pg_stat_activity
+                "options",              // Backend command-line options
+                "keepalives",           // Enable TCP keepalives (0/1)
+                "keepalives_idle",      // TCP keepalive idle time (seconds)
+                "keepalives_interval",  // TCP keepalive interval (seconds)
+                "keepalives_count",     // TCP keepalive count
+                "user",                 // Connection user (also in URL authority)
+                "password",             // Connection password (also in URL authority)
+                "dbname",               // Database name (also in URL path)
+                "host",                 // Host address (also in URL authority)
+                "port",                 // Host port (also in URL authority)
+                "statement_timeout",    // Statement timeout (milliseconds)
+                "tcp_user_timeout",     // TCP user timeout (milliseconds)
+                "gssencmode",           // GSSAPI encryption mode (PG 12+)
+                "channel_binding",      // Channel binding preference (PG 13+)
+                "target_session_attrs", // Target session attributes (PG 10+)
+                "service",              // pg_service.conf service name
+                "passfile",             // Password file path
+                "requiressl",           // Legacy SSL parameter (1=require)
             ];
             for pair in query.split('&') {
                 if let Some((key, value)) = pair.split_once('=') {
@@ -640,6 +648,15 @@ impl PgConfig {
                             }
                         }
                     }
+                } else if KNOWN_PARAMS.contains(&pair) {
+                    // Bare custom param without '=' (e.g. "?pooler" instead of
+                    // "?pooler=true") — strip_custom_params will remove it from
+                    // the URL, so the user's intent is silently lost. Warn so
+                    // they know to add an explicit value.
+                    tracing::warn!(
+                        "URL parameter '{pair}' has no value (missing '='), \
+                         ignoring — use ?{pair}=true"
+                    );
                 }
             }
         }
@@ -1061,6 +1078,43 @@ mod tests {
         assert_eq!(
             config2.min_connections, None,
             "typo param should not set min_connections"
+        );
+    }
+
+    // R47-L3: bare custom params (no '=') should be warned about.
+    // "?pooler" is stripped from the URL by strip_custom_params but
+    // silently ignored by merge_url_params — the user gets no feedback.
+    #[test]
+    fn test_bare_custom_param_warned() {
+        let mut config = PgConfig::default();
+        // "pooler" without '=' — should not set config.pooler (no value provided)
+        config
+            .merge_url_params("postgresql://u:p@h/db?pooler")
+            .unwrap();
+        assert!(
+            !config.pooler,
+            "bare 'pooler' param without value should not enable pooler mode"
+        );
+
+        // "?sslmode" is a bare sqlx param — not our custom param, so no warn
+        // (it's passed through to sqlx which may or may not handle it)
+        let mut config2 = PgConfig::default();
+        config2
+            .merge_url_params("postgresql://u:p@h/db?sslmode")
+            .unwrap();
+        assert!(!config2.pooler);
+    }
+
+    // R47-L4: additional libpq params should not trigger unknown-parameter warnings
+    #[test]
+    fn test_additional_libpq_params_not_warned() {
+        let mut config = PgConfig::default();
+        config
+            .merge_url_params("postgresql://u:p@h/db?gssencmode=prefer&channel_binding=prefer&target_session_attrs=read-write&service=prod&passfile=/tmp/.pgpass")
+            .unwrap();
+        assert_eq!(
+            config.max_connections, None,
+            "libpq params should not affect PgConfig"
         );
     }
 }
