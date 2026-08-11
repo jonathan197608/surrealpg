@@ -8,7 +8,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use surrealdb_core::kvs::{self, Key, KeysResult, ScanResult, Transactable, Val};
+use surrealdb_core::kvs::{self, GetMultiResult, Key, KeysResult, ScanResult, Transactable, Val};
 use tokio::sync::Mutex;
 use tracing::debug;
 
@@ -234,6 +234,31 @@ impl Transactable for PgTx {
         })
     }
 
+    // R51-M1: Override getm() with PG-native batch implementation (WHERE key = ANY($1))
+    // instead of the trait default which calls get() per key (N round-trips).
+    fn getm(
+        &self,
+        keys: Vec<Key>,
+        version: Option<u64>,
+    ) -> BoxFut<'_, kvs::Result<GetMultiResult>> {
+        Box::pin(async move {
+            Self::check_version(version)?;
+            let mut guard = self.lock().await?;
+            let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
+            let values = tx.getm(keys).await.map_err(kvs::Error::from)?;
+            let records = values.iter().filter(|v| v.is_some()).count() as u64;
+            let value_bytes = values
+                .iter()
+                .map(|v| v.as_ref().map_or(0, |v| v.len() as u64))
+                .sum();
+            Ok(GetMultiResult {
+                values,
+                records,
+                value_bytes,
+            })
+        })
+    }
+
     fn set(&self, key: Key, val: Val) -> BoxFut<'_, kvs::Result<()>> {
         Box::pin(async move {
             let mut guard = self.lock_write().await?;
@@ -271,6 +296,16 @@ impl Transactable for PgTx {
             let mut guard = self.lock_write().await?;
             let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
             tx.delc(key, chk).await.map_err(kvs::Error::from)
+        })
+    }
+
+    // R51-M2: Override delr() with PG-native range DELETE (WHERE key >= $1 AND key < $2)
+    // instead of the trait default which scans keys then deletes one-by-one (N+1 round-trips).
+    fn delr(&self, rng: std::ops::Range<Key>) -> BoxFut<'_, kvs::Result<()>> {
+        Box::pin(async move {
+            let mut guard = self.lock_write().await?;
+            let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
+            tx.delr(rng).await.map_err(kvs::Error::from)
         })
     }
 
@@ -349,6 +384,22 @@ impl Transactable for PgTx {
                 key_bytes,
                 value_bytes,
             })
+        })
+    }
+
+    // R51-M3: Override count() with PG-native SELECT count(*) instead of
+    // the trait default which scans all keys into memory via batch_keys().
+    fn count(
+        &self,
+        rng: std::ops::Range<Key>,
+        version: Option<u64>,
+    ) -> BoxFut<'_, kvs::Result<usize>> {
+        Box::pin(async move {
+            Self::check_version(version)?;
+            let mut guard = self.lock().await?;
+            let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
+            let cnt = tx.count(rng).await.map_err(kvs::Error::from)?;
+            Ok(cnt as usize)
         })
     }
 
