@@ -216,7 +216,14 @@ impl PgTuneConfig {
             keepalive_interval: env_duration_nonzero("PG_TUNED_KEEPALIVE_INTERVAL", 10),
             keepalive_count: {
                 let v = env_u32("PG_TUNED_KEEPALIVE_COUNT", 5);
-                if v > 100 {
+                if v == 0 {
+                    warn!(
+                        env = "PG_TUNED_KEEPALIVE_COUNT",
+                        "keepalive_count=0 disables TCP keepalive probes; \
+                         dead connections may not be detected, using default 5"
+                    );
+                    5
+                } else if v > 100 {
                     warn!(
                         env = "PG_TUNED_KEEPALIVE_COUNT",
                         value = v,
@@ -420,6 +427,13 @@ impl PgTuneConfig {
                 let v = env_f64("PG_TUNED_SERVER_RANDOM_PAGE_COST", 1.1);
                 if !v.is_finite() {
                     warn!(env = "PG_TUNED_SERVER_RANDOM_PAGE_COST", value = %v, "NaN/Infinity not allowed, using default 1.1");
+                    1.1
+                } else if v <= 0.0 {
+                    warn!(
+                        env = "PG_TUNED_SERVER_RANDOM_PAGE_COST",
+                        value = v,
+                        "must be > 0 (PG rejects zero/negative), using default 1.1"
+                    );
                     1.1
                 } else {
                     v
@@ -742,6 +756,12 @@ ALTER TABLE {part} SET (
             "server_random_page_cost must be finite, got {}",
             self.server_random_page_cost
         );
+        // H2: PG requires random_page_cost > 0 (zero/negative is invalid).
+        assert!(
+            self.server_random_page_cost > 0.0,
+            "server_random_page_cost must be > 0, got {}",
+            self.server_random_page_cost
+        );
         // F5: Defense-in-depth — stats_target must be in [-1, 10000].
         // from_env() validates this, but pub fields allow direct construction
         // with out-of-range values that would produce invalid SQL.
@@ -810,39 +830,48 @@ SET effective_cache_size = '{ecs}';"#,
 
 fn env_u32(key: &str, default: u32) -> u32 {
     match std::env::var(key) {
-        Ok(ref v) => match v.parse() {
-            Ok(val) => val,
-            Err(_) => {
-                warn!(env = key, value = %v, "failed to parse as u32, using default {default}");
-                default
+        Ok(ref raw) => {
+            let v = raw.trim();
+            match v.parse() {
+                Ok(val) => val,
+                Err(_) => {
+                    warn!(env = key, value = %v, "failed to parse as u32, using default {default}");
+                    default
+                }
             }
-        },
+        }
         Err(_) => default,
     }
 }
 
 fn env_i32(key: &str, default: i32) -> i32 {
     match std::env::var(key) {
-        Ok(ref v) => match v.parse() {
-            Ok(val) => val,
-            Err(_) => {
-                warn!(env = key, value = %v, "failed to parse as i32, using default {default}");
-                default
+        Ok(ref raw) => {
+            let v = raw.trim();
+            match v.parse() {
+                Ok(val) => val,
+                Err(_) => {
+                    warn!(env = key, value = %v, "failed to parse as i32, using default {default}");
+                    default
+                }
             }
-        },
+        }
         Err(_) => default,
     }
 }
 
 fn env_f64(key: &str, default: f64) -> f64 {
     match std::env::var(key) {
-        Ok(ref v) => match v.parse() {
-            Ok(val) => val,
-            Err(_) => {
-                warn!(env = key, value = %v, "failed to parse as f64, using default {default}");
-                default
+        Ok(ref raw) => {
+            let v = raw.trim();
+            match v.parse() {
+                Ok(val) => val,
+                Err(_) => {
+                    warn!(env = key, value = %v, "failed to parse as f64, using default {default}");
+                    default
+                }
             }
-        },
+        }
         Err(_) => default,
     }
 }
@@ -1820,5 +1849,91 @@ mod tests {
         assert!(sql.contains("statement_timeout = '30s'"));
         assert!(sql.contains("idle_in_transaction_session_timeout = '60s'"));
         assert!(sql.contains("lock_timeout = '10s'"));
+    }
+
+    // H2: random_page_cost=0 or negative should fall back to default 1.1
+    #[test]
+    fn test_random_page_cost_nonpositive_fallback() {
+        unsafe { std::env::set_var("PG_TUNED_SERVER_RANDOM_PAGE_COST", "0") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.server_random_page_cost, 1.1,
+            "random_page_cost=0 should fall back to 1.1"
+        );
+
+        unsafe { std::env::set_var("PG_TUNED_SERVER_RANDOM_PAGE_COST", "-1.5") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.server_random_page_cost, 1.1,
+            "negative random_page_cost should fall back to 1.1"
+        );
+
+        // Valid positive value should pass through
+        unsafe { std::env::set_var("PG_TUNED_SERVER_RANDOM_PAGE_COST", "2.0") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.server_random_page_cost, 2.0, "2.0 should pass through");
+
+        unsafe { std::env::remove_var("PG_TUNED_SERVER_RANDOM_PAGE_COST") };
+    }
+
+    // H2: session_sql defense-in-depth rejects random_page_cost <= 0
+    #[test]
+    #[should_panic(expected = "server_random_page_cost must be > 0")]
+    fn test_session_sql_rejects_zero_random_page_cost() {
+        let c = PgTuneConfig {
+            server_random_page_cost: 0.0,
+            ..PgTuneConfig::default()
+        };
+        let _ = c.session_sql();
+    }
+
+    #[test]
+    #[should_panic(expected = "server_random_page_cost must be > 0")]
+    fn test_session_sql_rejects_negative_random_page_cost() {
+        let c = PgTuneConfig {
+            server_random_page_cost: -1.0,
+            ..PgTuneConfig::default()
+        };
+        let _ = c.session_sql();
+    }
+
+    // M3: keepalive_count=0 should fall back to default 5
+    #[test]
+    fn test_keepalive_count_zero_fallback() {
+        unsafe { std::env::set_var("PG_TUNED_KEEPALIVE_COUNT", "0") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(
+            c.keepalive_count, 5,
+            "keepalive_count=0 should fall back to 5"
+        );
+
+        // Valid value should pass through
+        unsafe { std::env::set_var("PG_TUNED_KEEPALIVE_COUNT", "3") };
+        let c = PgTuneConfig::from_env();
+        assert_eq!(c.keepalive_count, 3, "3 should pass through");
+
+        unsafe { std::env::remove_var("PG_TUNED_KEEPALIVE_COUNT") };
+    }
+
+    // H1: env helpers should trim whitespace from environment variables
+    #[test]
+    fn test_env_u32_trims_whitespace() {
+        unsafe { std::env::set_var("TEST_ENV_U32_TRIM", " 42 ") };
+        assert_eq!(env_u32("TEST_ENV_U32_TRIM", 0), 42);
+        unsafe { std::env::remove_var("TEST_ENV_U32_TRIM") };
+    }
+
+    #[test]
+    fn test_env_i32_trims_whitespace() {
+        unsafe { std::env::set_var("TEST_ENV_I32_TRIM", " -10 ") };
+        assert_eq!(env_i32("TEST_ENV_I32_TRIM", 0), -10);
+        unsafe { std::env::remove_var("TEST_ENV_I32_TRIM") };
+    }
+
+    #[test]
+    fn test_env_f64_trims_whitespace() {
+        unsafe { std::env::set_var("TEST_ENV_F64_TRIM", " 1.5 ") };
+        assert_eq!(env_f64("TEST_ENV_F64_TRIM", 0.0), 1.5);
+        unsafe { std::env::remove_var("TEST_ENV_F64_TRIM") };
     }
 }

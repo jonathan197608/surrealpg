@@ -475,16 +475,21 @@ impl PgConfig {
                             ),
                         },
                         "min_connections" => match value.parse::<u32>() {
+                            Ok(0) => {
+                                // M2: min_connections=0 means no idle connections
+                                // maintained — likely a misconfiguration.
+                                tracing::warn!(
+                                    "min_connections=0 means no idle connections will be maintained; \
+                                     this may cause connection storms under load"
+                                );
+                                self.min_connections = Some(0);
+                            }
                             Ok(v) => {
-                                if let Some(max) = self.max_connections
-                                    && v > max
-                                {
-                                    tracing::warn!(
-                                        "min_connections={v} > max_connections={max}, ignoring"
-                                    );
-                                } else {
-                                    self.min_connections = Some(v);
-                                }
+                                // H3: No inline comparison with max_connections here.
+                                // If min is parsed before max (e.g. ?min_connections=50&max_connections=10),
+                                // self.max_connections is still None, so inline comparison is unreliable.
+                                // Post-merge cross-validation below handles the min > max check.
+                                self.min_connections = Some(v);
                             }
                             Err(_) => tracing::warn!(
                                 "min_connections='{value}' is not a valid u32, ignoring"
@@ -593,12 +598,24 @@ impl PgConfig {
                                     "hash_partitions=0 is invalid (must be >= 1), ignoring"
                                 );
                             }
+                            Ok(v) if v > 1024 => {
+                                tracing::warn!(
+                                    "hash_partitions={v} is unreasonably high (>1024), ignoring"
+                                );
+                            }
                             Ok(v) => self.hash_partitions = Some(v),
                             Err(_) => tracing::warn!(
                                 "hash_partitions='{value}' is not a valid u32, ignoring"
                             ),
                         },
-                        _ => {}
+                        _ => {
+                            // M5: Warn on unknown URL parameters instead of
+                            // silently ignoring them — helps catch typos
+                            // like `min_connctions=5`.
+                            if !key.is_empty() {
+                                tracing::warn!("unknown URL parameter '{key}', ignoring");
+                            }
+                        }
                     }
                 }
             }
@@ -964,8 +981,32 @@ mod tests {
             .unwrap();
         assert_eq!(config2.hash_partitions, None, "0 should be ignored");
 
+        // M7: >1024 is invalid
+        let mut config3 = PgConfig::default();
+        config3
+            .merge_url_params("postgresql://u:p@h/db?hash_partitions=2000")
+            .unwrap();
+        assert_eq!(config3.hash_partitions, None, ">1024 should be ignored");
+
+        // Boundary: 1024 is valid
+        let mut config4 = PgConfig::default();
+        config4
+            .merge_url_params("postgresql://u:p@h/db?hash_partitions=1024")
+            .unwrap();
+        assert_eq!(config4.hash_partitions, Some(1024));
+
         // Default is None (use env/default)
-        let config3 = PgConfig::default();
-        assert_eq!(config3.hash_partitions, None);
+        let config5 = PgConfig::default();
+        assert_eq!(config5.hash_partitions, None);
+    }
+
+    // M2: min_connections=0 should be accepted with a warning
+    #[test]
+    fn test_min_connections_zero_warning() {
+        let mut config = PgConfig::default();
+        config
+            .merge_url_params("postgresql://u:p@h/db?min_connections=0")
+            .unwrap();
+        assert_eq!(config.min_connections, Some(0));
     }
 }
