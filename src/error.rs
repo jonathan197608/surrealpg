@@ -139,6 +139,12 @@ impl PgStoreError {
             // reset, corrupted frame from a stale connection). Map to Io so
             // is_transient() returns true.
             sqlx::Error::Protocol(msg) => Self::Io(format!("protocol error: {msg}")),
+            // R56-H1: Pool worker task crashed — typically transient (PG/server
+            // disconnected, pooler restart). Map to Io so is_transient() returns
+            // true and SurrealDB/begin_direct retry logic can kick in.
+            sqlx::Error::WorkerCrashed => {
+                Self::Io("connection pool worker task crashed".to_string())
+            }
             _ => Self::Postgres(format!("{e}")),
         }
     }

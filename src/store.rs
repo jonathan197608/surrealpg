@@ -519,8 +519,17 @@ impl PgStore {
                     let ping_threshold = tune.keepalive_idle;
                     move |conn, meta| {
                         Box::pin(async move {
-                            if meta.idle_for > ping_threshold {
-                                sqlx::Connection::ping(conn).await?;
+                            if meta.idle_for > ping_threshold
+                                && let Err(e) =
+                                    sqlx::Connection::ping(conn).await
+                            {
+                                warn!(
+                                    idle_for_ms = meta.idle_for.as_millis(),
+                                    error = %e,
+                                    "before_acquire: ping failed — \
+                                     stale connection will be dropped"
+                                );
+                                return Err(e);
                             }
                             Ok(true)
                         })
@@ -1419,8 +1428,9 @@ async fn connect_direct_with_session(
         Err(_) => {
             warn!(
                 timeout_ms = connect_timeout.as_millis(),
-                "tcp_keepalive SET timed out on {label} connection (non-fatal, \
-                 half-open TCP suspected) — proceeding without keepalive"
+                "tcp_keepalive SET timed out on {label} connection \
+                 (non-fatal, half-open TCP suspected) — \
+                 proceeding without keepalive"
             );
         }
     }
@@ -1441,8 +1451,9 @@ async fn connect_direct_with_session(
         Err(_) => {
             warn!(
                 timeout_ms = connect_timeout.as_millis(),
-                "session SQL timed out on {label} connection (non-fatal, \
-                 half-open TCP suspected) — proceeding without session SQL"
+                "session SQL timed out on {label} connection \
+                 (non-fatal, half-open TCP suspected) — \
+                 proceeding without session SQL"
             );
         }
     }
