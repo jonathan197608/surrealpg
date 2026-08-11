@@ -453,7 +453,7 @@ impl PgStore {
                     && let Some(c) = &self.cancel
                 {
                     c.cancel();
-                    tracing::info!("heartbeat task cancelled during PgStore::new() cleanup");
+                    info!("heartbeat task cancelled during PgStore::new() cleanup");
                 }
             }
         }
@@ -865,7 +865,7 @@ impl PgStore {
                 return Err(PgStoreError::Other(SHUTTING_DOWN_MSG.to_string()));
             }
 
-            match connect_direct(opts, self.connect_timeout).await {
+            return match connect_direct(opts, self.connect_timeout).await {
                 Ok(mut conn) => {
                     // Apply keepalive (non-fatal).
                     // R31-F1: Wrap in timeout — without this, a half-open TCP
@@ -875,7 +875,7 @@ impl PgStore {
                         self.connect_timeout,
                         Executor::execute(&mut conn, sqlx::raw_sql(&self.keepalive_sql)),
                     )
-                    .await
+                        .await
                     {
                         Ok(Ok(_)) => {}
                         Ok(Err(e)) => {
@@ -904,7 +904,7 @@ impl PgStore {
                         self.connect_timeout,
                         Executor::execute(&mut conn, sqlx::raw_sql(&self.session_sql)),
                     )
-                    .await;
+                        .await;
                     let session_result = match session_result {
                         Ok(inner) => inner,
                         Err(_) => {
@@ -998,14 +998,14 @@ impl PgStore {
                         debug!(attempt, "begin_direct succeeded after retry");
                     }
 
-                    return Ok(PgTransaction::new_direct(
+                    Ok(PgTransaction::new_direct(
                         conn,
                         write,
                         self.config.isolation_level,
                         self.persistent,
                         Arc::clone(&self.sql),
                         Arc::clone(&self.tx_active),
-                    ));
+                    ))
                 }
                 Err(e) => {
                     if e.is_transient() && attempt <= MAX_RETRIES {
@@ -1025,7 +1025,7 @@ impl PgStore {
                             "begin_direct: TCP connect failed after {attempt} attempts (last: {e})"
                         )));
                     }
-                    return Err(e);
+                    Err(e)
                 }
             }
         }
@@ -1236,7 +1236,7 @@ impl PgStore {
                 const MAX_ATTEMPTS: u32 = 2;
                 loop {
                     attempt += 1;
-                    match connect_direct(opts, self.connect_timeout).await {
+                    return match connect_direct(opts, self.connect_timeout).await {
                         Ok(mut conn) => {
                             if let Err(e) =
                                 Executor::execute(&mut conn, sqlx::raw_sql("SELECT 1")).await
@@ -1259,7 +1259,7 @@ impl PgStore {
                             if attempt > 1 {
                                 debug!(attempt, "health_check succeeded after retry");
                             }
-                            return Ok(());
+                            Ok(())
                         }
                         Err(e) => {
                             if e.is_transient() && attempt < MAX_ATTEMPTS {
@@ -1277,7 +1277,7 @@ impl PgStore {
                                     "health_check: connect failed after {attempt} attempts (last: {e})"
                                 )));
                             }
-                            return Err(e);
+                            Err(e)
                         }
                     }
                 }
