@@ -149,21 +149,23 @@ impl Transactable for PgTx {
             if self.done.swap(true, Ordering::AcqRel) {
                 return Err(kvs::Error::TransactionFinished);
             }
-            if let Some(tx) = guard.as_mut()
-                && let Err(e) = tx.cancel().await
-            {
-                // Release the connection even on error — sqlx's Transaction
-                // Drop will auto-rollback and return the connection to the pool.
-                *guard = None;
-                self.tx_rolled_back.fetch_add(1, Ordering::Relaxed);
-                return Err(kvs::Error::from(e));
-            }
-            let had_tx = guard.is_some();
-            *guard = None; // Drop the transaction, returning the connection to the pool
-            if had_tx {
-                // F8: Record rollback in metric counter.
-                self.tx_rolled_back.fetch_add(1, Ordering::Relaxed);
-                debug!("PostgreSQL transaction cancelled");
+            // Take the transaction out while holding the lock, then release
+            // the lock before performing the network I/O (ROLLBACK). This
+            // minimizes lock hold time — other operations see done=true and
+            // return TransactionFinished immediately.
+            let tx_opt = guard.take();
+            drop(guard);
+            if let Some(mut tx) = tx_opt {
+                match tx.cancel().await {
+                    Ok(()) => {
+                        self.tx_rolled_back.fetch_add(1, Ordering::Relaxed);
+                        debug!("PostgreSQL transaction cancelled");
+                    }
+                    Err(e) => {
+                        self.tx_rolled_back.fetch_add(1, Ordering::Relaxed);
+                        return Err(kvs::Error::from(e));
+                    }
+                }
             }
             Ok(())
         })
@@ -185,22 +187,30 @@ impl Transactable for PgTx {
             if self.done.swap(true, Ordering::AcqRel) {
                 return Err(kvs::Error::TransactionFinished);
             }
+            // Take the transaction out while holding the lock, then release
+            // the lock before performing the network I/O (COMMIT). This
+            // minimizes lock hold time — other operations see done=true and
+            // return TransactionFinished immediately.
+            //
+            // Note: done is already set to true via swap above, so closed()
+            // returns true even though COMMIT hasn't been sent yet. This is
+            // correct — once commit() is called, no further operations should
+            // be accepted on this transaction.
+            let tx_opt = guard.take();
+            drop(guard);
             // PG natively supports COMMIT on read-only transactions.
-            if let Some(tx) = guard.as_mut()
-                && let Err(e) = tx.commit().await
-            {
-                // Release the connection even on error (e.g. serialization
-                // conflict). PG auto-rollbacks on COMMIT failure.
-                *guard = None;
-                self.tx_rolled_back.fetch_add(1, Ordering::Relaxed);
-                return Err(kvs::Error::from(e));
-            }
-            let had_tx = guard.is_some();
-            *guard = None;
-            if had_tx {
-                // F8: Record commit in metric counter.
-                self.tx_committed.fetch_add(1, Ordering::Relaxed);
-                debug!("PostgreSQL transaction committed");
+            if let Some(mut tx) = tx_opt {
+                match tx.commit().await {
+                    Ok(()) => {
+                        self.tx_committed.fetch_add(1, Ordering::Relaxed);
+                        debug!("PostgreSQL transaction committed");
+                    }
+                    Err(e) => {
+                        // PG auto-rollbacks on COMMIT failure.
+                        self.tx_rolled_back.fetch_add(1, Ordering::Relaxed);
+                        return Err(kvs::Error::from(e));
+                    }
+                }
             }
             Ok(())
         })

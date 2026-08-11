@@ -969,7 +969,11 @@ impl PgStore {
             cancel.cancel();
             info!("direct-mode heartbeat task cancellation requested");
         }
-        if let Some(handle) = self.heartbeat_handle.lock().await.take() {
+        // Take the JoinHandle out while holding the lock, then drop the
+        // guard before awaiting the handle — avoids holding the Mutex
+        // for up to 15s during heartbeat task shutdown.
+        let handle = self.heartbeat_handle.lock().await.take();
+        if let Some(handle) = handle {
             // The heartbeat task checks cancellation in tokio::select! branches,
             // so it should exit promptly. But if a SELECT 1 or connect is in
             // progress, it may take up to ~10s (HEARTBEAT_TIMEOUT). Give it
