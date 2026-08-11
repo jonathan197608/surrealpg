@@ -73,6 +73,9 @@ pub(crate) struct Sql {
     range_keys_desc: String,
     range_kv_asc: String,
     range_kv_desc: String,
+    // R52: range scan without LIMIT/OFFSET — for getr() which fetches all
+    // keys+vals in a range in a single round-trip.
+    range_kv_all: String,
     // Original table name (for `count_approx` / `pg_class` queries).
     table_name: String,
     // Pre-built parameterised count_approx query (uses $1 for relname).
@@ -126,6 +129,10 @@ impl Sql {
             range_kv_desc: format!(
                 "SELECT key, val FROM {table} WHERE key >= $1 AND key < $2 \
                  ORDER BY key DESC LIMIT $3 OFFSET $4"
+            ),
+            range_kv_all: format!(
+                "SELECT key, val FROM {table} WHERE key >= $1 AND key < $2 \
+                 ORDER BY key ASC"
             ),
             table_name: table.to_string(),
             count_approx: String::from(
@@ -918,6 +925,25 @@ impl PgTransaction {
             skip,
         )
         .await?;
+        Ok(Self::rows_to_pairs(rows))
+    }
+
+    /// Fetch all key-value pairs in a range (ascending, no limit).
+    /// R52: Used by Transactable::getr() override — single round-trip
+    /// instead of the trait default's batch_keys_vals() loop.
+    pub async fn getr(&mut self, rng: Range<Key>) -> Result<Vec<(Key, Val)>> {
+        // Empty range — skip DB round-trip.
+        if rng.start >= rng.end {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
+        let persistent = self.persistent;
+        let rows = Self::build_query(persistent, &self.sql.range_kv_all)
+            .bind(rng.start.as_slice())
+            .bind(rng.end.as_slice())
+            .fetch_all(conn.conn_mut())
+            .await
+            .map_err(|e| PgStoreError::from_sqlx(None, &e))?;
         Ok(Self::rows_to_pairs(rows))
     }
 

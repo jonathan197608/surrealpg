@@ -403,6 +403,38 @@ impl Transactable for PgTx {
         })
     }
 
+    // R52-M1: Override getr() with PG-native single-query range scan (no
+    // LIMIT/OFFSET) instead of the trait default which loops batch_keys_vals()
+    // accumulating all results (same memory, more round-trips).
+    fn getr(
+        &self,
+        rng: std::ops::Range<Key>,
+        version: Option<u64>,
+    ) -> BoxFut<'_, kvs::Result<ScanResult>> {
+        Box::pin(async move {
+            Self::check_version(version)?;
+            let mut guard = self.lock().await?;
+            let tx = guard.as_mut().ok_or(kvs::Error::TransactionFinished)?;
+            let values = tx.getr(rng).await.map_err(kvs::Error::from)?;
+            let key_bytes = values.iter().map(|(k, _)| k.len() as u64).sum();
+            let value_bytes = values.iter().map(|(_, v)| v.len() as u64).sum();
+            Ok(ScanResult {
+                values,
+                key_bytes,
+                value_bytes,
+            })
+        })
+    }
+
+    // R52-M2: Override clrr() — for PG (no versioning), clr(key) = del(key),
+    // so clrr(range) is semantically identical to delr(range) which is already
+    // a single DELETE WHERE key >= $1 AND key < $2. The trait default does
+    // batch_keys() + clr() per key (N+1 round-trips).
+    fn clrr(&self, rng: std::ops::Range<Key>) -> BoxFut<'_, kvs::Result<()>> {
+        // Delegate directly to delr — same SQL, same semantics.
+        self.delr(rng)
+    }
+
     fn new_save_point(&self) -> BoxFut<'_, kvs::Result<()>> {
         Box::pin(async move {
             let mut guard = self.lock().await?;
