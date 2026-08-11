@@ -227,6 +227,20 @@ fn verify_partition_count(table: &str, expected: u32, actual: i64) -> Result<()>
 /// and `begin_direct()` to avoid duplicating the string literal.
 const SHUTTING_DOWN_MSG: &str = "PgStore is shutting down — new transactions are refused";
 
+// R57-L1: Named Duration constants for shutdown / pool operations.
+// These replace inline `Duration::from_secs/ms(…)` literals for readability.
+
+/// Default direct-mode connect timeout when not specified.
+const DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Time to wait for the heartbeat task to exit after cancellation.
+const HEARTBEAT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Time to wait for `pool.close()` before giving up.
+const POOL_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Grace period for in-flight direct-mode transactions during shutdown.
+const DIRECT_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+/// Polling interval when waiting for direct-mode tx_active to reach zero.
+const DIRECT_SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 impl PgStore {
     /// Create a new `PgStore` from a PostgreSQL connection URL.
     ///
@@ -310,10 +324,7 @@ impl PgStore {
         // In pool mode this is unused (Duration::ZERO placeholder).
         let connect_timeout = if config.pooler {
             config.connect_timeout.unwrap_or_else(|| {
-                std::cmp::max(
-                    tune.pool_acquire_timeout,
-                    std::time::Duration::from_secs(30),
-                )
+                std::cmp::max(tune.pool_acquire_timeout, DEFAULT_CONNECT_TIMEOUT)
             })
         } else {
             // Pool mode: connect_timeout is not used — acquire_timeout
@@ -1052,7 +1063,7 @@ impl PgStore {
             // so it should exit promptly. But if a SELECT 1 or connect is in
             // progress, it may take up to ~10s (HEARTBEAT_TIMEOUT). Give it
             // 15s to finish before giving up.
-            match tokio::time::timeout(std::time::Duration::from_secs(15), handle).await {
+            match tokio::time::timeout(HEARTBEAT_SHUTDOWN_TIMEOUT, handle).await {
                 Ok(Ok(())) => info!("direct-mode heartbeat task exited cleanly"),
                 Ok(Err(e)) => warn!(error = %e, "direct-mode heartbeat task exited with error"),
                 Err(_) => {
@@ -1074,7 +1085,7 @@ impl PgStore {
                 // Close the pool with a 30s timeout. Without this, pool.close()
                 // can hang indefinitely if a connection is stuck (e.g. TCP
                 // half-open). Direct mode already has a 30s deadline.
-                match tokio::time::timeout(std::time::Duration::from_secs(30), pool.close()).await {
+                match tokio::time::timeout(POOL_CLOSE_TIMEOUT, pool.close()).await {
                     Ok(()) => {}
                     Err(_) => {
                         warn!("pool.close() timed out after 30s — proceeding with shutdown");
@@ -1099,7 +1110,7 @@ impl PgStore {
                         "shutdown: direct mode with in-flight transactions — \
                          giving 3s grace period before proceeding"
                     );
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    let deadline = std::time::Instant::now() + DIRECT_SHUTDOWN_GRACE;
                     loop {
                         let remaining = self.tx_active.load(AtomicOrdering::Relaxed);
                         if remaining == 0 {
@@ -1108,7 +1119,7 @@ impl PgStore {
                         if std::time::Instant::now() >= deadline {
                             break;
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        tokio::time::sleep(DIRECT_SHUTDOWN_POLL).await;
                     }
                 }
             }
