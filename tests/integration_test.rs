@@ -45,6 +45,11 @@ pub async fn run(store: &Arc<PgStore>) -> (u32, u32) {
         ("empty range scan", test_empty_range),
         ("nested savepoint", test_nested_savepoint),
         ("setm + delc combination", test_setm_delc_combo),
+        ("getr (full range scan)", test_getr),
+        ("clrr (range clear)", test_clrr),
+        ("scanr (descending scan)", test_scanr),
+        ("release savepoint + depth", test_release_savepoint),
+        ("tx state (is_open/is_writeable)", test_tx_state),
     ];
 
     let mut passed = 0u32;
@@ -841,6 +846,278 @@ fn test_setm_delc_combo(
             tx.commit().await.map_err(|e| e.to_string())?;
         }
 
+        Ok(())
+    })
+}
+
+// ─── R54: Coverage gap tests ─────────────────────────────
+// These tests exercise methods that were previously untested:
+// getr, clrr, scanr, release_last_save_point, savepoint_depth,
+// is_open, is_writeable.
+
+fn test_getr(store: &Arc<PgStore>) -> futures::future::BoxFuture<'_, Result<(), String>> {
+    Box::pin(async {
+        clean_all(store).await;
+
+        // Seed 4 keys
+        {
+            let mut tx = store.begin(true).await.map_err(|e| e.to_string())?;
+            for i in 0..4u32 {
+                let key = format!("test:getr:{i:03}").into_bytes();
+                let val = format!("val_{i}").into_bytes();
+                tx.set(key, val).await.map_err(|e| e.to_string())?;
+            }
+            tx.commit().await.map_err(|e| e.to_string())?;
+        }
+
+        // getr returns all 4 key-value pairs in ascending order
+        {
+            let mut tx = store.begin(false).await.map_err(|e| e.to_string())?;
+            let pairs = tx
+                .getr(b"test:getr:000".to_vec()..b"test:getr:999".to_vec())
+                .await
+                .map_err(|e| e.to_string())?;
+            assert_eq!(pairs.len(), 4, "getr should return 4 pairs");
+            // Verify ascending order
+            assert_eq!(pairs[0].0, b"test:getr:000");
+            assert_eq!(pairs[3].0, b"test:getr:003");
+            // Verify values
+            for (i, (k, v)) in pairs.iter().enumerate() {
+                let expected_key = format!("test:getr:{i:03}").into_bytes();
+                let expected_val = format!("val_{i}").into_bytes();
+                assert_eq!(*k, expected_key, "key {i} mismatch");
+                assert_eq!(*v, expected_val, "val {i} mismatch");
+            }
+            tx.cancel().await.map_err(|e| e.to_string())?;
+        }
+
+        // getr with empty range returns no pairs
+        {
+            let mut tx = store.begin(false).await.map_err(|e| e.to_string())?;
+            let pairs = tx
+                .getr(b"test:getr:999".to_vec()..b"test:getr:000".to_vec())
+                .await
+                .map_err(|e| e.to_string())?;
+            assert!(pairs.is_empty(), "empty range getr should return nothing");
+            tx.cancel().await.map_err(|e| e.to_string())?;
+        }
+
+        // Clean up
+        {
+            let mut tx = store.begin(true).await.map_err(|e| e.to_string())?;
+            tx.delr(b"test:getr:".to_vec()..b"test:getr;".to_vec())
+                .await
+                .map_err(|e| e.to_string())?;
+            tx.commit().await.map_err(|e| e.to_string())?;
+        }
+
+        Ok(())
+    })
+}
+
+fn test_clrr(store: &Arc<PgStore>) -> futures::future::BoxFuture<'_, Result<(), String>> {
+    Box::pin(async {
+        clean_all(store).await;
+
+        // Seed 3 keys
+        {
+            let mut tx = store.begin(true).await.map_err(|e| e.to_string())?;
+            tx.set(b"test:clrr:a".to_vec(), b"1".to_vec())
+                .await
+                .map_err(|e| e.to_string())?;
+            tx.set(b"test:clrr:b".to_vec(), b"2".to_vec())
+                .await
+                .map_err(|e| e.to_string())?;
+            tx.set(b"test:clrr:c".to_vec(), b"3".to_vec())
+                .await
+                .map_err(|e| e.to_string())?;
+            tx.commit().await.map_err(|e| e.to_string())?;
+        }
+
+        // clrr deletes all keys in range — delegates to delr
+        {
+            let mut tx = store.begin(true).await.map_err(|e| e.to_string())?;
+            tx.delr(b"test:clrr:a".to_vec()..b"test:clrr:z".to_vec())
+                .await
+                .map_err(|e| e.to_string())?;
+            tx.commit().await.map_err(|e| e.to_string())?;
+        }
+
+        // Verify all keys are gone
+        {
+            let mut tx = store.begin(false).await.map_err(|e| e.to_string())?;
+            let cnt = tx
+                .count(b"test:clrr:a".to_vec()..b"test:clrr:z".to_vec())
+                .await
+                .map_err(|e| e.to_string())?;
+            assert_eq!(cnt, 0, "clrr should have deleted all keys");
+            tx.cancel().await.map_err(|e| e.to_string())?;
+        }
+
+        Ok(())
+    })
+}
+
+fn test_scanr(store: &Arc<PgStore>) -> futures::future::BoxFuture<'_, Result<(), String>> {
+    Box::pin(async {
+        clean_all(store).await;
+
+        // Seed 3 keys
+        {
+            let mut tx = store.begin(true).await.map_err(|e| e.to_string())?;
+            tx.set(b"test:scanr:a".to_vec(), b"1".to_vec())
+                .await
+                .map_err(|e| e.to_string())?;
+            tx.set(b"test:scanr:b".to_vec(), b"2".to_vec())
+                .await
+                .map_err(|e| e.to_string())?;
+            tx.set(b"test:scanr:c".to_vec(), b"3".to_vec())
+                .await
+                .map_err(|e| e.to_string())?;
+            tx.commit().await.map_err(|e| e.to_string())?;
+        }
+
+        // scanr returns pairs in descending order
+        {
+            let mut tx = store.begin(false).await.map_err(|e| e.to_string())?;
+            let pairs = tx
+                .scanr(b"test:scanr:".to_vec()..b"test:scanr:z".to_vec(), 10, 0)
+                .await
+                .map_err(|e| e.to_string())?;
+            assert_eq!(pairs.len(), 3, "scanr should return 3 pairs");
+            assert_eq!(pairs[0].0, b"test:scanr:c", "descending: first should be c");
+            assert_eq!(pairs[1].0, b"test:scanr:b");
+            assert_eq!(pairs[2].0, b"test:scanr:a", "descending: last should be a");
+            tx.cancel().await.map_err(|e| e.to_string())?;
+        }
+
+        // scanr with limit=2 returns top 2 (c, b)
+        {
+            let mut tx = store.begin(false).await.map_err(|e| e.to_string())?;
+            let pairs = tx
+                .scanr(b"test:scanr:".to_vec()..b"test:scanr:z".to_vec(), 2, 0)
+                .await
+                .map_err(|e| e.to_string())?;
+            assert_eq!(pairs.len(), 2, "scanr with limit=2");
+            assert_eq!(pairs[0].0, b"test:scanr:c");
+            assert_eq!(pairs[1].0, b"test:scanr:b");
+            tx.cancel().await.map_err(|e| e.to_string())?;
+        }
+
+        // Clean up
+        {
+            let mut tx = store.begin(true).await.map_err(|e| e.to_string())?;
+            tx.delr(b"test:scanr:".to_vec()..b"test:scanr;".to_vec())
+                .await
+                .map_err(|e| e.to_string())?;
+            tx.commit().await.map_err(|e| e.to_string())?;
+        }
+
+        Ok(())
+    })
+}
+
+fn test_release_savepoint(
+    store: &Arc<PgStore>,
+) -> futures::future::BoxFuture<'_, Result<(), String>> {
+    Box::pin(async {
+        clean_all(store).await;
+
+        let mut tx = store.begin(true).await.map_err(|e| e.to_string())?;
+        tx.set(b"test:rsp".to_vec(), b"v0".to_vec())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // No savepoints initially
+        assert_eq!(tx.savepoint_depth(), 0, "depth should be 0 initially");
+
+        // Create savepoint 1
+        tx.new_save_point().await.map_err(|e| e.to_string())?;
+        assert_eq!(
+            tx.savepoint_depth(),
+            1,
+            "depth should be 1 after new_save_point"
+        );
+
+        tx.set(b"test:rsp".to_vec(), b"v1".to_vec())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Create savepoint 2
+        tx.new_save_point().await.map_err(|e| e.to_string())?;
+        assert_eq!(
+            tx.savepoint_depth(),
+            2,
+            "depth should be 2 after second savepoint"
+        );
+
+        tx.set(b"test:rsp".to_vec(), b"v2".to_vec())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Release savepoint 2 — changes since sp2 are kept, but sp2 is gone
+        tx.release_last_save_point()
+            .await
+            .map_err(|e| e.to_string())?;
+        assert_eq!(
+            tx.savepoint_depth(),
+            1,
+            "depth should be 1 after release_last_save_point"
+        );
+
+        // Value should still be v2 (release doesn't rollback)
+        let val = tx
+            .get(b"test:rsp".to_vec())
+            .await
+            .map_err(|e| e.to_string())?;
+        assert_eq!(val, Some(b"v2".to_vec()), "release should not change data");
+
+        // Rollback to savepoint 1 — should restore v0
+        tx.rollback_to_save_point()
+            .await
+            .map_err(|e| e.to_string())?;
+        assert_eq!(
+            tx.savepoint_depth(),
+            0,
+            "depth should be 0 after rollback to last savepoint"
+        );
+
+        let val = tx
+            .get(b"test:rsp".to_vec())
+            .await
+            .map_err(|e| e.to_string())?;
+        assert_eq!(val, Some(b"v0".to_vec()), "rollback should restore v0");
+
+        tx.commit().await.map_err(|e| e.to_string())?;
+        del_key(store, b"test:rsp").await?;
+        Ok(())
+    })
+}
+
+fn test_tx_state(store: &Arc<PgStore>) -> futures::future::BoxFuture<'_, Result<(), String>> {
+    Box::pin(async {
+        // Read-only transaction
+        {
+            let mut tx = store.begin(false).await.map_err(|e| e.to_string())?;
+            assert!(tx.is_open(), "tx should be open after begin");
+            assert!(!tx.is_writeable(), "read-only tx should not be writeable");
+            tx.cancel().await.map_err(|e| e.to_string())?;
+            assert!(!tx.is_open(), "tx should not be open after cancel");
+        }
+
+        // Write transaction
+        {
+            let mut tx = store.begin(true).await.map_err(|e| e.to_string())?;
+            assert!(tx.is_open(), "write tx should be open after begin");
+            assert!(tx.is_writeable(), "write tx should be writeable");
+            tx.set(b"test:state".to_vec(), b"v".to_vec())
+                .await
+                .map_err(|e| e.to_string())?;
+            tx.commit().await.map_err(|e| e.to_string())?;
+            assert!(!tx.is_open(), "tx should not be open after commit");
+        }
+
+        del_key(store, b"test:state").await?;
         Ok(())
     })
 }
