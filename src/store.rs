@@ -100,6 +100,21 @@ pub struct PgStore {
     heartbeat_interval: std::time::Duration,
 }
 
+// ─── Drop: ensure heartbeat is cancelled even if shutdown() is never called ──
+
+impl Drop for PgStore {
+    fn drop(&mut self) {
+        // R48-L1: If shutdown() was never called (e.g. test code, error path),
+        // the heartbeat task would leak because CancellationToken::drop does
+        // NOT cancel. Cancel here so the task exits on its next select! poll.
+        // PgStore is behind Arc<>, so Drop only fires when the last reference
+        // is released — no risk of premature cancellation during normal use.
+        if let Some(cancel) = &self.heartbeat_cancel {
+            cancel.cancel();
+        }
+    }
+}
+
 // ─── URL sanitization ─────────────────────────────────
 
 /// Custom query parameters that we parse ourselves and must not be
@@ -406,6 +421,29 @@ impl PgStore {
         } else {
             (None, None)
         };
+        // R48-M1: Guard to cancel the heartbeat task if any fallible
+        // operation below fails — without this, the heartbeat leaks
+        // (CancellationToken::drop does NOT cancel, and JoinHandle::drop
+        // detaches the task). The guard is "disarmed" just before Ok() so
+        // it does nothing on the success path.
+        struct HeartbeatGuard {
+            cancel: Option<CancellationToken>,
+            armed: bool,
+        }
+        impl Drop for HeartbeatGuard {
+            fn drop(&mut self) {
+                if self.armed
+                    && let Some(c) = &self.cancel
+                {
+                    c.cancel();
+                    tracing::info!("heartbeat task cancelled during PgStore::new() cleanup");
+                }
+            }
+        }
+        let mut hb_guard = HeartbeatGuard {
+            cancel: heartbeat_cancel.clone(),
+            armed: true,
+        };
         let heartbeat_interval = tune.keepalive_idle;
 
         // ── Branch: pooler (direct) vs pooled ──
@@ -628,6 +666,9 @@ impl PgStore {
             keepalive_ms = tune.keepalive_idle.as_millis(),
             "PgStore created"
         );
+
+        // R48-M1: Disarm the guard — heartbeat will be managed by shutdown().
+        hb_guard.armed = false;
 
         Ok(Arc::new(Self {
             mode,
@@ -999,7 +1040,17 @@ impl PgStore {
             match tokio::time::timeout(std::time::Duration::from_secs(15), handle).await {
                 Ok(Ok(())) => info!("direct-mode heartbeat task exited cleanly"),
                 Ok(Err(e)) => warn!(error = %e, "direct-mode heartbeat task exited with error"),
-                Err(_) => warn!("direct-mode heartbeat task did not exit within 15s — proceeding"),
+                Err(_) => {
+                    // R48-L2: The cancel token was already fired (above), so the
+                    // task will exit on its next select! poll. The JoinHandle
+                    // was consumed by timeout() — the task is now detached.
+                    // In practice this branch should never trigger (all select!
+                    // branches honour cancellation), but if it does, the task
+                    // will self-terminate shortly rather than running forever.
+                    warn!(
+                        "direct-mode heartbeat task did not exit within 15s — detached (cancel already requested)"
+                    );
+                }
             }
         }
 
