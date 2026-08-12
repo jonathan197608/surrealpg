@@ -513,6 +513,13 @@ impl PgConfig {
                             Ok(0) => {
                                 tracing::warn!("max_connections=0 is invalid, ignoring");
                             }
+                            Ok(v) if v > 10_000 => {
+                                tracing::warn!(
+                                    "max_connections={v} is unreasonably high (>10000), \
+                                     capping to 10000"
+                                );
+                                self.max_connections = Some(10_000);
+                            }
                             Ok(v) => self.max_connections = Some(v),
                             Err(_) => tracing::warn!(
                                 "max_connections='{value}' is not a valid u32, ignoring"
@@ -527,6 +534,13 @@ impl PgConfig {
                                      this may cause connection storms under load"
                                 );
                                 self.min_connections = Some(0);
+                            }
+                            Ok(v) if v > 10_000 => {
+                                tracing::warn!(
+                                    "min_connections={v} is unreasonably high (>10000), \
+                                     capping to 10000"
+                                );
+                                self.min_connections = Some(10_000);
                             }
                             Ok(v) => {
                                 // H3: No inline comparison with max_connections here.

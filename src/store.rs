@@ -498,27 +498,68 @@ impl PgStore {
             }
 
             let pool = pool_opts
-                .after_connect(move |conn, _meta| {
-                    let sql = session_sql_for_pool.clone();
-                    let ka = keepalive_sql_for_pool.clone();
-                    Box::pin(async move {
-                        if let Err(e) = Executor::execute(&mut *conn, sqlx::raw_sql(&ka)).await {
-                            warn!(
-                                error = %e,
-                                "tcp_keepalive SET failed (non-fatal, may not be supported by this PG)"
-                            );
-                        }
-                        if let Err(e) = Executor::execute(conn, sqlx::raw_sql(&sql)).await {
-                            warn!(
-                                error = %e,
-                                "session SQL failed in after_connect — connection \
-                                 will be rejected (statement_timeout/lock_timeout \
-                                 not set for this connection)"
-                            );
-                            return Err(e);
-                        }
-                        Ok(())
-                    })
+                .after_connect({
+                    // R61-M1: Wrap keepalive and session SQL in acquire_timeout,
+                    // matching the direct-mode connect_direct_with_session pattern
+                    // (R30-F1/R31-F1). Without this, a half-open TCP connection
+                    // where PG accepts the handshake but doesn't respond to SET
+                    // commands would hang indefinitely (statement_timeout is set
+                    // *by* session SQL — chicken-and-egg).
+                    let timeout = acquire_timeout;
+                    move |conn, _meta| {
+                        let sql = session_sql_for_pool.clone();
+                        let ka = keepalive_sql_for_pool.clone();
+                        Box::pin(async move {
+                            match tokio::time::timeout(
+                                timeout,
+                                Executor::execute(&mut *conn, sqlx::raw_sql(&ka)),
+                            )
+                            .await
+                            {
+                                Ok(Ok(_)) => {}
+                                Ok(Err(e)) => {
+                                    warn!(
+                                        error = %e,
+                                        "tcp_keepalive SET failed in after_connect \
+                                         (non-fatal, may not be supported by this PG)"
+                                    );
+                                }
+                                Err(_) => {
+                                    warn!(
+                                        timeout_ms = timeout.as_millis(),
+                                        "tcp_keepalive SET timed out in after_connect \
+                                         (non-fatal, half-open TCP suspected)"
+                                    );
+                                }
+                            }
+                            match tokio::time::timeout(
+                                timeout,
+                                Executor::execute(conn, sqlx::raw_sql(&sql)),
+                            )
+                            .await
+                            {
+                                Ok(Ok(_)) => Ok(()),
+                                Ok(Err(e)) => {
+                                    warn!(
+                                        error = %e,
+                                        "session SQL failed in after_connect — \
+                                         connection will be rejected"
+                                    );
+                                    Err(e)
+                                }
+                                Err(_) => {
+                                    warn!(
+                                        timeout_ms = timeout.as_millis(),
+                                        "session SQL timed out in after_connect — \
+                                         connection will be rejected"
+                                    );
+                                    Err(sqlx::Error::Protocol(
+                                        "session SQL timed out in after_connect".into(),
+                                    ))
+                                }
+                            }
+                        })
+                    }
                 })
                 .before_acquire({
                     // Use keepalive_idle as the ping threshold: if a connection
@@ -530,8 +571,7 @@ impl PgStore {
                     move |conn, meta| {
                         Box::pin(async move {
                             if meta.idle_for > ping_threshold
-                                && let Err(e) =
-                                    sqlx::Connection::ping(conn).await
+                                && let Err(e) = sqlx::Connection::ping(conn).await
                             {
                                 warn!(
                                     idle_for_ms = meta.idle_for.as_millis(),
