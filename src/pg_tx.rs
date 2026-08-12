@@ -128,8 +128,13 @@ impl Transactable for PgTx {
         "postgres"
     }
 
+    // R58-M1: Use Acquire ordering to pair with the AcqRel swap in commit()/cancel().
+    // On ARM, a Relaxed load may return a stale `false` even after swap(true, AcqRel)
+    // has completed. While subsequent operations are protected by the Mutex (which
+    // provides its own Acquire semantics), `closed()` is a public diagnostic method
+    // that SurrealDB may rely on — it should return accurate results immediately.
     fn closed(&self) -> bool {
-        self.done.load(Ordering::Relaxed)
+        self.done.load(Ordering::Acquire)
     }
 
     fn writeable(&self) -> bool {
