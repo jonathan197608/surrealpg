@@ -1,6 +1,6 @@
 [package]
 name = "surreal-pg"
-version = "0.1.0"
+version = "1.2.1"
 edition = "2024"
 license = "Apache-2.0"
 description = "SurrealDB server with PostgreSQL storage backend — delegates to surrealdb-server::init()"

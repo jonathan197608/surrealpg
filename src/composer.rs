@@ -90,6 +90,13 @@ impl PostgresComposer {
     }
 }
 
+// R63-M3: Manual Debug impl — CommunityComposer may not implement Debug.
+impl fmt::Debug for PostgresComposer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PostgresComposer").finish_non_exhaustive()
+    }
+}
+
 impl Default for PostgresComposer {
     fn default() -> Self {
         Self::new(CommunityComposer::default())

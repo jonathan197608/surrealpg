@@ -3,6 +3,7 @@
 //! This is the core of the backend: every SurrealDB KV operation maps to one
 //! or more SQL statements executed within a single PG transaction.
 
+use std::fmt;
 use std::ops::DerefMut;
 use std::ops::Range;
 use std::sync::Arc;
@@ -209,6 +210,20 @@ pub struct PgTransaction {
     /// diagnostics: pool acquire failures log `tx_active` to show how
     /// many connections are held by in-flight transactions.
     tx_active: Arc<AtomicU64>,
+}
+
+// R63-M2: Manual Debug impl — PgTransaction contains TxConn (pub(crate) enum
+// with sqlx types that don't implement Debug) and Arc<Sql> (no Debug).
+impl fmt::Debug for PgTransaction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PgTransaction")
+            .field("writeable", &self.writeable)
+            .field("persistent", &self.persistent)
+            .field("is_open", &self.conn.is_some())
+            .field("savepoint_depth", &self.savepoints.len())
+            .field("isolation", &self.isolation)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PgTransaction {
