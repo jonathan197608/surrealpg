@@ -466,10 +466,9 @@ impl PgStore {
         // ── Branch: pooler (direct) vs pooled ──
         let mode = if config.pooler {
             info!(
+                timeout_ms = connect_timeout.as_millis(),
                 "pooler=true: using DIRECT connection mode (bypassing sqlx pool). \
-                 Each transaction creates a fresh TCP connection. \
-                 timeout_ms={}",
-                connect_timeout.as_millis()
+                 Each transaction creates a fresh TCP connection."
             );
             ConnectionMode::Direct(Box::new(opts))
         } else {
@@ -793,13 +792,26 @@ impl PgStore {
 
                     if idle == 0 && active == 0 && size > 0 {
                         zombie_detected = true;
+                    }
+
+                    // Compute delay before logging so we can include delay_ms.
+                    let delay = if zombie_detected {
+                        let d = ZOMBIE_BASE_DELAY_MS * 2u64.pow(attempt - 1);
+                        d.min(ZOMBIE_MAX_DELAY_MS)
+                    } else {
+                        let d = BASE_DELAY_MS * 2u64.pow(attempt - 1);
+                        d.min(MAX_DELAY_MS)
+                    };
+
+                    if zombie_detected {
                         warn!(
                             attempt,
-                            max_retries = BEGIN_MAX_RETRIES,
+                            max_attempts = BEGIN_MAX_RETRIES,
                             pool_size = size,
                             pool_idle = idle,
                             pool_max = self.pool_max,
                             tx_active = active,
+                            delay_ms = delay,
                             write,
                             error = %pg_err,
                             "begin_with() failed — ZOMBIE POOL detected. \
@@ -808,33 +820,28 @@ impl PgStore {
                     } else {
                         warn!(
                             attempt,
-                            max_retries = BEGIN_MAX_RETRIES,
+                            max_attempts = BEGIN_MAX_RETRIES,
                             pool_size = size,
                             pool_idle = idle,
                             pool_max = self.pool_max,
                             tx_active = active,
+                            delay_ms = delay,
                             write,
                             error = %pg_err,
-                            "begin_with() failed — pool diagnostics logged"
+                            "begin_with() failed — check PG server status, \
+                             max_connections, or acquire_timeout"
                         );
                     }
 
                     if !pg_err.is_transient() || attempt > BEGIN_MAX_RETRIES {
                         if attempt > 1 {
                             return Err(PgStoreError::Other(format!(
-                                "begin_pooled failed after {attempt} attempts (last error: {pg_err})"
+                                "begin_pooled failed after {attempt} attempts (last: {pg_err})"
                             )));
                         }
                         return Err(pg_err);
                     }
 
-                    let delay = if zombie_detected {
-                        let d = ZOMBIE_BASE_DELAY_MS * 2u64.pow(attempt - 1);
-                        d.min(ZOMBIE_MAX_DELAY_MS)
-                    } else {
-                        let d = BASE_DELAY_MS * 2u64.pow(attempt - 1);
-                        d.min(MAX_DELAY_MS)
-                    };
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 }
             }
@@ -875,7 +882,7 @@ impl PgStore {
                         self.connect_timeout,
                         Executor::execute(&mut conn, sqlx::raw_sql(&self.keepalive_sql)),
                     )
-                        .await
+                    .await
                     {
                         Ok(Ok(_)) => {}
                         Ok(Err(e)) => {
@@ -904,7 +911,7 @@ impl PgStore {
                         self.connect_timeout,
                         Executor::execute(&mut conn, sqlx::raw_sql(&self.session_sql)),
                     )
-                        .await;
+                    .await;
                     let session_result = match session_result {
                         Ok(inner) => inner,
                         Err(_) => {
@@ -914,7 +921,7 @@ impl PgStore {
                                     (BASE_DELAY_MS * 2u64.pow(attempt - 1)).min(MAX_DELAY_MS);
                                 warn!(
                                     attempt,
-                                    max_retries = MAX_RETRIES,
+                                    max_attempts = MAX_RETRIES,
                                     delay_ms = delay,
                                     timeout_ms = self.connect_timeout.as_millis(),
                                     "session SQL timed out — retrying"
@@ -936,7 +943,7 @@ impl PgStore {
                             let delay = (BASE_DELAY_MS * 2u64.pow(attempt - 1)).min(MAX_DELAY_MS);
                             warn!(
                                 attempt,
-                                max_retries = MAX_RETRIES,
+                                max_attempts = MAX_RETRIES,
                                 delay_ms = delay,
                                 "session SQL failed (transient) — retrying"
                             );
@@ -974,7 +981,7 @@ impl PgStore {
                                     (BASE_DELAY_MS * 2u64.pow(attempt - 1)).min(MAX_DELAY_MS);
                                 warn!(
                                     attempt,
-                                    max_retries = MAX_RETRIES,
+                                    max_attempts = MAX_RETRIES,
                                     delay_ms = delay,
                                     error = %pg_err,
                                     "BEGIN failed (transient) — retrying"
@@ -1012,7 +1019,7 @@ impl PgStore {
                         let delay = (BASE_DELAY_MS * 2u64.pow(attempt - 1)).min(MAX_DELAY_MS);
                         warn!(
                             attempt,
-                            max_retries = MAX_RETRIES,
+                            max_attempts = MAX_RETRIES,
                             delay_ms = delay,
                             error = %e,
                             "direct-mode TCP connect failed (transient) — retrying"
@@ -1027,7 +1034,7 @@ impl PgStore {
                     }
                     Err(e)
                 }
-            }
+            };
         }
     }
 
@@ -1279,7 +1286,7 @@ impl PgStore {
                             }
                             Err(e)
                         }
-                    }
+                    };
                 }
             }
         }
