@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use tracing::{info, warn};
+
 /// Percent-decode a URL-encoded string.
 ///
 /// Handles `%XX` sequences (e.g. `%20` → space, `%2F` → `/`) and
@@ -412,14 +414,14 @@ impl PgConfig {
             // (" auto " ≠ "auto").
             let val = raw.trim();
             if let Some(v) = PersistentStatements::parse(val) {
-                tracing::info!(
+                info!(
                     env = "PG_PERSISTENT_STATEMENTS",
                     value = %val,
                     "overriding persistent_statements from environment"
                 );
                 self.persistent_statements = v;
             } else {
-                tracing::warn!(
+                warn!(
                     env = "PG_PERSISTENT_STATEMENTS",
                     value = %val,
                     "unrecognized value, ignoring (expected: auto|true|false|on|off|1|0|yes|no)"
@@ -497,7 +499,7 @@ impl PgConfig {
                 if let Some((key, value)) = pair.split_once('=') {
                     // B6: Warn on duplicate known parameters.
                     if KNOWN_PARAMS.contains(&key) && !seen.insert(key) {
-                        tracing::warn!(
+                        warn!(
                             param = key,
                             "duplicate URL parameter '{key}': last occurrence wins"
                         );
@@ -511,32 +513,32 @@ impl PgConfig {
                     match key {
                         "max_connections" => match value.parse::<u32>() {
                             Ok(0) => {
-                                tracing::warn!("max_connections=0 is invalid, ignoring");
+                                warn!("max_connections=0 is invalid, ignoring");
                             }
                             Ok(v) if v > 10_000 => {
-                                tracing::warn!(
+                                warn!(
                                     "max_connections={v} is unreasonably high (>10000), \
                                      capping to 10000"
                                 );
                                 self.max_connections = Some(10_000);
                             }
                             Ok(v) => self.max_connections = Some(v),
-                            Err(_) => tracing::warn!(
-                                "max_connections='{value}' is not a valid u32, ignoring"
-                            ),
+                            Err(_) => {
+                                warn!("max_connections='{value}' is not a valid u32, ignoring")
+                            }
                         },
                         "min_connections" => match value.parse::<u32>() {
                             Ok(0) => {
                                 // M2: min_connections=0 means no idle connections
                                 // maintained — likely a misconfiguration.
-                                tracing::warn!(
+                                warn!(
                                     "min_connections=0 means no idle connections will be maintained; \
                                      this may cause connection storms under load"
                                 );
                                 self.min_connections = Some(0);
                             }
                             Ok(v) if v > 10_000 => {
-                                tracing::warn!(
+                                warn!(
                                     "min_connections={v} is unreasonably high (>10000), \
                                      capping to 10000"
                                 );
@@ -549,24 +551,24 @@ impl PgConfig {
                                 // Post-merge cross-validation below handles the min > max check.
                                 self.min_connections = Some(v);
                             }
-                            Err(_) => tracing::warn!(
-                                "min_connections='{value}' is not a valid u32, ignoring"
-                            ),
+                            Err(_) => {
+                                warn!("min_connections='{value}' is not a valid u32, ignoring")
+                            }
                         },
                         "max_lifetime" => match value.parse::<u64>() {
                             Ok(0) => {
-                                tracing::warn!(
+                                warn!(
                                     "max_lifetime=0 is invalid (connections would be immediately recycled), ignoring"
                                 );
                             }
                             Ok(secs) => self.max_lifetime = Some(Duration::from_secs(secs)),
-                            Err(_) => tracing::warn!(
-                                "max_lifetime='{value}' is not a valid number, ignoring"
-                            ),
+                            Err(_) => {
+                                warn!("max_lifetime='{value}' is not a valid number, ignoring")
+                            }
                         },
                         "auto_create_table" => match parse_bool_param(&value) {
                             Some(v) => self.auto_create_table = v,
-                            None => tracing::warn!(
+                            None => warn!(
                                 "auto_create_table='{value}' is not a valid bool (expected true/false/yes/no/on/off/1/0), ignoring"
                             ),
                         },
@@ -582,7 +584,7 @@ impl PgConfig {
                                 "serializable" => PgIsolation::Serializable,
                                 "read_committed" | "read committed" => PgIsolation::ReadCommitted,
                                 _ => {
-                                    tracing::warn!(
+                                    warn!(
                                         "isolation_level='{value}' is not recognized, defaulting to ReadCommitted"
                                     );
                                     PgIsolation::ReadCommitted
@@ -591,48 +593,48 @@ impl PgConfig {
                         }
                         "persistent_statements" => match PersistentStatements::parse(&value) {
                             Some(v) => self.persistent_statements = v,
-                            None => tracing::warn!(
-                                "persistent_statements='{value}' is not recognized, ignoring"
-                            ),
+                            None => {
+                                warn!("persistent_statements='{value}' is not recognized, ignoring")
+                            }
                         },
                         "connect_timeout" => match value.parse::<u64>() {
                             Ok(0) => {
-                                tracing::warn!(
+                                warn!(
                                     "connect_timeout=0 is invalid (would cause immediate timeout), ignoring"
                                 );
                             }
                             Ok(secs) => self.connect_timeout = Some(Duration::from_secs(secs)),
-                            Err(_) => tracing::warn!(
-                                "connect_timeout='{value}' is not a valid number, ignoring"
-                            ),
+                            Err(_) => {
+                                warn!("connect_timeout='{value}' is not a valid number, ignoring")
+                            }
                         },
                         "idle_timeout" => match value.parse::<u64>() {
                             Ok(0) => {
-                                tracing::warn!(
+                                warn!(
                                     "idle_timeout=0 is invalid (would cause immediate timeout), ignoring"
                                 );
                             }
                             Ok(secs) => self.idle_timeout = Some(Duration::from_secs(secs)),
-                            Err(_) => tracing::warn!(
-                                "idle_timeout='{value}' is not a valid number, ignoring"
-                            ),
+                            Err(_) => {
+                                warn!("idle_timeout='{value}' is not a valid number, ignoring")
+                            }
                         },
                         "slow_acquire_threshold_secs" => match value.parse::<u64>() {
                             Ok(0) => {
-                                tracing::warn!(
+                                warn!(
                                     "slow_acquire_threshold_secs=0 is invalid (would trigger on every acquire), ignoring"
                                 );
                             }
                             Ok(secs) => {
                                 self.slow_acquire_threshold_secs = Some(Duration::from_secs(secs))
                             }
-                            Err(_) => tracing::warn!(
+                            Err(_) => warn!(
                                 "slow_acquire_threshold_secs='{value}' is not a valid number, ignoring"
                             ),
                         },
                         "slow_statements_threshold_secs" => match value.parse::<u64>() {
                             Ok(0) => {
-                                tracing::warn!(
+                                warn!(
                                     "slow_statements_threshold_secs=0 is invalid (would trigger on every statement), ignoring"
                                 );
                             }
@@ -640,38 +642,34 @@ impl PgConfig {
                                 self.slow_statements_threshold_secs =
                                     Some(Duration::from_secs(secs))
                             }
-                            Err(_) => tracing::warn!(
+                            Err(_) => warn!(
                                 "slow_statements_threshold_secs='{value}' is not a valid number, ignoring"
                             ),
                         },
                         "pooler" => match parse_bool_param(&value) {
                             Some(v) => self.pooler = v,
-                            None => tracing::warn!(
+                            None => warn!(
                                 "pooler='{value}' is not a valid bool (expected true/false/yes/no/on/off/1/0), ignoring"
                             ),
                         },
                         "hash_partitions" => match value.parse::<u32>() {
                             Ok(0) => {
-                                tracing::warn!(
-                                    "hash_partitions=0 is invalid (must be >= 1), ignoring"
-                                );
+                                warn!("hash_partitions=0 is invalid (must be >= 1), ignoring");
                             }
                             Ok(v) if v > 1024 => {
-                                tracing::warn!(
-                                    "hash_partitions={v} is unreasonably high (>1024), ignoring"
-                                );
+                                warn!("hash_partitions={v} is unreasonably high (>1024), ignoring");
                             }
                             Ok(v) => self.hash_partitions = Some(v),
-                            Err(_) => tracing::warn!(
-                                "hash_partitions='{value}' is not a valid u32, ignoring"
-                            ),
+                            Err(_) => {
+                                warn!("hash_partitions='{value}' is not a valid u32, ignoring")
+                            }
                         },
                         _ => {
                             // M5: Warn on truly unknown URL parameters to help
                             // catch typos like `min_connctions=5`. Parameters
                             // recognised by sqlx/libpq are silently allowed.
                             if !key.is_empty() && !SQLX_KNOWN_PARAMS.contains(&key) {
-                                tracing::warn!("unknown URL parameter '{key}', ignoring");
+                                warn!("unknown URL parameter '{key}', ignoring");
                             }
                         }
                     }
@@ -680,7 +678,7 @@ impl PgConfig {
                     // "?pooler=true") — strip_custom_params will remove it from
                     // the URL, so the user's intent is silently lost. Warn so
                     // they know to add an explicit value.
-                    tracing::warn!(
+                    warn!(
                         "URL parameter '{pair}' has no value (missing '='), \
                          ignoring — use ?{pair}=true"
                     );
@@ -694,7 +692,7 @@ impl PgConfig {
         if let (Some(min), Some(max)) = (self.min_connections, self.max_connections)
             && min > max
         {
-            tracing::warn!(
+            warn!(
                 "min_connections={min} > max_connections={max} (detected in post-merge validation), \
                  will be capped by the store layer"
             );

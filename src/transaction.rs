@@ -308,7 +308,7 @@ impl PgTransaction {
         Ok(conn.conn_mut())
     }
 
-    fn check_writable(&self) -> Result<()> {
+    fn check_writeable(&self) -> Result<()> {
         if !self.writeable {
             return Err(PgStoreError::TxReadOnly);
         }
@@ -552,7 +552,7 @@ impl PgTransaction {
 
     /// Set a key to a value (insert or update).
     pub async fn set(&mut self, key: Key, val: Val) -> Result<()> {
-        self.check_writable()?;
+        self.check_writeable()?;
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         Self::build_query(persistent, &self.sql.set)
@@ -592,7 +592,7 @@ impl PgTransaction {
         if self.conn.is_none() {
             return Err(PgStoreError::TxClosed);
         }
-        self.check_writable()?;
+        self.check_writeable()?;
         if pairs.is_empty() {
             return Ok(());
         }
@@ -705,7 +705,7 @@ impl PgTransaction {
     /// set a key only if it does not already exist (insert-if-absent).
     /// Returns `KeyAlreadyExists` if the key exists.
     pub async fn put(&mut self, key: Key, val: Val) -> Result<()> {
-        self.check_writable()?;
+        self.check_writeable()?;
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         let result = Self::build_query(persistent, &self.sql.put)
@@ -724,7 +724,7 @@ impl PgTransaction {
     /// `chk = None` means "only if key does not exist" (delegates to `put`).
     /// `chk = Some(v)` means "only if current value equals v".
     pub async fn putc(&mut self, key: Key, val: Val, chk: Option<Val>) -> Result<()> {
-        self.check_writable()?;
+        self.check_writeable()?;
         let Some(expected) = chk else {
             return self.put(key, val).await;
         };
@@ -749,7 +749,7 @@ impl PgTransaction {
 
     /// Delete a key.
     pub async fn del(&mut self, key: Key) -> Result<()> {
-        self.check_writable()?;
+        self.check_writeable()?;
         let conn = self.conn.as_mut().ok_or(PgStoreError::TxClosed)?;
         let persistent = self.persistent;
         Self::build_query(persistent, &self.sql.del)
@@ -765,7 +765,7 @@ impl PgTransaction {
     /// `chk = None` → unconditional delete (delegates to `del`).
     /// `chk = Some(v)` → key must exist and value must equal v.
     pub async fn delc(&mut self, key: Key, chk: Option<Val>) -> Result<()> {
-        self.check_writable()?;
+        self.check_writeable()?;
         let Some(expected) = chk else {
             return self.del(key).await;
         };
@@ -787,7 +787,7 @@ impl PgTransaction {
 
     /// Delete all keys in a range (inclusive start, exclusive end).
     pub async fn delr(&mut self, rng: Range<Key>) -> Result<()> {
-        self.check_writable()?;
+        self.check_writeable()?;
         // Empty range — skip DB round-trip.
         if rng.start >= rng.end {
             return Ok(());

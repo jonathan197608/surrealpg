@@ -6,7 +6,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
 use surrealdb_core::kvs::{self, GetMultiResult, Key, KeysResult, ScanResult, Transactable, Val};
 use tokio::sync::Mutex;
@@ -66,7 +66,7 @@ impl PgTx {
 
     /// Acquire the inner transaction, returning an error if already closed.
     async fn lock(&self) -> kvs::Result<tokio::sync::MutexGuard<'_, Option<PgTransaction>>> {
-        if self.done.load(Ordering::Relaxed) {
+        if self.done.load(AtomicOrdering::Relaxed) {
             return Err(kvs::Error::TransactionFinished);
         }
         let guard = self.inner.lock().await;
@@ -79,7 +79,7 @@ impl PgTx {
     /// Like `lock()`, but also checks that the transaction is writable.
     /// Used by all write methods to avoid repeating the closed/writable guards.
     async fn lock_write(&self) -> kvs::Result<tokio::sync::MutexGuard<'_, Option<PgTransaction>>> {
-        if self.done.load(Ordering::Relaxed) {
+        if self.done.load(AtomicOrdering::Relaxed) {
             return Err(kvs::Error::TransactionFinished);
         }
         if !self.write {
@@ -98,7 +98,7 @@ impl PgTx {
 impl fmt::Debug for PgTx {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PgTx")
-            .field("done", &self.done.load(Ordering::Relaxed))
+            .field("done", &self.done.load(AtomicOrdering::Relaxed))
             .field("write", &self.write)
             .finish_non_exhaustive()
     }
@@ -116,8 +116,8 @@ impl Drop for PgTx {
         // commit()/cancel() — these are "ghost" transactions from a metrics
         // perspective. Record them as rollbacks so that
         // tx_started == tx_committed + tx_rolled_back holds.
-        if !self.done.load(Ordering::Relaxed) {
-            self.tx_rolled_back.fetch_add(1, Ordering::Relaxed);
+        if !self.done.load(AtomicOrdering::Relaxed) {
+            self.tx_rolled_back.fetch_add(1, AtomicOrdering::Relaxed);
             debug!("PgTx dropped without explicit commit/cancel — counted as rollback");
         }
     }
@@ -134,7 +134,7 @@ impl Transactable for PgTx {
     // provides its own Acquire semantics), `closed()` is a public diagnostic method
     // that SurrealDB may rely on — it should return accurate results immediately.
     fn closed(&self) -> bool {
-        self.done.load(Ordering::Acquire)
+        self.done.load(AtomicOrdering::Acquire)
     }
 
     fn writeable(&self) -> bool {
@@ -145,13 +145,13 @@ impl Transactable for PgTx {
         Box::pin(async move {
             // Fast check before acquiring the lock — if already done,
             // return early without blocking.
-            if self.done.load(Ordering::Relaxed) {
+            if self.done.load(AtomicOrdering::Relaxed) {
                 return Err(kvs::Error::TransactionFinished);
             }
             let mut guard = self.inner.lock().await;
             // Double-check under lock: another concurrent call may have
             // already set done. Use swap to atomically claim the close.
-            if self.done.swap(true, Ordering::AcqRel) {
+            if self.done.swap(true, AtomicOrdering::AcqRel) {
                 return Err(kvs::Error::TransactionFinished);
             }
             // Take the transaction out while holding the lock, then release
@@ -163,11 +163,11 @@ impl Transactable for PgTx {
             if let Some(mut tx) = tx_opt {
                 match tx.cancel().await {
                     Ok(()) => {
-                        self.tx_rolled_back.fetch_add(1, Ordering::Relaxed);
+                        self.tx_rolled_back.fetch_add(1, AtomicOrdering::Relaxed);
                         debug!("PostgreSQL transaction cancelled");
                     }
                     Err(e) => {
-                        self.tx_rolled_back.fetch_add(1, Ordering::Relaxed);
+                        self.tx_rolled_back.fetch_add(1, AtomicOrdering::Relaxed);
                         return Err(kvs::Error::from(e));
                     }
                 }
@@ -180,7 +180,7 @@ impl Transactable for PgTx {
         Box::pin(async move {
             // Fast check before acquiring the lock — if already done,
             // return early without blocking.
-            if self.done.load(Ordering::Relaxed) {
+            if self.done.load(AtomicOrdering::Relaxed) {
                 return Err(kvs::Error::TransactionFinished);
             }
             let mut guard = self.inner.lock().await;
@@ -189,7 +189,7 @@ impl Transactable for PgTx {
             // B1: swap must happen AFTER acquiring the lock (matching cancel()),
             // so that closed() returning true always means the connection is
             // released — no window where done=true but the lock is still held.
-            if self.done.swap(true, Ordering::AcqRel) {
+            if self.done.swap(true, AtomicOrdering::AcqRel) {
                 return Err(kvs::Error::TransactionFinished);
             }
             // Take the transaction out while holding the lock, then release
@@ -207,12 +207,12 @@ impl Transactable for PgTx {
             if let Some(mut tx) = tx_opt {
                 match tx.commit().await {
                     Ok(()) => {
-                        self.tx_committed.fetch_add(1, Ordering::Relaxed);
+                        self.tx_committed.fetch_add(1, AtomicOrdering::Relaxed);
                         debug!("PostgreSQL transaction committed");
                     }
                     Err(e) => {
                         // PG auto-rollbacks on COMMIT failure.
-                        self.tx_rolled_back.fetch_add(1, Ordering::Relaxed);
+                        self.tx_rolled_back.fetch_add(1, AtomicOrdering::Relaxed);
                         return Err(kvs::Error::from(e));
                     }
                 }
